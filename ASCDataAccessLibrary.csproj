@@ -1,0 +1,27 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+    <Title>Azure Table Storage Data Access Library</Title>
+    <Authors>O. Brown | M. Chukwuemeka</Authors>
+    <Company>Answer Sales Calls Inc.</Company>
+    <Description>A secure toolkit for using Azure Table Storage as a reliable database for your applications. Lightweight, scalable, model first design thats faster than most ORMs and avoids injection problems. WARNING: v1 uses an obsolete version of Cosmos Table Storage component library.</Description>
+    <Copyright>2025 Answer Sales Calls Inc.</Copyright>
+    <PackageIcon>Azure DB Cloud.png</PackageIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\..\Pictures\Azure DB Cloud.png">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Azure.Cosmos.Table" Version="1.0.8" />
+  </ItemGroup>
+
+</Project>
