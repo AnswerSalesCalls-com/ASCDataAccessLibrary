@@ -12,10 +12,11 @@
     <Copyright>2025 Answer Sales Calls Inc.</Copyright>
     <PackageIcon>Azure DB Cloud.png</PackageIcon>
     <GenerateDocumentationFile>True</GenerateDocumentationFile>
-    <AssemblyVersion>1.0.0.1</AssemblyVersion>
+    <AssemblyVersion>1.0.1</AssemblyVersion>
     <PackageOutputPath>Files</PackageOutputPath>
     <BaseOutputPath></BaseOutputPath>
     <DocumentationFile></DocumentationFile>
+    <RootNamespace>AZTableStorage</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>
