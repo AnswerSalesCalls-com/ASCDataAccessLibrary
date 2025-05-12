@@ -11,6 +11,11 @@
     <Description>A secure toolkit for using Azure Table Storage as a reliable database for your applications. Lightweight, scalable, model first design thats faster than most ORMs and avoids injection problems. WARNING: v1 uses an obsolete version of Cosmos Table Storage component library.</Description>
     <Copyright>2025 Answer Sales Calls Inc.</Copyright>
     <PackageIcon>Azure DB Cloud.png</PackageIcon>
+    <GenerateDocumentationFile>True</GenerateDocumentationFile>
+    <AssemblyVersion>1.0.0.1</AssemblyVersion>
+    <PackageOutputPath>Files</PackageOutputPath>
+    <BaseOutputPath></BaseOutputPath>
+    <DocumentationFile></DocumentationFile>
   </PropertyGroup>
 
   <ItemGroup>
@@ -21,6 +26,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Azure.Storage.Blobs" Version="12.24.0" />
     <PackageReference Include="Microsoft.Azure.Cosmos.Table" Version="1.0.8" />
   </ItemGroup>
 

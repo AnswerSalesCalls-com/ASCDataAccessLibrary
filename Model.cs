@@ -173,4 +173,167 @@ namespace AZTableStorage.Models
         public string TableReference => "AppSessionData";
         public string GetIDValue() => this.SessionID!;
     } //end class BOTSessionData
-}
+
+    /// <summary>
+    /// Represents blob information with metadata
+    /// </summary>
+    public class BlobData
+    {
+        /// <summary>
+        /// The name of the blob in storage
+        /// </summary>
+        public string? Name { get; set; }
+
+        /// <summary>
+        /// Original filename before upload
+        /// </summary>
+        public string? OriginalFilename { get; set; }
+
+        /// <summary>
+        /// Content type
+        /// </summary>
+        public string? ContentType { get; set; }
+
+        /// <summary>
+        /// Size in bytes
+        /// </summary>
+        public long Size { get; set; }
+
+        /// <summary>
+        /// Upload date
+        /// </summary>
+        public DateTime UploadDate { get; set; }
+
+        /// <summary>
+        /// Full URL to the blob
+        /// </summary>
+        public Uri? Url { get; set; }
+
+        /// <summary>
+        /// Standard file types and their corresponding MIME types
+        /// </summary>
+        public static Dictionary<string, string> FileTypes
+        {
+            get => new()
+            { 
+                // Images
+                { ".jpg", "image/jpeg" },
+                { ".jpeg", "image/jpeg" },
+                { ".png", "image/png" },
+                { ".gif", "image/gif" },
+                { ".bmp", "image/bmp" },
+                { ".svg", "image/svg+xml" },
+                { ".tiff", "image/tiff" },
+                { ".tif", "image/tiff" },
+                { ".webp", "image/webp" },
+            
+                // Documents
+                { ".pdf", "application/pdf" },
+                { ".txt", "text/plain" },
+            
+                // Microsoft Office Documents
+                // Word
+                { ".doc", "application/msword" },
+                { ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document" },
+                { ".docm", "application/vnd.ms-word.document.macroEnabled.12" },
+                { ".dot", "application/msword" },
+                { ".dotx", "application/vnd.openxmlformats-officedocument.wordprocessingml.template" },
+                { ".dotm", "application/vnd.ms-word.template.macroEnabled.12" },
+            
+                // Excel
+                { ".xls", "application/vnd.ms-excel" },
+                { ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+                { ".xlsm", "application/vnd.ms-excel.sheet.macroEnabled.12" },
+                { ".xlt", "application/vnd.ms-excel" },
+                { ".xltx", "application/vnd.openxmlformats-officedocument.spreadsheetml.template" },
+                { ".xltm", "application/vnd.ms-excel.template.macroEnabled.12" },
+                { ".xlsb", "application/vnd.ms-excel.sheet.binary.macroEnabled.12" },
+            
+                // PowerPoint
+                { ".ppt", "application/vnd.ms-powerpoint" },
+                { ".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation" },
+                { ".pptm", "application/vnd.ms-powerpoint.presentation.macroEnabled.12" },
+                { ".pot", "application/vnd.ms-powerpoint" },
+                { ".potx", "application/vnd.openxmlformats-officedocument.presentationml.template" },
+                { ".potm", "application/vnd.ms-powerpoint.template.macroEnabled.12" },
+                { ".pps", "application/vnd.ms-powerpoint" },
+                { ".ppsx", "application/vnd.openxmlformats-officedocument.presentationml.slideshow" },
+                { ".ppsm", "application/vnd.ms-powerpoint.slideshow.macroEnabled.12" },
+            
+                // Access
+                { ".accdb", "application/vnd.ms-access" },
+                { ".accde", "application/vnd.ms-access" },
+                { ".accdt", "application/vnd.ms-access" },
+                { ".mdb", "application/vnd.ms-access" },
+            
+                // Publisher
+                { ".pub", "application/vnd.ms-publisher" },
+            
+                // OneNote
+                { ".one", "application/onenote" },
+            
+                // Visio
+                { ".vsd", "application/vnd.visio" },
+                { ".vsdx", "application/vnd.ms-visio.drawing" },
+                { ".vsdm", "application/vnd.ms-visio.drawing.macroEnabled.12" },
+                { ".vst", "application/vnd.visio" },
+                { ".vstx", "application/vnd.ms-visio.template" },
+                { ".vstm", "application/vnd.ms-visio.template.macroEnabled.12" },
+            
+                // Project
+                { ".mpp", "application/vnd.ms-project" },
+            
+                // OpenDocument Formats
+                { ".odt", "application/vnd.oasis.opendocument.text" },
+                { ".ods", "application/vnd.oasis.opendocument.spreadsheet" },
+                { ".odp", "application/vnd.oasis.opendocument.presentation" },
+            
+                // Audio Files
+                { ".mp3", "audio/mpeg" },
+                { ".wav", "audio/wav" },
+                { ".ogg", "audio/ogg" },
+                { ".flac", "audio/flac" },
+                { ".aac", "audio/aac" },
+                { ".m4a", "audio/mp4" },
+                { ".wma", "audio/x-ms-wma" },
+                { ".aiff", "audio/aiff" },
+                { ".alac", "audio/alac" },
+                { ".mid", "audio/midi" },
+                { ".midi", "audio/midi" },
+                { ".oga", "audio/ogg" },
+                { ".opus", "audio/opus" },
+                { ".ra", "audio/x-realaudio" },
+                { ".webm", "audio/webm" },
+            
+                // Video Files
+                { ".mp4", "video/mp4" },
+                { ".avi", "video/x-msvideo" },
+                { ".mov", "video/quicktime" },
+                { ".wmv", "video/x-ms-wmv" },
+                { ".mkv", "video/x-matroska" },
+                { ".flv", "video/x-flv" },
+                { ".webm", "video/webm" },
+            
+                // Data Files
+                { ".csv", "text/csv" },
+                { ".json", "application/json" },
+                { ".xml", "application/xml" },
+                { ".yaml", "application/yaml" },
+                { ".yml", "application/yaml" },
+            
+                // Web Files
+                { ".html", "text/html" },
+                { ".htm", "text/html" },
+                { ".css", "text/css" },
+                { ".js", "application/javascript" },
+            
+                // Compressed Files
+                { ".zip", "application/zip" },
+                { ".rar", "application/x-rar-compressed" },
+                { ".7z", "application/x-7z-compressed" },
+                { ".tar", "application/x-tar" },
+                { ".gz", "application/gzip" }
+            };
+        }
+    } // end FileTypes Property
+} //end class BlobData
