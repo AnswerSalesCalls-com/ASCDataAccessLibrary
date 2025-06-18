@@ -16,7 +16,7 @@
     <PackageOutputPath>Files</PackageOutputPath>
     <BaseOutputPath></BaseOutputPath>
     <DocumentationFile></DocumentationFile>
-    <RootNamespace>AZTableStorage</RootNamespace>
+    <RootNamespace>ASCTableStorage</RootNamespace>
     <Version>1.0.1</Version>
   </PropertyGroup>
 

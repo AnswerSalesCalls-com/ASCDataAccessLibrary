@@ -1,8 +1,11 @@
-﻿using Microsoft.Azure.Cosmos.Table;
+﻿using ASCTableStorage.Common;
+using ASCTableStorage.Data;
+using Microsoft.Azure.Cosmos.Table;
+using Newtonsoft.Json;
 using System.Reflection;
 using System.Xml.Serialization;
 
-namespace AZTableStorage.Models
+namespace ASCTableStorage.Models
 {
     /// <summary>
     /// Required by all TableEntities to help with DataAccess
@@ -335,5 +338,252 @@ namespace AZTableStorage.Models
                 { ".gz", "application/gzip" }
             };
         }
-    } // end FileTypes Property
-} //end class BlobData
+   } //end class BlobData
+
+   /// <summary>
+   /// Result of batch update operation
+   /// </summary>
+   public class BatchUpdateResult
+   {
+      /// <summary>
+      /// Gets or sets a value indicating whether the operation was successful.
+      /// </summary>
+      public bool Success { get; set; }
+      /// <summary>
+      /// Gets or sets the number of items that were successfully processed.
+      /// </summary>
+      public int SuccessfulItems { get; set; }
+      /// <summary>
+      /// Gets or sets the number of items that failed during the operation.
+      /// </summary>
+      public int FailedItems { get; set; }
+      /// <summary>
+      /// Gets or sets the collection of error messages.
+      /// </summary>
+      public List<string> Errors { get; set; } = new List<string>();
+   }
+
+   /// <summary>
+   /// Progress information for batch operations
+   /// </summary>
+   public class BatchUpdateProgress
+   {
+      /// <summary>
+      /// Gets or sets the number of batches that have been successfully completed.
+      /// </summary>
+      public int CompletedBatches { get; set; }
+      /// <summary>
+      /// Gets or sets the total number of batches processed or to be processed.
+      /// </summary>
+      public int TotalBatches { get; set; }
+      /// <summary>
+      /// Gets or sets the number of items that have been successfully processed.
+      /// </summary>
+      public int ProcessedItems { get; set; }
+      /// <summary>
+      /// Gets or sets the total number of items.
+      /// </summary>
+      public int TotalItems { get; set; }
+      /// <summary>
+      /// Gets or sets the size of the current batch being processed.
+      /// </summary>
+      public int CurrentBatchSize { get; set; }
+      /// <summary>
+      /// Gets the percentage of items that have been processed.
+      /// </summary>
+      public double PercentComplete => TotalItems > 0 ? (double)ProcessedItems / TotalItems * 100 : 0;
+   }
+
+   /// <summary>
+   /// Allows for collections of data to be stored in the DB for State Management
+   /// </summary>
+   public class QueueData<T> : TableEntityBase, ITableExtra
+   {
+      /// <summary>
+      /// Gets or sets the unique identifier for the queue.
+      /// </summary>
+      public string? QueueID
+      {
+         get => this.RowKey;
+         set => this.RowKey = value;
+      }
+      /// <summary>
+      /// Name the type of data that's going to be stored.
+      /// </summary>
+      public string? Name
+      {
+         get => this.PartitionKey;
+         set => this.PartitionKey = value;
+      }
+      /// <summary>
+      /// The Actual Serialized Collection of Type T Data being Stored
+      /// </summary>
+      public string? Value { get; set; }
+      /// <summary>
+      /// Explodes the data into usable form
+      /// </summary>
+      public List<T> GetData()
+      {
+         return JsonConvert.DeserializeObject<List<T>>(Value!)!;
+      }
+      /// <summary>
+      /// Shrinks the data to a string to store
+      /// </summary>
+      /// <param name="data">The collection</param>
+      public void PutData(List<T> data)
+      {
+         Value = JsonConvert.SerializeObject(data, SharedFunctions.NewtonSoftRemoveNulls());
+      }
+      /// <summary>
+      /// Preserves the queued data to the DB
+      /// </summary>
+      /// <param name="accountName">The Azure Account name for the Table Store</param>
+      /// <param name="accountKey">The Azure Account key for Table Storage</param>
+      public void SaveQueue(string accountName, string accountKey)
+      {
+         new DataAccess<QueueData<T>>(accountName, accountKey).ManageData(this);
+      }
+      /// <summary>
+      /// Returns a list of Queued data that is ready to be worked on again. Removes the data once complete
+      /// </summary>
+      /// <param name="name">The name stored to identify the type of data</param>
+      /// <param name="accountName">The Azure Account name for the Table Store</param>
+      /// <param name="accountKey">The Azure Account key for Table Storage</param>
+      public List<T> GetQueues(string name, string accountName, string accountKey)
+      {
+         DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+         List<QueueData<T>> d = da.GetCollection(name).OrderBy(x => x.Timestamp).ToList();//Make sure to handle the data in the correct order of importance
+         _ = Task.Run(async () => { await da.BatchUpdateListAsync(d, TableOperationType.Delete); });  // This is in a thread so it does not delay the return
+
+         //Convert the data back to an enumerable that can be used in code
+         List<T> allData = new();
+         foreach (QueueData<T> q in d)
+            allData.AddRange(q.GetData());
+         return allData;
+      }
+
+      [XmlIgnore]
+      public string TableReference => "AppQueueData";
+      public string GetIDValue() => this.QueueID!;
+   }// end class QueueData
+
+   /// <summary>
+   /// The various acceptable error codes to report
+   /// </summary>
+   public enum ErrorCodeTypes
+   {
+      /// <summary>
+      /// Represents an unknown or unspecified value.
+      /// </summary>
+      /// <remarks>This type or member is used as a placeholder for cases where the value or state is not
+      /// defined. It may be used in scenarios where a default or fallback value is required.</remarks>
+      Unknown,
+      /// <summary>
+      /// Represents a warning message or notification within the system.
+      /// </summary>
+      /// <remarks>This class can be used to encapsulate details about a warning, such as its message,
+      /// severity, or associated metadata. It is typically used in logging, user notifications, or system monitoring
+      /// scenarios.</remarks>
+      Warning,
+      /// <summary>
+      /// Represents a critical log level used to indicate severe issues that require immediate attention.
+      /// </summary>
+      /// <remarks>The <see cref="Critical"/> log level is typically used for errors or conditions that
+      /// cause the application  to fail or require urgent intervention. Use this level sparingly and only for the most
+      /// serious issues.</remarks>
+      Critical,
+      /// <summary>
+      /// Represents general information or metadata.
+      /// </summary>
+      /// <remarks>This class or member is intended to encapsulate or provide access to informational data.
+      /// Use it to store or retrieve descriptive details relevant to the application or domain.</remarks>
+      Information
+   } //end enum ErrorCodeTypes
+
+   /// <summary>
+   /// Represents detailed error information for logging and tracking purposes.
+   /// </summary>
+   /// <remarks>The <see cref="ErrorLogData"/> class is designed to capture and store information about errors
+   /// that occur within an application. It includes details such as the application name, error severity, error
+   /// message, and the function where the error occurred. This class also supports logging errors asynchronously and
+   /// associating errors with specific customers or subscriptions.</remarks>
+   public class ErrorLogData : TableEntityBase, ITableExtra
+   {
+      /// <summary>
+      /// Initializes a new instance of the <see cref="ErrorLogData"/> class.
+      /// </summary>
+      /// <remarks>This constructor creates a default instance of the <see cref="ErrorLogData"/> class. Use
+      /// this constructor when no initial data needs to be provided.</remarks>
+      public ErrorLogData() { } //Default Constructor
+      /// <summary>
+      /// Initializes a new instance of the <see cref="ErrorLogData"/> class, representing detailed error information.
+      /// </summary>
+      /// <remarks>This constructor combines information from the provided exception and custom error
+      /// description to populate the error log data. The <paramref name="e"/> parameter is used to extract the
+      /// application name, stack trace, and exception message.</remarks>
+      /// <param name="e">The exception that occurred. Must not be <see langword="null"/>.</param>
+      /// <param name="errDescription">A custom description of the error. This is typically additional context or details about the error.</param>
+      /// <param name="severity">The severity level of the error, represented as an <see cref="ErrorCodeTypes"/> value.</param>
+      /// <param name="cID">The customer identifier associated with the error. Defaults to "undefined" if not provided.</param>
+      public ErrorLogData(Exception e, string errDescription, ErrorCodeTypes severity, string cID = "undefined")
+      {
+         this.ApplicationName = e.Source!;
+         this.ErrorSeverity = severity.ToString();
+         this.ErrorMessage = errDescription + " " + e.Message; //Todo errDes is usually the same with e.Message
+         this.FunctionName = e.StackTrace;
+         this.CustomerID = cID;
+      }
+
+      /// <summary>
+      /// Unique ID for the Error
+      /// </summary>
+      public string ErrorID
+      {
+         get { return string.IsNullOrEmpty(this.RowKey) ? this.RowKey = Guid.NewGuid().ToString() : this.RowKey; }
+         set { this.RowKey = value; }
+      }
+      /// <summary>
+      /// Name of the app
+      /// </summary>
+      public string ApplicationName
+      {
+         get { return this.PartitionKey!; }
+         set { this.PartitionKey = value; }
+      }
+      /// <summary>
+      /// When included allows for errors to be tracked by the Company / Customer / Subscription
+      /// </summary>
+      public string? CustomerID { get; set; }
+      /// <summary>
+      /// The message from the code
+      /// </summary>
+      public string? ErrorMessage { get; set; }
+      /// <summary>
+      /// Severity of the Error
+      /// </summary>
+      /// <example>Information | Critical | Message</example>
+      public string? ErrorSeverity { get; set; }
+      /// <summary>
+      /// Name of the function where the error occured if known
+      /// </summary>
+      public string? FunctionName { get; set; }
+      [XmlIgnore]
+      public string TableReference => "AppErrorLogs";
+      public string GetIDValue() => this.ErrorID;
+
+      /// <summary>
+      /// Allows the object to log its own error
+      /// </summary>
+      /// <param name="accountName">The Azure Account name for the Table Store</param>
+      /// <param name="accountKey">The Azure Account key for Table Storage</param>
+      public async Task LogErrorAsync(string accountName, string accountKey)
+      {
+         await Task.Run(() =>
+         {
+            new DataAccess<ErrorLogData>(accountName, accountKey).ManageData(this); //InsertUpdates the Data
+         });
+      }
+   } //end class ErrorData
+
+
+} // end namespace ASCTableStorage.Models

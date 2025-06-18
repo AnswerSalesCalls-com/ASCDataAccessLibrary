@@ -38,7 +38,7 @@ dotnet add package ASCDataAccessLibrary
 Your model classes need to inherit from `TableEntityBase` and implement `ITableExtra`:
 
 ```csharp
-using AZTableStorage.Models;
+using ASCTableStorage.Models;
 
 public class Customer : TableEntityBase, ITableExtra
 {
@@ -201,8 +201,8 @@ var staleSessions = session.GetStaleSessions();
 ### Complete Customer Management Example
 
 ```csharp
-using AZTableStorage.Data;
-using AZTableStorage.Models;
+using ASCTableStorage.Data;
+using ASCTableStorage.Models;
 using System;
 using System.Collections.Generic;
 
@@ -240,7 +240,7 @@ Console.WriteLine("Customer deleted");
 ### Session Management Example
 
 ```csharp
-using AZTableStorage.Data;
+using ASCTableStorage.Data;
 using System;
 
 // Initialize session

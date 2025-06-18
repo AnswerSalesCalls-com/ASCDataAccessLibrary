@@ -1,9 +1,9 @@
-﻿using AZTableStorage.Models;
+﻿using ASCTableStorage.Models;
 using Azure;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 
-namespace AZTableStorage.Blobs
+namespace ASCTableStorage.Blobs
 {
     /// <summary>
     /// Service to handle Azure Blob Storage operations for file uploads and downloads. Defaults to 5MB file Sizes
