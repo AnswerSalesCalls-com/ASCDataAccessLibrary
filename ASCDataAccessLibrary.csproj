@@ -5,19 +5,28 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
-    <Title>Azure Table Storage Data Access Library</Title>
+    <Title>ASC Azure Table Storage Data Access Library</Title>
     <Authors>O. Brown | M. Chukwuemeka</Authors>
     <Company>Answer Sales Calls Inc.</Company>
-    <Description>A secure toolkit for using Azure Table Storage as a reliable database for your applications. Lightweight, scalable, model first design thats faster than most ORMs and avoids injection problems. WARNING: v1 uses an obsolete version of Cosmos Table Storage component library.</Description>
+    <Description>A secure toolkit for using Azure Table Storage as a reliable database for your applications. Lightweight, scalable, model first design that's faster than most ORMs and avoids injection problems. Latest version adds capability for using table storage for Error Logging and Queueing bulk collections of data for later processing -- useful for quickly storage data when a server is about to go down so you can pick up where you left off. Now also allows for lamda functions to define queries. WARNING: v1 uses an obsolete version of Cosmos Table Storage component library.</Description>
     <Copyright>2025 Answer Sales Calls Inc.</Copyright>
     <PackageIcon>Azure DB Cloud.png</PackageIcon>
     <GenerateDocumentationFile>True</GenerateDocumentationFile>
-    <AssemblyVersion>1.0.1</AssemblyVersion>
+    <AssemblyVersion>1.0.2</AssemblyVersion>
     <PackageOutputPath>Files</PackageOutputPath>
     <BaseOutputPath></BaseOutputPath>
     <DocumentationFile></DocumentationFile>
     <RootNamespace>ASCTableStorage</RootNamespace>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
+    <PackageReadmeFile>getting-started-guide-102.md</PackageReadmeFile>
+    <PackageReleaseNotes>updated and refactored the code to allow for 
+
+Error Logging capability to allow logging of your errors to the Azure Table Store
+
+Queueing of data to the Azure Table Store as needed for any failed and continued processes
+
+DataAccess is now sync and async. Allows for paging data. Allows for Lamda Functions to define queries
+</PackageReleaseNotes>
   </PropertyGroup>
 
   <ItemGroup>
@@ -30,6 +39,13 @@
   <ItemGroup>
     <PackageReference Include="Azure.Storage.Blobs" Version="12.24.0" />
     <PackageReference Include="Microsoft.Azure.Cosmos.Table" Version="1.0.8" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="getting-started-guide-102.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
   </ItemGroup>
 
 </Project>
