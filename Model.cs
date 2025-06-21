@@ -2,7 +2,9 @@
 using ASCTableStorage.Data;
 using Microsoft.Azure.Cosmos.Table;
 using Newtonsoft.Json;
+using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Xml.Serialization;
 
 namespace ASCTableStorage.Models
@@ -467,123 +469,232 @@ namespace ASCTableStorage.Models
       public string GetIDValue() => this.QueueID!;
    }// end class QueueData
 
-   /// <summary>
-   /// The various acceptable error codes to report
-   /// </summary>
-   public enum ErrorCodeTypes
-   {
-      /// <summary>
-      /// Represents an unknown or unspecified value.
-      /// </summary>
-      /// <remarks>This type or member is used as a placeholder for cases where the value or state is not
-      /// defined. It may be used in scenarios where a default or fallback value is required.</remarks>
-      Unknown,
-      /// <summary>
-      /// Represents a warning message or notification within the system.
-      /// </summary>
-      /// <remarks>This class can be used to encapsulate details about a warning, such as its message,
-      /// severity, or associated metadata. It is typically used in logging, user notifications, or system monitoring
-      /// scenarios.</remarks>
-      Warning,
-      /// <summary>
-      /// Represents a critical log level used to indicate severe issues that require immediate attention.
-      /// </summary>
-      /// <remarks>The <see cref="Critical"/> log level is typically used for errors or conditions that
-      /// cause the application  to fail or require urgent intervention. Use this level sparingly and only for the most
-      /// serious issues.</remarks>
-      Critical,
-      /// <summary>
-      /// Represents general information or metadata.
-      /// </summary>
-      /// <remarks>This class or member is intended to encapsulate or provide access to informational data.
-      /// Use it to store or retrieve descriptive details relevant to the application or domain.</remarks>
-      Information
-   } //end enum ErrorCodeTypes
+    /// <summary>
+    /// The various acceptable error codes to report
+    /// </summary>
+    public enum ErrorCodeTypes
+    {
+        /// <summary>
+        /// Represents a message or log entry that is an Error in nature.
+        /// </summary>
+        Error,
+        /// <summary>
+        /// Represents an unknown or unspecified value.
+        /// </summary>
+        /// <remarks>This type or member is used as a placeholder for cases where the value or state is not
+        /// defined. It may be used in scenarios where a default or fallback value is required.</remarks>
+        Unknown,
+        /// <summary>
+        /// Represents a warning message or notification within the system.
+        /// </summary>
+        /// <remarks>This class can be used to encapsulate details about a warning, such as its message,
+        /// severity, or associated metadata. It is typically used in logging, user notifications, or system monitoring
+        /// scenarios.</remarks>
+        Warning,
+        /// <summary>
+        /// Represents a critical log level used to indicate severe issues that require immediate attention.
+        /// </summary>
+        /// <remarks>The <see cref="Critical"/> log level is typically used for errors or conditions that
+        /// cause the application  to fail or require urgent intervention. Use this level sparingly and only for the most
+        /// serious issues.</remarks>
+        Critical,
+        /// <summary>
+        /// Represents general information or metadata.
+        /// </summary>
+        /// <remarks>This class or member is intended to encapsulate or provide access to informational data.
+        /// Use it to store or retrieve descriptive details relevant to the application or domain.</remarks>
+        Information
+    } //end enum ErrorCodeTypes
 
-   /// <summary>
-   /// Represents detailed error information for logging and tracking purposes.
-   /// </summary>
-   /// <remarks>The <see cref="ErrorLogData"/> class is designed to capture and store information about errors
-   /// that occur within an application. It includes details such as the application name, error severity, error
-   /// message, and the function where the error occurred. This class also supports logging errors asynchronously and
-   /// associating errors with specific customers or subscriptions.</remarks>
-   public class ErrorLogData : TableEntityBase, ITableExtra
-   {
-      /// <summary>
-      /// Initializes a new instance of the <see cref="ErrorLogData"/> class.
-      /// </summary>
-      /// <remarks>This constructor creates a default instance of the <see cref="ErrorLogData"/> class. Use
-      /// this constructor when no initial data needs to be provided.</remarks>
-      public ErrorLogData() { } //Default Constructor
-      /// <summary>
-      /// Initializes a new instance of the <see cref="ErrorLogData"/> class, representing detailed error information.
-      /// </summary>
-      /// <remarks>This constructor combines information from the provided exception and custom error
-      /// description to populate the error log data. The <paramref name="e"/> parameter is used to extract the
-      /// application name, stack trace, and exception message.</remarks>
-      /// <param name="e">The exception that occurred. Must not be <see langword="null"/>.</param>
-      /// <param name="errDescription">A custom description of the error. This is typically additional context or details about the error.</param>
-      /// <param name="severity">The severity level of the error, represented as an <see cref="ErrorCodeTypes"/> value.</param>
-      /// <param name="cID">The customer identifier associated with the error. Defaults to "undefined" if not provided.</param>
-      public ErrorLogData(Exception e, string errDescription, ErrorCodeTypes severity, string cID = "undefined")
-      {
-         this.ApplicationName = e.Source!;
-         this.ErrorSeverity = severity.ToString();
-         this.ErrorMessage = errDescription + " " + e.Message; //Todo errDes is usually the same with e.Message
-         this.FunctionName = e.StackTrace;
-         this.CustomerID = cID;
-      }
+    /// <summary>
+    /// Represents detailed error information for logging and tracking purposes.
+    /// </summary>
+    /// <remarks>The <see cref="ErrorLogData"/> class is designed to capture and store information about errors
+    /// that occur within an application. It includes details such as the application name, error severity, error
+    /// message, and the function where the error occurred. This class also supports logging errors asynchronously and
+    /// associating errors with specific customers or subscriptions.</remarks>
+    public class ErrorLogData : TableEntityBase, ITableExtra
+    {
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ErrorLogData"/> class.
+        /// </summary>
+        /// <remarks>This constructor creates a default instance of the <see cref="ErrorLogData"/> class. Use
+        /// this constructor when no initial data needs to be provided.</remarks>
+        public ErrorLogData() { } //Default Constructor
 
-      /// <summary>
-      /// Unique ID for the Error
-      /// </summary>
-      public string ErrorID
-      {
-         get { return string.IsNullOrEmpty(this.RowKey) ? this.RowKey = Guid.NewGuid().ToString() : this.RowKey; }
-         set { this.RowKey = value; }
-      }
-      /// <summary>
-      /// Name of the app
-      /// </summary>
-      public string ApplicationName
-      {
-         get { return this.PartitionKey!; }
-         set { this.PartitionKey = value; }
-      }
-      /// <summary>
-      /// When included allows for errors to be tracked by the Company / Customer / Subscription
-      /// </summary>
-      public string? CustomerID { get; set; }
-      /// <summary>
-      /// The message from the code
-      /// </summary>
-      public string? ErrorMessage { get; set; }
-      /// <summary>
-      /// Severity of the Error
-      /// </summary>
-      /// <example>Information | Critical | Message</example>
-      public string? ErrorSeverity { get; set; }
-      /// <summary>
-      /// Name of the function where the error occured if known
-      /// </summary>
-      public string? FunctionName { get; set; }
-      [XmlIgnore]
-      public string TableReference => "AppErrorLogs";
-      public string GetIDValue() => this.ErrorID;
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ErrorLogData"/> class, representing detailed error information.
+        /// </summary>
+        /// <remarks>This constructor combines information from the provided exception and custom error
+        /// description to populate the error log data. The application name and calling function are dynamically
+        /// determined from the call stack.</remarks>
+        /// <param name="e">The exception that occurred. Must not be <see langword="null"/>.</param>
+        /// <param name="errDescription">A custom description of the error. This is typically additional context or details about the error.</param>
+        /// <param name="severity">The severity level of the error, represented as an <see cref="ErrorCodeTypes"/> value.</param>
+        /// <param name="cID">The customer identifier associated with the error. Defaults to "undefined" if not provided.</param>
+        public ErrorLogData(Exception e, string errDescription, ErrorCodeTypes severity, string cID = "undefined")
+        {
+            var callStackInfo = GetCallStackInfo();
 
-      /// <summary>
-      /// Allows the object to log its own error
-      /// </summary>
-      /// <param name="accountName">The Azure Account name for the Table Store</param>
-      /// <param name="accountKey">The Azure Account key for Table Storage</param>
-      public async Task LogErrorAsync(string accountName, string accountKey)
-      {
-         await Task.Run(() =>
-         {
-            new DataAccess<ErrorLogData>(accountName, accountKey).ManageData(this); //InsertUpdates the Data
-         });
-      }
-   } //end class ErrorData
+            this.ApplicationName = callStackInfo.ApplicationName;
+            this.ErrorSeverity = severity.ToString();
+            this.ErrorMessage = errDescription + " " + e.Message;
+            this.FunctionName = callStackInfo.CallingFunction;
+            this.CustomerID = cID;
+        }
+
+        /// <summary>
+        /// Creates an ErrorLogData instance with caller information automatically captured
+        /// </summary>
+        /// <param name="errDescription">A custom description of the error</param>
+        /// <param name="severity">The severity level of the error</param>
+        /// <param name="cID">The customer identifier associated with the error</param>
+        /// <param name="callerMemberName">Automatically captured caller member name</param>
+        /// <param name="callerFilePath">Automatically captured caller file path</param>
+        /// <param name="callerLineNumber">Automatically captured caller line number</param>
+        /// <returns>A new ErrorLogData instance</returns>
+        public static ErrorLogData CreateWithCallerInfo(
+            string errDescription,
+            ErrorCodeTypes severity,
+            string cID = "undefined",
+            [CallerMemberName] string callerMemberName = "",
+            [CallerFilePath] string callerFilePath = "",
+            [CallerLineNumber] int callerLineNumber = 0)
+        {
+            var errorLog = new ErrorLogData();
+            var callStackInfo = GetCallStackInfo();
+
+            errorLog.ApplicationName = callStackInfo.ApplicationName;
+            errorLog.ErrorSeverity = severity.ToString();
+            errorLog.ErrorMessage = errDescription;
+            errorLog.FunctionName = $"{callerMemberName} (Line: {callerLineNumber})";
+            errorLog.CustomerID = cID;
+
+            return errorLog;
+        }
+
+        /// <summary>
+        /// Gets detailed information from the current call stack
+        /// </summary>
+        /// <returns>Call stack information including application name and calling function</returns>
+        private static (string ApplicationName, string CallingFunction) GetCallStackInfo()
+        {
+            try
+            {
+                var stackTrace = new StackTrace(true);
+                var frames = stackTrace.GetFrames();
+
+                // Skip the current method and constructor frames to find the actual caller
+                MethodBase? callingMethod = null;
+                string applicationName = Assembly.GetExecutingAssembly().GetName().Name ?? "Unknown";
+
+                for (int i = 2; i < frames.Length; i++) // Start at 2 to skip current method and constructor
+                {
+                    var frame = frames[i];
+                    var method = frame.GetMethod();
+
+                    if (method != null &&
+                        method.DeclaringType != typeof(ErrorLogData) &&
+                        !method.DeclaringType?.Name.Contains("Exception") == true)
+                    {
+                        callingMethod = method;
+
+                        // Get the assembly name from the calling method's declaring type
+                        if (method.DeclaringType?.Assembly != null)
+                        {
+                            applicationName = method.DeclaringType.Assembly.GetName().Name ?? applicationName;
+                        }
+                        break;
+                    }
+                }
+
+                string functionInfo = "Unknown";
+                if (callingMethod != null)
+                {
+                    var className = callingMethod.DeclaringType?.Name ?? "Unknown";
+                    var methodName = callingMethod.Name;
+
+                    // Find the frame with file info for line number
+                    var frameWithFileInfo = Array.Find(frames, f =>
+                        f.GetMethod() == callingMethod && f.GetFileName() != null);
+
+                    if (frameWithFileInfo != null)
+                    {
+                        var lineNumber = frameWithFileInfo.GetFileLineNumber();
+                        functionInfo = $"{className}.{methodName} (Line: {lineNumber})";
+                    }
+                    else
+                    {
+                        functionInfo = $"{className}.{methodName}";
+                    }
+                }
+
+                return (applicationName, functionInfo);
+            }
+            catch
+            {
+                // Fallback in case of any issues with stack trace analysis
+                return (Assembly.GetExecutingAssembly().GetName().Name ?? "Unknown", "Unknown");
+            }
+        }
+
+        /// <summary>
+        /// Unique ID for the Error
+        /// </summary>
+        public string ErrorID
+        {
+            get { return string.IsNullOrEmpty(this.RowKey) ? this.RowKey = Guid.NewGuid().ToString() : this.RowKey; }
+            set { this.RowKey = value; }
+        }
+
+        /// <summary>
+        /// Name of the app
+        /// </summary>
+        public string ApplicationName
+        {
+            get { return this.PartitionKey!; }
+            set { this.PartitionKey = value; }
+        }
+
+        /// <summary>
+        /// When included allows for errors to be tracked by the Company / Customer / Subscription
+        /// </summary>
+        public string? CustomerID { get; set; }
+
+        /// <summary>
+        /// The message from the code
+        /// </summary>
+        public string? ErrorMessage { get; set; }
+
+        /// <summary>
+        /// Severity of the Error
+        /// </summary>
+        /// <example>Information | Critical | Message</example>
+        public string? ErrorSeverity { get; set; }
+
+        /// <summary>
+        /// Name of the function where the error occurred if known
+        /// </summary>
+        public string? FunctionName { get; set; }
+
+        [XmlIgnore]
+        public string TableReference => "AppErrorLogs";
+
+        public string GetIDValue() => this.ErrorID;
+
+        /// <summary>
+        /// Allows the object to log its own error
+        /// </summary>
+        /// <param name="accountName">The Azure Account name for the Table Store</param>
+        /// <param name="accountKey">The Azure Account key for Table Storage</param>
+        public async Task LogErrorAsync(string accountName, string accountKey)
+        {
+            await Task.Run(() =>
+            {
+                new DataAccess<ErrorLogData>(accountName, accountKey).ManageData(this); //InsertUpdates the Data
+            });
+        }
+    } //end class ErrorLogData
 
 
 } // end namespace ASCTableStorage.Models
