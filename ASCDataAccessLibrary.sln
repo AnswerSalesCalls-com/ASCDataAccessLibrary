@@ -1,9 +1,11 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
-VisualStudioVersion = 17.13.35806.99 d17.13
+VisualStudioVersion = 17.13.35806.99
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ASCDataAccessLibrary", "ASCDataAccessLibrary.csproj", "{E163889D-6DCA-4E60-8AE2-5AE77DC02806}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TestHarness", "..\TestHarness\TestHarness.csproj", "{349973A0-5482-4414-B906-3DD1153ABB1D}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -15,6 +17,10 @@ Global
 		{E163889D-6DCA-4E60-8AE2-5AE77DC02806}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{E163889D-6DCA-4E60-8AE2-5AE77DC02806}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{E163889D-6DCA-4E60-8AE2-5AE77DC02806}.Release|Any CPU.Build.0 = Release|Any CPU
+		{349973A0-5482-4414-B906-3DD1153ABB1D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{349973A0-5482-4414-B906-3DD1153ABB1D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{349973A0-5482-4414-B906-3DD1153ABB1D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{349973A0-5482-4414-B906-3DD1153ABB1D}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

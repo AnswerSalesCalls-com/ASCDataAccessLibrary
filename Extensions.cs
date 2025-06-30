@@ -53,7 +53,7 @@ namespace ASCTableStorage.Common
     /// <summary>
     /// Provides shared functions across the project
     /// </summary>
-    public static class SharedFunctions
+    public static class Functions
     {
         /// <summary>
         /// Gets the option to removes nullables from object when serializing with NewtonSoft

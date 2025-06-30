@@ -140,13 +140,34 @@ namespace ASCTableStorage.Data
         }
 
         /// <summary>
-        /// Core implementation for getting collection by lambda expression
+        /// Core implementation for getting collection by lambda expression with hybrid filtering
         /// </summary>
         private async Task<List<T>> GetCollectionCore(Expression<Func<T, bool>> predicate)
         {
-            string queryString = ConvertLambdaToODataFilter(predicate);
-            TableQuery<T> q = new TableQuery<T>().Where(queryString);
-            return await GetCollectionCore(q);
+            // Use hybrid filtering for maximum efficiency
+            var hybridResult = ConvertLambdaToHybridFilter(predicate);
+
+            // Execute server-side query with maximum filtering possible
+            TableQuery<T> query;
+            if (!string.IsNullOrEmpty(hybridResult.ServerSideFilter))
+            {
+                query = new TableQuery<T>().Where(hybridResult.ServerSideFilter);
+            }
+            else
+            {
+                // If no server-side filtering possible, get all data
+                query = new TableQuery<T>();
+            }
+
+            var serverResults = await GetCollectionCore(query);
+
+            // Apply client-side filtering if needed
+            if (hybridResult.RequiresClientFiltering && hybridResult.ClientSidePredicate != null)
+            {
+                return serverResults.Where(hybridResult.ClientSidePredicate).ToList();
+            }
+
+            return serverResults;
         }
 
         /// <summary>
@@ -203,7 +224,7 @@ namespace ASCTableStorage.Data
         }
 
         /// <summary>
-        /// Core implementation for getting single row by lambda expression
+        /// Core implementation for getting single row by lambda expression with hybrid filtering
         /// </summary>
         private async Task<T> GetRowObjectCore(Expression<Func<T, bool>> predicate)
         {
@@ -212,15 +233,42 @@ namespace ASCTableStorage.Data
         }
 
         /// <summary>
-        /// Core implementation for paginated collection retrieval
+        /// Core implementation for paginated collection retrieval with hybrid filtering support
         /// </summary>
         private async Task<PagedResult<T>> GetPagedCollectionCore(int pageSize = DEFAULT_PAGE_SIZE,
-            string continuationToken = null, TableQuery<T> definedQuery = null)
+            string continuationToken = null, TableQuery<T> definedQuery = null,
+            Expression<Func<T, bool>> predicate = null)
         {
             T obj = Activator.CreateInstance<T>();
             CloudTable table = await GetTableCore(obj.TableReference);
 
-            var query = definedQuery ?? new TableQuery<T>();
+            TableQuery<T> query;
+            Func<T, bool> clientFilter = null;
+
+            // Handle hybrid filtering for lambda expressions
+            if (predicate != null)
+            {
+                var hybridResult = ConvertLambdaToHybridFilter(predicate);
+
+                if (!string.IsNullOrEmpty(hybridResult.ServerSideFilter))
+                {
+                    query = new TableQuery<T>().Where(hybridResult.ServerSideFilter);
+                }
+                else
+                {
+                    query = new TableQuery<T>();
+                }
+
+                if (hybridResult.RequiresClientFiltering)
+                {
+                    clientFilter = hybridResult.ClientSidePredicate;
+                }
+            }
+            else
+            {
+                query = definedQuery ?? new TableQuery<T>();
+            }
+
             query = query.Take(pageSize);
 
             TableContinuationToken token = null;
@@ -230,13 +278,20 @@ namespace ASCTableStorage.Data
             }
 
             var segment = await table.ExecuteQuerySegmentedAsync(query, token);
+            var results = segment.ToList();
+
+            // Apply client-side filtering if needed
+            if (clientFilter != null)
+            {
+                results = results.Where(clientFilter).ToList();
+            }
 
             return new PagedResult<T>
             {
-                Items = segment.ToList(),
+                Items = results,
                 ContinuationToken = SerializeContinuationToken(segment.ContinuationToken),
                 HasMore = segment.ContinuationToken != null,
-                Count = segment.Count()
+                Count = results.Count
             };
         }
 
@@ -345,7 +400,7 @@ namespace ASCTableStorage.Data
             await table.ExecuteBatchAsync(tableBatch);
         }
 
-        #endregion
+        #endregion Core Implementation Methods
 
         #region Public Synchronous Methods (Wrap Core)
 
@@ -386,12 +441,14 @@ namespace ASCTableStorage.Data
         }
 
         /// <summary>
-        /// Returns a list of Objects using a lambda expression (synchronous)
+        /// Returns a list of Objects using a lambda expression with hybrid server/client filtering (synchronous)
         /// </summary>
         /// <param name="predicate">Lambda expression defining the filter criteria</param>
         /// <returns>A collection of the Type requested from the appropriate table</returns>
         /// <example>
         /// var results = dataAccess.GetCollection(x => x.Status == "Active" && x.CreatedDate > DateTime.Today.AddDays(-30));
+        /// // Complex expressions like ToLower().Contains() are automatically handled with hybrid filtering
+        /// var companies = dataAccess.GetCollection(c => c.CompanyName.ToLower().Contains("test") || c.CompanyID == "123");
         /// </example>
         public List<T> GetCollection(Expression<Func<T, bool>> predicate)
         {
@@ -440,12 +497,14 @@ namespace ASCTableStorage.Data
         }
 
         /// <summary>
-        /// Gets a specific row using a lambda expression (synchronous)
+        /// Gets a specific row using a lambda expression with hybrid filtering (synchronous)
         /// </summary>
         /// <param name="predicate">Lambda expression defining the filter criteria</param>
         /// <returns>First matching entity or null</returns>
         /// <example>
         /// var user = dataAccess.GetRowObject(x => x.Email == "user@example.com" && x.IsActive);
+        /// // Complex expressions are automatically handled
+        /// var company = dataAccess.GetRowObject(c => c.CompanyName.ToLower().Contains("microsoft"));
         /// </example>
         public T GetRowObject(Expression<Func<T, bool>> predicate)
         {
@@ -464,7 +523,7 @@ namespace ASCTableStorage.Data
             return result.Success;
         }
 
-        #endregion
+        #endregion Public Synchronous Methods
 
         #region Public Asynchronous Methods (Call Core Directly)
 
@@ -505,12 +564,14 @@ namespace ASCTableStorage.Data
         }
 
         /// <summary>
-        /// Returns a list of Objects using a lambda expression (asynchronous)
+        /// Returns a list of Objects using a lambda expression with hybrid server/client filtering (asynchronous)
         /// </summary>
         /// <param name="predicate">Lambda expression defining the filter criteria</param>
         /// <returns>A collection of the Type requested from the appropriate table</returns>
         /// <example>
         /// var results = await dataAccess.GetCollectionAsync(x => x.Status == "Active" && x.CreatedDate > DateTime.Today.AddDays(-30));
+        /// // Complex expressions like ToLower().Contains() are automatically handled with hybrid filtering
+        /// var companies = await dataAccess.GetCollectionAsync(c => c.CompanyName.ToLower().Contains("test") || c.CompanyID == "123");
         /// </example>
         public Task<List<T>> GetCollectionAsync(Expression<Func<T, bool>> predicate)
         {
@@ -559,12 +620,14 @@ namespace ASCTableStorage.Data
         }
 
         /// <summary>
-        /// Gets a specific row using a lambda expression (asynchronous)
+        /// Gets a specific row using a lambda expression with hybrid filtering (asynchronous)
         /// </summary>
         /// <param name="predicate">Lambda expression defining the filter criteria</param>
         /// <returns>First matching entity or null</returns>
         /// <example>
         /// var user = await dataAccess.GetRowObjectAsync(x => x.Email == "user@example.com" && x.IsActive);
+        /// // Complex expressions are automatically handled
+        /// var company = await dataAccess.GetRowObjectAsync(c => c.CompanyName.ToLower().Contains("microsoft"));
         /// </example>
         public Task<T> GetRowObjectAsync(Expression<Func<T, bool>> predicate)
         {
@@ -583,7 +646,7 @@ namespace ASCTableStorage.Data
             return BatchUpdateListCore(data, direction, progressCallback);
         }
 
-        #endregion
+        #endregion Public Asynchronous Methods
 
         #region Pagination Support
 
@@ -625,7 +688,7 @@ namespace ASCTableStorage.Data
         }
 
         /// <summary>
-        /// Gets a paginated collection using a lambda expression (asynchronous)
+        /// Gets a paginated collection using a lambda expression with hybrid filtering (asynchronous)
         /// </summary>
         /// <param name="predicate">Lambda expression defining the filter criteria</param>
         /// <param name="pageSize">Number of items per page</param>
@@ -633,12 +696,12 @@ namespace ASCTableStorage.Data
         /// <returns>Paginated result</returns>
         /// <example>
         /// var page = await dataAccess.GetPagedCollectionAsync(x => x.Status == "Active", 50);
+        /// // Complex expressions are automatically handled with hybrid filtering
+        /// var companies = await dataAccess.GetPagedCollectionAsync(c => c.CompanyName.ToLower().Contains("test"), 25);
         /// </example>
-        public async Task<PagedResult<T>> GetPagedCollectionAsync(Expression<Func<T, bool>> predicate, int pageSize = DEFAULT_PAGE_SIZE, string continuationToken = null!)
+        public Task<PagedResult<T>> GetPagedCollectionAsync(Expression<Func<T, bool>> predicate, int pageSize = DEFAULT_PAGE_SIZE, string continuationToken = null!)
         {
-            string queryString = ConvertLambdaToODataFilter(predicate);
-            TableQuery<T> q = new TableQuery<T>().Where(queryString);
-            return await GetPagedCollectionCore(pageSize, continuationToken, q);
+            return GetPagedCollectionCore(pageSize, continuationToken, null, predicate);
         }
 
         /// <summary>
@@ -653,19 +716,17 @@ namespace ASCTableStorage.Data
         }
 
         /// <summary>
-        /// Gets an initial quick load using lambda expression
+        /// Gets an initial quick load using lambda expression with hybrid filtering
         /// </summary>
         /// <param name="predicate">Lambda expression defining the filter criteria</param>
         /// <param name="initialLoadSize">Size of initial quick load</param>
         /// <returns>Initial page result</returns>
         public Task<PagedResult<T>> GetInitialDataLoadAsync(Expression<Func<T, bool>> predicate, int initialLoadSize = DEFAULT_PAGE_SIZE)
         {
-            string queryString = ConvertLambdaToODataFilter(predicate);
-            TableQuery<T> q = new TableQuery<T>().Where(queryString);
-            return GetPagedCollectionCore(initialLoadSize, null!, q);
+            return GetPagedCollectionCore(initialLoadSize, null!, null, predicate);
         }
 
-        #endregion
+        #endregion Pagination Support
 
         #region Helper Methods and Support Classes
 
@@ -764,43 +825,199 @@ namespace ASCTableStorage.Data
             public double PercentComplete => TotalItems > 0 ? (double)ProcessedItems / TotalItems * 100 : 0;
         }
 
-        #endregion
+        #endregion Helper Methods and Support Classes
 
         #region Lambda Expression Processing
 
         /// <summary>
         /// Converts a lambda expression to OData filter string for Azure Table Storage
+        /// with hybrid server/client-side filtering for maximum efficiency
+        /// </summary>
+        /// <param name="predicate">The lambda expression to convert</param>
+        /// <returns>Hybrid filter result containing server filter and client predicate</returns>
+        private HybridFilterResult<T> ConvertLambdaToHybridFilter(Expression<Func<T, bool>> predicate)
+        {
+            var builder = new ODataFilterBuilder();
+            var result = builder.BuildHybridFilter(predicate.Body);
+
+            return new HybridFilterResult<T>
+            {
+                ServerSideFilter = result.ServerSideOData,
+                ClientSidePredicate = result.HasClientSideOperations ? predicate.Compile() : null,
+                RequiresClientFiltering = result.HasClientSideOperations
+            };
+        }
+
+        /// <summary>
+        /// Backwards compatibility: Converts lambda to OData filter (throws if unsupported operations found)
         /// </summary>
         /// <param name="predicate">The lambda expression to convert</param>
         /// <returns>OData filter string</returns>
         private string ConvertLambdaToODataFilter(Expression<Func<T, bool>> predicate)
         {
-            return new ODataFilterBuilder().Build(predicate.Body);
+            var hybridResult = ConvertLambdaToHybridFilter(predicate);
+
+            if (hybridResult.RequiresClientFiltering)
+            {
+                throw new NotSupportedException(
+                    "The lambda expression contains operations not supported by Azure Table Storage. " +
+                    "Use GetCollection/GetCollectionAsync methods which automatically handle hybrid server/client-side filtering.");
+            }
+
+            return hybridResult.ServerSideFilter ?? "";
         }
 
         /// <summary>
-        /// Helper class to build OData filter strings from expression trees
+        /// Result of hybrid filter processing
+        /// </summary>
+        private class HybridFilterResult<TEntity>
+        {
+            public string? ServerSideFilter { get; set; }
+            public Func<TEntity, bool>? ClientSidePredicate { get; set; }
+            public bool RequiresClientFiltering { get; set; }
+        }
+
+        /// <summary>
+        /// Helper class to build OData filter strings from expression trees with intelligent server/client separation
         /// </summary>
         private class ODataFilterBuilder : ExpressionVisitor
         {
             private StringBuilder _filter = new StringBuilder();
+            private bool _hasClientSideOperations = false;
+
+            public FilterAnalysisResult BuildHybridFilter(Expression expression)
+            {
+                _filter.Clear();
+                _hasClientSideOperations = false;
+
+                Visit(expression);
+
+                return new FilterAnalysisResult
+                {
+                    ServerSideOData = _filter.Length > 0 ? _filter.ToString() : null,
+                    HasClientSideOperations = _hasClientSideOperations
+                };
+            }
 
             public string Build(Expression expression)
             {
-                _filter.Clear();
-                Visit(expression);
-                return _filter.ToString();
+                var result = BuildHybridFilter(expression);
+                return result.ServerSideOData ?? "";
             }
 
             protected override Expression VisitBinary(BinaryExpression node)
             {
-                _filter.Append("(");
-                Visit(node.Left);
+                // Handle AND operations - we can extract supported parts for server filtering
+                if (node.NodeType == ExpressionType.AndAlso)
+                {
+                    return HandleAndOperation(node);
+                }
 
-                _filter.Append($" {ConvertOperator(node.NodeType)} ");
+                // Handle OR operations - need both sides supported for server filtering
+                if (node.NodeType == ExpressionType.OrElse)
+                {
+                    return HandleOrOperation(node);
+                }
 
-                Visit(node.Right);
-                _filter.Append(")");
+                // Handle other binary operations
+                return HandleSimpleBinary(node);
+            }
+
+            private Expression HandleAndOperation(BinaryExpression node)
+            {
+                var leftBuilder = new ODataFilterBuilder();
+                var leftResult = leftBuilder.BuildHybridFilter(node.Left);
+
+                var rightBuilder = new ODataFilterBuilder();
+                var rightResult = rightBuilder.BuildHybridFilter(node.Right);
+
+                // AND Operation Logic:
+                // - Can use ANY server-supported parts to reduce dataset
+                // - Client-side will handle the complete filtering
+                // - Safe to combine server parts with AND because we're being MORE restrictive
+
+                var serverParts = new List<string>();
+
+                if (!string.IsNullOrEmpty(leftResult.ServerSideOData))
+                    serverParts.Add($"({leftResult.ServerSideOData})");
+
+                if (!string.IsNullOrEmpty(rightResult.ServerSideOData))
+                    serverParts.Add($"({rightResult.ServerSideOData})");
+
+                if (serverParts.Any())
+                {
+                    _filter.Append(string.Join(" and ", serverParts));
+                    Console.WriteLine($"AND operation - using server filter: {string.Join(" and ", serverParts)}");
+                }
+
+                // Mark for client processing if either side has unsupported operations
+                if (leftResult.HasClientSideOperations || rightResult.HasClientSideOperations)
+                {
+                    _hasClientSideOperations = true;
+                    Console.WriteLine($"AND operation will also apply client-side filtering");
+                }
+
+                return node;
+            } // end HandleAndOperation
+
+            // The issue might be in the HandleOrOperation method. Let me fix it:
+
+            private Expression HandleOrOperation(BinaryExpression node)
+            {
+                var leftBuilder = new ODataFilterBuilder();
+                var leftResult = leftBuilder.BuildHybridFilter(node.Left);
+
+                var rightBuilder = new ODataFilterBuilder();
+                var rightResult = rightBuilder.BuildHybridFilter(node.Right);
+
+                // OR Operation Logic:
+                // - If BOTH sides are fully server-supported → Use server-side OR
+                // - If ANY side needs client processing → Must do ALL processing client-side
+                // - Cannot use partial server filtering for OR because it would miss records
+
+                bool leftFullySupported = !leftResult.HasClientSideOperations && !string.IsNullOrEmpty(leftResult.ServerSideOData);
+                bool rightFullySupported = !rightResult.HasClientSideOperations && !string.IsNullOrEmpty(rightResult.ServerSideOData);
+
+                System.Diagnostics.Debug.WriteLine($"OR Operation Analysis:");
+                System.Diagnostics.Debug.WriteLine($"  Left fully supported: {leftFullySupported}");
+                System.Diagnostics.Debug.WriteLine($"  Right fully supported: {rightFullySupported}");
+
+                if (leftFullySupported && rightFullySupported)
+                {
+                    // Both sides fully supported - can do pure server-side OR
+                    _filter.Append($"({leftResult.ServerSideOData}) or ({rightResult.ServerSideOData})");
+                    System.Diagnostics.Debug.WriteLine($"  Using pure server-side OR");
+                    // No client-side processing needed
+                }
+                else
+                {
+                    // At least one side needs client processing
+                    // CRITICAL: We must mark this for client-side processing AND not add server filtering
+                    _hasClientSideOperations = true;
+
+                    // Do NOT add any server-side filtering for mixed OR operations
+                    // The _filter should remain empty to indicate no server filtering
+
+                    System.Diagnostics.Debug.WriteLine($"  Mixed OR detected - will use client-side filtering only");
+                }
+
+                return node;
+            } // end HandleOrOperation
+
+            private Expression HandleSimpleBinary(BinaryExpression node)
+            {
+                if (IsServerSupported(node.Left) && IsServerSupported(node.Right) && IsSupportedOperator(node.NodeType))
+                {
+                    _filter.Append("(");
+                    Visit(node.Left);
+                    _filter.Append($" {ConvertOperator(node.NodeType)} ");
+                    Visit(node.Right);
+                    _filter.Append(")");
+                }
+                else
+                {
+                    _hasClientSideOperations = true;
+                }
 
                 return node;
             }
@@ -808,35 +1025,55 @@ namespace ASCTableStorage.Data
             /// <summary>
             /// Visits a <see cref="MemberExpression"/> and appends the name of the member to the filter.
             /// </summary>
-            /// <remarks>This method processes the member access expression by appending the name of the
-            /// accessed member  to an internal filter. It does not modify the expression tree and returns the input
-            /// expression unchanged.</remarks>
             /// <param name="node">The <see cref="MemberExpression"/> to visit. Cannot be <see langword="null"/>.</param>
             /// <returns>The original <see cref="MemberExpression"/> passed to the method.</returns>
             protected override Expression VisitMember(MemberExpression node)
             {
-                _filter.Append(node.Member.Name);
+                // Parameter member access (like c.CompanyName) is server-supported
+                if (node.Expression is ParameterExpression)
+                {
+                    _filter.Append(node.Member.Name);
+                    return node;
+                }
+
+                // Try to evaluate other member access (like variables from outer scope)
+                if (!ContainsParameterReference(node))
+                {
+                    try
+                    {
+                        var lambda = Expression.Lambda(node);
+                        var compiled = lambda.Compile();
+                        var result = compiled.DynamicInvoke();
+                        Visit(Expression.Constant(result));
+                        return node;
+                    }
+                    catch
+                    {
+                        _hasClientSideOperations = true;
+                    }
+                }
+                else
+                {
+                    _hasClientSideOperations = true;
+                }
+
                 return node;
             }
 
             /// <summary>
             /// Visits a <see cref="ConstantExpression"/> and appends its value to the filter string.
             /// </summary>
-            /// <remarks>This method processes constant expressions by converting their values into a string
-            /// representation suitable for inclusion in a filter query. The conversion is based on the type of the
-            /// constant value. Supported types include <see cref="string"/>, <see cref="DateTime"/>, <see cref="bool"/>,
-            /// <see cref="Guid"/>, and numeric types. Null values are represented as "null".</remarks>
             /// <param name="node">The <see cref="ConstantExpression"/> to visit. Must not be <c>null</c>.</param>
             /// <returns>The original <see cref="ConstantExpression"/> after processing.</returns>
             protected override Expression VisitConstant(ConstantExpression node)
             {
                 if (node.Value == null)
                 {
-                    _filter.Append("null");
+                    _filter.Append("'__null__'");  // Azure Table Storage representation for null
                 }
                 else if (node.Type == typeof(string))
                 {
-                    _filter.Append($"'{node.Value}'");
+                    _filter.Append($"'{EscapeODataString(node.Value.ToString()!)}'");
                 }
                 else if (node.Type == typeof(DateTime) || node.Type == typeof(DateTime?))
                 {
@@ -857,7 +1094,7 @@ namespace ASCTableStorage.Data
                 }
                 else
                 {
-                    _filter.Append($"'{node.Value}'");
+                    _filter.Append($"'{EscapeODataString(node.Value.ToString()!)}'");
                 }
 
                 return node;
@@ -866,35 +1103,50 @@ namespace ASCTableStorage.Data
             /// <summary>
             /// Visits a <see cref="MethodCallExpression"/> and processes it based on the method being called.
             /// </summary>
-            /// <remarks>This method handles specific method calls on <see cref="string"/> and <see
-            /// cref="DateTime"/> types, as well as attempts to evaluate other method calls dynamically. For <see
-            /// cref="string"/> methods such as <c>Contains</c>, <c>StartsWith</c>, and <c>EndsWith</c>, it generates
-            /// corresponding filter expressions. For <see cref="DateTime"/> methods like <c>AddDays</c>, <c>AddHours</c>,
-            /// and <c>AddMinutes</c>, it evaluates the method call and substitutes the result. If a method call cannot be
-            /// evaluated, it defaults to converting the expression to a string representation.</remarks>
-            /// <param name="node">The <see cref="MethodCallExpression"/> to visit. This represents a method call within an expression tree.</param>
+            /// <param name="node">The <see cref="MethodCallExpression"/> to visit.</param>
             /// <returns>The original <see cref="MethodCallExpression"/> after processing.</returns>
             protected override Expression VisitMethodCall(MethodCallExpression node)
             {
-                // Handle string methods like Contains, StartsWith, EndsWith
-                if (node.Method.DeclaringType == typeof(string))
+                // Handle static string methods that ARE supported by Table Storage
+                if (node.Method.DeclaringType == typeof(string) && node.Method.IsStatic)
+                {
+                    switch (node.Method.Name)
+                    {
+                        case "IsNullOrEmpty":
+                            // Generate condition for "field IS null or empty"
+                            _filter.Append("(");
+                            Visit(node.Arguments[0]);
+                            _filter.Append(" eq '__null__' or ");
+                            Visit(node.Arguments[0]);
+                            _filter.Append(" eq '')");
+                            return node;
+
+                        case "IsNullOrWhiteSpace":
+                            // Table Storage doesn't support trimming, so treat same as IsNullOrEmpty
+                            _filter.Append("(");
+                            Visit(node.Arguments[0]);
+                            _filter.Append(" eq '__null__' or ");
+                            Visit(node.Arguments[0]);
+                            _filter.Append(" eq '')");
+                            return node;
+                    }
+                }
+
+                // Handle instance string methods - these are NOT supported by Table Storage
+                if (node.Method.DeclaringType == typeof(string) && !node.Method.IsStatic)
                 {
                     switch (node.Method.Name)
                     {
                         case "Contains":
-                            Visit(node.Object);
-                            _filter.Append(" substringof ");
-                            Visit(node.Arguments[0]);
-                            return node;
                         case "StartsWith":
-                            Visit(node.Object);
-                            _filter.Append(" startswith ");
-                            Visit(node.Arguments[0]);
-                            return node;
                         case "EndsWith":
-                            Visit(node.Object);
-                            _filter.Append(" endswith ");
-                            Visit(node.Arguments[0]);
+                        case "ToLower":
+                        case "ToUpper":
+                        case "Trim":
+                        case "TrimStart":
+                        case "TrimEnd":
+                            // Mark for client-side processing
+                            _hasClientSideOperations = true;
                             return node;
                     }
                 }
@@ -907,50 +1159,173 @@ namespace ASCTableStorage.Data
                         case "AddDays":
                         case "AddHours":
                         case "AddMinutes":
-                            // For method calls on DateTime, we need to evaluate the expression
-                            var lambda = Expression.Lambda(node);
-                            var compiled = lambda.Compile();
-                            var result = compiled.DynamicInvoke();
-                            Visit(Expression.Constant(result));
-                            return node;
+                        case "AddSeconds":
+                            // For method calls on DateTime, evaluate if possible
+                            if (!ContainsParameterReference(node))
+                            {
+                                try
+                                {
+                                    var lambda = Expression.Lambda(node);
+                                    var compiled = lambda.Compile();
+                                    var result = compiled.DynamicInvoke();
+                                    Visit(Expression.Constant(result));
+                                    return node;
+                                }
+                                catch
+                                {
+                                    _hasClientSideOperations = true;
+                                    return node;
+                                }
+                            }
+                            else
+                            {
+                                _hasClientSideOperations = true;
+                                return node;
+                            }
                     }
                 }
 
-                // Default handling - try to evaluate the method call
-                try
+                // Try to evaluate method calls that don't involve parameters
+                if (!ContainsParameterReference(node))
                 {
-                    var lambda = Expression.Lambda(node);
-                    var compiled = lambda.Compile();
-                    var result = compiled.DynamicInvoke();
-                    Visit(Expression.Constant(result));
+                    try
+                    {
+                        var lambda = Expression.Lambda(node);
+                        var compiled = lambda.Compile();
+                        var result = compiled.DynamicInvoke();
+                        Visit(Expression.Constant(result));
+                        return node;
+                    }
+                    catch
+                    {
+                        _hasClientSideOperations = true;
+                    }
                 }
-                catch
+                else
                 {
-                    // If we can't evaluate, just convert to string
-                    _filter.Append($"'{node}'");
+                    // Method involves parameters, mark for client-side
+                    _hasClientSideOperations = true;
                 }
 
                 return node;
-            }
+            } //end VisitMethodCall
 
             /// <summary>
             /// Visits a <see cref="UnaryExpression"/> and processes it based on its <see cref="ExpressionType"/>.
             /// </summary>
-            /// <remarks>If the <see cref="ExpressionType"/> of the <paramref name="node"/> is <see
-            /// cref="ExpressionType.Not"/>, the method appends "not " to the internal filter and recursively visits the
-            /// operand of the expression. For other unary expression types, the base implementation is invoked.</remarks>
             /// <param name="node">The <see cref="UnaryExpression"/> to visit. Must not be <see langword="null"/>.</param>
             /// <returns>The original <see cref="UnaryExpression"/> after processing.</returns>
             protected override Expression VisitUnary(UnaryExpression node)
             {
                 if (node.NodeType == ExpressionType.Not)
                 {
-                    _filter.Append("not ");
-                    Visit(node.Operand);
+                    // Handle specific cases where we can convert NOT to supported operations
+                    if (node.Operand is MethodCallExpression methodCall)
+                    {
+                        // Handle !string.IsNullOrEmpty() -> convert to "field ne '__null__' and field ne ''"
+                        if (methodCall.Method.DeclaringType == typeof(string) &&
+                            methodCall.Method.IsStatic &&
+                            methodCall.Method.Name == "IsNullOrEmpty")
+                        {
+                            // This means the field IS NOT null or empty (has a value)
+                            _filter.Append("(");
+                            Visit(methodCall.Arguments[0]);
+                            _filter.Append(" ne '__null__' and ");
+                            Visit(methodCall.Arguments[0]);
+                            _filter.Append(" ne '')");
+                            return node;
+                        }
+
+                        // Handle !string.IsNullOrWhiteSpace() 
+                        if (methodCall.Method.DeclaringType == typeof(string) &&
+                            methodCall.Method.IsStatic &&
+                            methodCall.Method.Name == "IsNullOrWhiteSpace")
+                        {
+                            // This means the field IS NOT null or whitespace (has meaningful content)
+                            _filter.Append("(");
+                            Visit(methodCall.Arguments[0]);
+                            _filter.Append(" ne '__null__' and ");
+                            Visit(methodCall.Arguments[0]);
+                            _filter.Append(" ne '')");
+                            return node;
+                        }
+                    }
+
+                    // Handle !booleanExpression -> convert to opposite
+                    if (node.Operand is BinaryExpression binaryExpr)
+                    {
+                        // Convert !(...) to the opposite operation if possible
+                        var oppositeOperator = GetOppositeOperator(binaryExpr.NodeType);
+                        if (oppositeOperator.HasValue &&
+                            IsServerSupported(binaryExpr.Left) &&
+                            IsServerSupported(binaryExpr.Right))
+                        {
+                            _filter.Append("(");
+                            Visit(binaryExpr.Left);
+                            _filter.Append($" {ConvertOperator(oppositeOperator.Value)} ");
+                            Visit(binaryExpr.Right);
+                            _filter.Append(")");
+                            return node;
+                        }
+                    }
+
+                    // Handle !booleanField -> convert to "field eq false"
+                    if (node.Operand is MemberExpression memberExpr &&
+                        memberExpr.Expression is ParameterExpression &&
+                        (memberExpr.Type == typeof(bool) || memberExpr.Type == typeof(bool?)))
+                    {
+                        _filter.Append("(");
+                        Visit(memberExpr);
+                        _filter.Append(" eq false)");
+                        return node;
+                    }
+
+                    // If we can't handle the NOT operation server-side, mark for client processing
+                    _hasClientSideOperations = true;
                     return node;
                 }
 
                 return base.VisitUnary(node);
+            } // end VisitUnary
+            /// <summary>
+            /// Gets the opposite operator for negation purposes
+            /// </summary>
+            private ExpressionType? GetOppositeOperator(ExpressionType nodeType)
+            {
+                return nodeType switch
+                {
+                    ExpressionType.Equal => ExpressionType.NotEqual,
+                    ExpressionType.NotEqual => ExpressionType.Equal,
+                    ExpressionType.GreaterThan => ExpressionType.LessThanOrEqual,
+                    ExpressionType.GreaterThanOrEqual => ExpressionType.LessThan,
+                    ExpressionType.LessThan => ExpressionType.GreaterThanOrEqual,
+                    ExpressionType.LessThanOrEqual => ExpressionType.GreaterThan,
+                    // Note: AND/OR opposites require De Morgan's law which is complex, so we don't handle them
+                    _ => null
+                };
+            }
+
+            private bool IsServerSupported(Expression expression)
+            {
+                var analyzer = new ODataFilterBuilder();
+                var result = analyzer.BuildHybridFilter(expression);
+                return !result.HasClientSideOperations && !string.IsNullOrEmpty(result.ServerSideOData);
+            }
+
+            private bool IsSupportedOperator(ExpressionType nodeType)
+            {
+                return nodeType switch
+                {
+                    ExpressionType.Equal => true,
+                    ExpressionType.NotEqual => true,
+                    ExpressionType.GreaterThan => true,
+                    ExpressionType.GreaterThanOrEqual => true,
+                    ExpressionType.LessThan => true,
+                    ExpressionType.LessThanOrEqual => true,
+                    ExpressionType.AndAlso => true,
+                    ExpressionType.OrElse => true,
+                    _ => false
+                };
             }
 
             private string ConvertOperator(ExpressionType nodeType)
@@ -975,11 +1350,48 @@ namespace ASCTableStorage.Data
                 return nonNullableType == typeof(int) || nonNullableType == typeof(long) ||
                        nonNullableType == typeof(float) || nonNullableType == typeof(double) ||
                        nonNullableType == typeof(decimal) || nonNullableType == typeof(byte) ||
-                       nonNullableType == typeof(short);
+                       nonNullableType == typeof(short) || nonNullableType == typeof(sbyte) ||
+                       nonNullableType == typeof(ushort) || nonNullableType == typeof(uint) ||
+                       nonNullableType == typeof(ulong);
+            }
+
+            private string EscapeODataString(string value)
+            {
+                return value?.Replace("'", "''") ?? "";
+            }
+
+            private bool ContainsParameterReference(Expression expression)
+            {
+                var finder = new ParameterFinder();
+                finder.Visit(expression);
+                return finder.HasParameter;
             }
         }
 
-        #endregion
+        private class FilterAnalysisResult
+        {
+            public string? ServerSideOData { get; set; }
+            public bool HasClientSideOperations { get; set; }
+        }
+
+        private class ParameterFinder : ExpressionVisitor
+        {
+            public bool HasParameter { get; private set; }
+
+            protected override Expression VisitParameter(ParameterExpression node)
+            {
+                HasParameter = true;
+                return node;
+            }
+
+            public override Expression Visit(Expression? node)
+            {
+                if (HasParameter) return node!; // Short circuit
+                return base.Visit(node!);
+            }
+        }
+
+        #endregion Lambda Expression Processing
     } // class DataAccess<T>
 
     /// <summary>

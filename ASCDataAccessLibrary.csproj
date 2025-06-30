@@ -12,20 +12,15 @@
     <Copyright>2025 Answer Sales Calls Inc.</Copyright>
     <PackageIcon>Azure DB Cloud.png</PackageIcon>
     <GenerateDocumentationFile>True</GenerateDocumentationFile>
-    <AssemblyVersion>1.0.2</AssemblyVersion>
+    <AssemblyVersion>1.0.3</AssemblyVersion>
     <PackageOutputPath>Files</PackageOutputPath>
     <BaseOutputPath></BaseOutputPath>
     <DocumentationFile></DocumentationFile>
     <RootNamespace>ASCTableStorage</RootNamespace>
-    <Version>1.0.2</Version>
-    <PackageReadmeFile>getting-started-guide-102.md</PackageReadmeFile>
-    <PackageReleaseNotes>updated and refactored the code to allow for 
-
-Error Logging capability to allow logging of your errors to the Azure Table Store
-
-Queueing of data to the Azure Table Store as needed for any failed and continued processes
-
-DataAccess is now sync and async. Allows for paging data. Allows for Lamda Functions to define queries
+    <Version>1.0.4</Version>
+    <PackageReadmeFile>getting-started-guide-103.md</PackageReadmeFile>
+    <PackageReleaseNotes>Updated Queueing to now be called async or sync
+Bug fixes with Lambda querying for data searching. Will now attempt to provide you as little data it can provide from a simplified server-side approach, and then utilize the remainder of your query client side to return the desired results.
 </PackageReleaseNotes>
   </PropertyGroup>
 
@@ -43,6 +38,10 @@ DataAccess is now sync and async. Allows for paging data. Allows for Lamda Funct
 
   <ItemGroup>
     <None Update="getting-started-guide-102.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Update="getting-started-guide-103.md">
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>
