@@ -12,16 +12,20 @@
     <Copyright>2025 Answer Sales Calls Inc.</Copyright>
     <PackageIcon>Azure DB Cloud.png</PackageIcon>
     <GenerateDocumentationFile>True</GenerateDocumentationFile>
-    <AssemblyVersion>1.0.3</AssemblyVersion>
+    <AssemblyVersion>2.0</AssemblyVersion>
     <PackageOutputPath>Files</PackageOutputPath>
     <BaseOutputPath></BaseOutputPath>
     <DocumentationFile></DocumentationFile>
     <RootNamespace>ASCTableStorage</RootNamespace>
-    <Version>1.0.4</Version>
-    <PackageReadmeFile>getting-started-guide-103.md</PackageReadmeFile>
-    <PackageReleaseNotes>Updated Queueing to now be called async or sync
-Bug fixes with Lambda querying for data searching. Will now attempt to provide you as little data it can provide from a simplified server-side approach, and then utilize the remainder of your query client side to return the desired results.
-</PackageReleaseNotes>
+    <Version>2.0</Version>
+    <PackageReadmeFile>getting-started-guide-20.md</PackageReadmeFile>
+    <PackageReleaseNotes>## **Release Notes - ASCDataAccessLibrary v2.0**
+
+**Major Release: Tag-Based Blob Indexing and Lambda Expression Support**
+
+This release adds **tag-based indexing for Azure Blob Storage** with up to 10 searchable tags per blob for fast queries, **lambda expression support** for both Table and Blob storage operations, and **hybrid filtering** that automatically optimizes between server-side and client-side processing. The AzureBlobs class now operates on a single container and includes lambda-based bulk operations for downloads and deletes. Key improvements include 10-100x faster blob searches using tags, simplified upload methods with automatic naming, and enhanced file type management. **Breaking changes**: AzureBlobs constructor now requires container name, and some method signatures have been simplified. Lambda expressions work with both storage types: `dataAccess.GetCollectionAsync(x =&gt; x.Status == "Active")` for tables and `blobs.GetCollectionAsync(b =&gt; b.Tags["type"] == "invoice")` for blobs. The library now provides enterprise-grade performance with modern C# syntax while maintaining full async/await support.</PackageReleaseNotes>
+    <PackageLicenseFile>mit_license.md</PackageLicenseFile>
+    <PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
   </PropertyGroup>
 
   <ItemGroup>
@@ -42,6 +46,18 @@ Bug fixes with Lambda querying for data searching. Will now attempt to provide y
       <PackagePath>\</PackagePath>
     </None>
     <None Update="getting-started-guide-103.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Update="getting-started-guide-20.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Update="MIT License.pdf">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Update="mit_license.md">
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>

@@ -29,9 +29,21 @@ namespace ASCTableStorage.Models
     /// </summary> 
     public abstract class TableEntityBase : ITableEntity
     {
+        /// <summary>
+        /// Represents the partition value of table storage. Acts like a Foreign Key relationship
+        /// </summary>
         public string? PartitionKey { get; set; }
+        /// <summary>
+        /// Must be unique within the table. Acts like a Primary Key relationship
+        /// </summary>
         public string? RowKey { get; set; }
+        /// <summary>
+        /// The datetime the data was managed into the table. Is not constant. Updates on each change to the row.
+        /// </summary>
         public DateTimeOffset Timestamp { get; set; }
+        /// <summary>
+        /// Immutable Tag applied by table storage that helps it identify this unique row of data.
+        /// </summary>
         public string? ETag { get; set; }
 
         private const int maxFieldSize = 31999; // Azure Table Storage field size limit of characters == 64Kb or 32K chars
@@ -174,8 +186,14 @@ namespace ASCTableStorage.Models
         /// Value of the object for retrieval
         /// </summary>
         public string? Value { get; set; }
+        /// <summary>
+        /// The table that will get created in your Table Storage account for managing session data.
+        /// </summary>
         [XmlIgnore]
         public string TableReference => "AppSessionData";
+        /// <summary>
+        /// The Session ID
+        /// </summary>
         public string GetIDValue() => this.SessionID!;
     } //end class BOTSessionData
 
@@ -185,160 +203,280 @@ namespace ASCTableStorage.Models
     public class BlobData
     {
         /// <summary>
-        /// The name of the blob in storage
+        /// The blob name in Azure Storage
         /// </summary>
         public string? Name { get; set; }
 
         /// <summary>
-        /// Original filename before upload
+        /// The original filename when uploaded
         /// </summary>
         public string? OriginalFilename { get; set; }
 
         /// <summary>
-        /// Content type
+        /// The MIME content type of the blob
         /// </summary>
         public string? ContentType { get; set; }
 
         /// <summary>
-        /// Size in bytes
+        /// Size of the blob in bytes
         /// </summary>
         public long Size { get; set; }
 
         /// <summary>
-        /// Upload date
+        /// When the blob was uploaded
         /// </summary>
         public DateTime UploadDate { get; set; }
 
         /// <summary>
-        /// Full URL to the blob
+        /// Full URL to access the blob
         /// </summary>
         public Uri? Url { get; set; }
 
         /// <summary>
-        /// Standard file types and their corresponding MIME types
+        /// Container name where the blob is stored
         /// </summary>
-        public static Dictionary<string, string> FileTypes
+        public string? ContainerName { get; set; }
+
+        /// <summary>
+        /// Index tags for fast searching (max 10 tags supported by Azure)
+        /// These are searchable using tag queries
+        /// </summary>
+        public Dictionary<string, string> Tags { get; set; } = new Dictionary<string, string>();
+
+        /// <summary>
+        /// Metadata associated with the blob (not searchable but accessible)
+        /// Use for additional information that doesn't need to be searchable
+        /// </summary>
+        public Dictionary<string, string> Metadata { get; set; } = new Dictionary<string, string>();
+
+        /// <summary>
+        /// Static dictionary of allowed file types and their MIME types
+        /// Can be modified using AzureBlobs.AddAllowedFileType() and RemoveAllowedFileType()
+        /// </summary>
+        public static Dictionary<string, string> FileTypes { get; set; } = new Dictionary<string, string>
         {
-            get => new()
-            { 
-                // Images
-                { ".jpg", "image/jpeg" },
-                { ".jpeg", "image/jpeg" },
-                { ".png", "image/png" },
-                { ".gif", "image/gif" },
-                { ".bmp", "image/bmp" },
-                { ".svg", "image/svg+xml" },
-                { ".tiff", "image/tiff" },
-                { ".tif", "image/tiff" },
-                { ".webp", "image/webp" },
-            
-                // Documents
-                { ".pdf", "application/pdf" },
-                { ".txt", "text/plain" },
-            
-                // Microsoft Office Documents
-                // Word
-                { ".doc", "application/msword" },
-                { ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document" },
-                { ".docm", "application/vnd.ms-word.document.macroEnabled.12" },
-                { ".dot", "application/msword" },
-                { ".dotx", "application/vnd.openxmlformats-officedocument.wordprocessingml.template" },
-                { ".dotm", "application/vnd.ms-word.template.macroEnabled.12" },
-            
-                // Excel
-                { ".xls", "application/vnd.ms-excel" },
-                { ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
-                { ".xlsm", "application/vnd.ms-excel.sheet.macroEnabled.12" },
-                { ".xlt", "application/vnd.ms-excel" },
-                { ".xltx", "application/vnd.openxmlformats-officedocument.spreadsheetml.template" },
-                { ".xltm", "application/vnd.ms-excel.template.macroEnabled.12" },
-                { ".xlsb", "application/vnd.ms-excel.sheet.binary.macroEnabled.12" },
-            
-                // PowerPoint
-                { ".ppt", "application/vnd.ms-powerpoint" },
-                { ".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation" },
-                { ".pptm", "application/vnd.ms-powerpoint.presentation.macroEnabled.12" },
-                { ".pot", "application/vnd.ms-powerpoint" },
-                { ".potx", "application/vnd.openxmlformats-officedocument.presentationml.template" },
-                { ".potm", "application/vnd.ms-powerpoint.template.macroEnabled.12" },
-                { ".pps", "application/vnd.ms-powerpoint" },
-                { ".ppsx", "application/vnd.openxmlformats-officedocument.presentationml.slideshow" },
-                { ".ppsm", "application/vnd.ms-powerpoint.slideshow.macroEnabled.12" },
-            
-                // Access
-                { ".accdb", "application/vnd.ms-access" },
-                { ".accde", "application/vnd.ms-access" },
-                { ".accdt", "application/vnd.ms-access" },
-                { ".mdb", "application/vnd.ms-access" },
-            
-                // Publisher
-                { ".pub", "application/vnd.ms-publisher" },
-            
-                // OneNote
-                { ".one", "application/onenote" },
-            
-                // Visio
-                { ".vsd", "application/vnd.visio" },
-                { ".vsdx", "application/vnd.ms-visio.drawing" },
-                { ".vsdm", "application/vnd.ms-visio.drawing.macroEnabled.12" },
-                { ".vst", "application/vnd.visio" },
-                { ".vstx", "application/vnd.ms-visio.template" },
-                { ".vstm", "application/vnd.ms-visio.template.macroEnabled.12" },
-            
-                // Project
-                { ".mpp", "application/vnd.ms-project" },
-            
-                // OpenDocument Formats
-                { ".odt", "application/vnd.oasis.opendocument.text" },
-                { ".ods", "application/vnd.oasis.opendocument.spreadsheet" },
-                { ".odp", "application/vnd.oasis.opendocument.presentation" },
-            
-                // Audio Files
-                { ".mp3", "audio/mpeg" },
-                { ".wav", "audio/wav" },
-                { ".ogg", "audio/ogg" },
-                { ".flac", "audio/flac" },
-                { ".aac", "audio/aac" },
-                { ".m4a", "audio/mp4" },
-                { ".wma", "audio/x-ms-wma" },
-                { ".aiff", "audio/aiff" },
-                { ".alac", "audio/alac" },
-                { ".mid", "audio/midi" },
-                { ".midi", "audio/midi" },
-                { ".oga", "audio/ogg" },
-                { ".opus", "audio/opus" },
-                { ".ra", "audio/x-realaudio" },
-                { ".webm", "audio/webm" },
-            
-                // Video Files
-                { ".mp4", "video/mp4" },
-                { ".avi", "video/x-msvideo" },
-                { ".mov", "video/quicktime" },
-                { ".wmv", "video/x-ms-wmv" },
-                { ".mkv", "video/x-matroska" },
-                { ".flv", "video/x-flv" },
-                { ".webm", "video/webm" },
-            
-                // Data Files
-                { ".csv", "text/csv" },
-                { ".json", "application/json" },
-                { ".xml", "application/xml" },
-                { ".yaml", "application/yaml" },
-                { ".yml", "application/yaml" },
-            
-                // Web Files
-                { ".html", "text/html" },
-                { ".htm", "text/html" },
-                { ".css", "text/css" },
-                { ".js", "application/javascript" },
-            
-                // Compressed Files
-                { ".zip", "application/zip" },
-                { ".rar", "application/x-rar-compressed" },
-                { ".7z", "application/x-7z-compressed" },
-                { ".tar", "application/x-tar" },
-                { ".gz", "application/gzip" }
-            };
+            // Documents
+            { ".pdf", "application/pdf" },
+            { ".doc", "application/msword" },
+            { ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document" },
+            { ".xls", "application/vnd.ms-excel" },
+            { ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+            { ".ppt", "application/vnd.ms-powerpoint" },
+            { ".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation" },
+            { ".txt", "text/plain" },
+            { ".rtf", "application/rtf" },
+            { ".csv", "text/csv" },
+
+            // Images
+            { ".jpg", "image/jpeg" },
+            { ".jpeg", "image/jpeg" },
+            { ".png", "image/png" },
+            { ".gif", "image/gif" },
+            { ".bmp", "image/bmp" },
+            { ".tiff", "image/tiff" },
+            { ".tif", "image/tiff" },
+            { ".svg", "image/svg+xml" },
+            { ".webp", "image/webp" },
+            { ".ico", "image/x-icon" },
+
+            // Audio
+            { ".mp3", "audio/mpeg" },
+            { ".wav", "audio/wav" },
+            { ".ogg", "audio/ogg" },
+            { ".m4a", "audio/mp4" },
+            { ".aac", "audio/aac" },
+            { ".flac", "audio/flac" },
+
+            // Video
+            { ".mp4", "video/mp4" },
+            { ".avi", "video/x-msvideo" },
+            { ".mov", "video/quicktime" },
+            { ".wmv", "video/x-ms-wmv" },
+            { ".flv", "video/x-flv" },
+            { ".webm", "video/webm" },
+            { ".mkv", "video/x-matroska" },
+
+            // Archives
+            { ".zip", "application/zip" },
+            { ".rar", "application/vnd.rar" },
+            { ".7z", "application/x-7z-compressed" },
+            { ".tar", "application/x-tar" },
+            { ".gz", "application/gzip" },
+
+            // Web
+            { ".html", "text/html" },
+            { ".htm", "text/html" },
+            { ".css", "text/css" },
+            { ".js", "application/javascript" },
+            { ".json", "application/json" },
+            { ".xml", "application/xml" },
+
+            // Programming
+            { ".cs", "text/plain" },
+            { ".java", "text/plain" },
+            { ".cpp", "text/plain" },
+            { ".c", "text/plain" },
+            { ".h", "text/plain" },
+            { ".py", "text/plain" },
+            { ".php", "text/plain" },
+            { ".rb", "text/plain" },
+            { ".go", "text/plain" },
+            { ".sql", "text/plain" }
+        };
+
+        /// <summary>
+        /// Gets a tag value by key, returns null if not found
+        /// </summary>
+        /// <param name="tagKey">The tag key to lookup</param>
+        /// <returns>Tag value or null if not found</returns>
+        public string? GetTag(string tagKey)
+        {
+            return Tags.TryGetValue(tagKey, out var value) ? value : null;
+        }
+
+        /// <summary>
+        /// Sets a tag value (adds or updates)
+        /// </summary>
+        /// <param name="tagKey">The tag key</param>
+        /// <param name="tagValue">The tag value</param>
+        /// <exception cref="InvalidOperationException">Thrown if trying to add more than 10 tags</exception>
+        public void SetTag(string tagKey, string tagValue)
+        {
+            if (!Tags.ContainsKey(tagKey) && Tags.Count >= 10)
+            {
+                throw new InvalidOperationException("Azure Blob Storage supports a maximum of 10 index tags per blob");
+            }
+            Tags[tagKey] = tagValue;
+        }
+
+        /// <summary>
+        /// Removes a tag by key
+        /// </summary>
+        /// <param name="tagKey">The tag key to remove</param>
+        /// <returns>True if the tag was removed, false if it didn't exist</returns>
+        public bool RemoveTag(string tagKey)
+        {
+            return Tags.Remove(tagKey);
+        }
+
+        /// <summary>
+        /// Gets metadata value by key, returns null if not found
+        /// </summary>
+        /// <param name="metadataKey">The metadata key to lookup</param>
+        /// <returns>Metadata value or null if not found</returns>
+        public string? GetMetadata(string metadataKey)
+        {
+            return Metadata.TryGetValue(metadataKey, out var value) ? value : null;
+        }
+
+        /// <summary>
+        /// Sets metadata value (adds or updates)
+        /// </summary>
+        /// <param name="metadataKey">The metadata key</param>
+        /// <param name="metadataValue">The metadata value</param>
+        public void SetMetadata(string metadataKey, string metadataValue)
+        {
+            Metadata[metadataKey] = metadataValue;
+        }
+
+        /// <summary>
+        /// Removes metadata by key
+        /// </summary>
+        /// <param name="metadataKey">The metadata key to remove</param>
+        /// <returns>True if the metadata was removed, false if it didn't exist</returns>
+        public bool RemoveMetadata(string metadataKey)
+        {
+            return Metadata.Remove(metadataKey);
+        }
+
+        /// <summary>
+        /// Checks if the blob has a specific tag
+        /// </summary>
+        /// <param name="tagKey">The tag key to check</param>
+        /// <param name="tagValue">Optional specific value to check for</param>
+        /// <returns>True if tag exists (and matches value if provided)</returns>
+        public bool HasTag(string tagKey, string? tagValue = null)
+        {
+            if (!Tags.TryGetValue(tagKey, out var existingValue))
+                return false;
+
+            return tagValue == null || existingValue == tagValue;
+        }
+
+        /// <summary>
+        /// Gets a human-readable file size string
+        /// </summary>
+        /// <returns>Formatted file size (e.g., "1.5 MB", "532 KB")</returns>
+        public string GetFormattedSize()
+        {
+            string[] sizeUnits = { "B", "KB", "MB", "GB", "TB" };
+            double size = Size;
+            int unitIndex = 0;
+
+            while (size >= 1024 && unitIndex < sizeUnits.Length - 1)
+            {
+                size /= 1024;
+                unitIndex++;
+            }
+
+            return $"{size:F1} {sizeUnits[unitIndex]}";
+        }
+
+        /// <summary>
+        /// Gets the file extension from the blob name
+        /// </summary>
+        /// <returns>File extension including the dot, or empty string if no extension</returns>
+        public string GetFileExtension()
+        {
+            return !string.IsNullOrEmpty(Name) ? Path.GetExtension(Name) : string.Empty;
+        }
+
+        /// <summary>
+        /// Checks if the blob is an image based on its content type
+        /// </summary>
+        /// <returns>True if the blob is an image</returns>
+        public bool IsImage()
+        {
+            return !string.IsNullOrEmpty(ContentType) && ContentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Checks if the blob is a document based on its content type
+        /// </summary>
+        /// <returns>True if the blob is a document</returns>
+        public bool IsDocument()
+        {
+            if (string.IsNullOrEmpty(ContentType)) return false;
+
+            return ContentType.StartsWith("application/", StringComparison.OrdinalIgnoreCase) ||
+                   ContentType.StartsWith("text/", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Checks if the blob is a video based on its content type
+        /// </summary>
+        /// <returns>True if the blob is a video</returns>
+        public bool IsVideo()
+        {
+            return !string.IsNullOrEmpty(ContentType) && ContentType.StartsWith("video/", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Checks if the blob is audio based on its content type
+        /// </summary>
+        /// <returns>True if the blob is audio</returns>
+        public bool IsAudio()
+        {
+            return !string.IsNullOrEmpty(ContentType) && ContentType.StartsWith("audio/", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Returns a string representation of the blob data
+        /// </summary>
+        /// <returns>String containing blob name, size, and upload date</returns>
+        public override string ToString()
+        {
+            return $"{OriginalFilename ?? Name} ({GetFormattedSize()}) - {UploadDate:yyyy-MM-dd HH:mm:ss}";
         }
     } //end class BlobData
 
@@ -743,5 +881,108 @@ namespace ASCTableStorage.Models
         }
     } //end class ErrorLogData
 
+
+    #region Blob Supporting Classes
+
+    /// <summary>
+    /// Information for uploading a blob with tags and metadata
+    /// </summary>
+    public class BlobUploadInfo
+    {
+        /// <summary>
+        /// Local file path to upload
+        /// </summary>
+        public string FilePath { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Optional index tags for fast searching (max 10)
+        /// </summary>
+        public Dictionary<string, string>? IndexTags { get; set; }
+
+        /// <summary>
+        /// Optional metadata (not searchable but accessible)
+        /// </summary>
+        public Dictionary<string, string>? Metadata { get; set; }
+    }
+
+    /// <summary>
+    /// Result of a blob upload operation
+    /// </summary>
+    public class BlobUploadResult
+    {
+        /// <summary>
+        /// Whether the upload was successful
+        /// </summary>
+        public bool Success { get; set; }
+
+        /// <summary>
+        /// URI of the uploaded blob (if successful)
+        /// </summary>
+        public Uri? BlobUri { get; set; }
+
+        /// <summary>
+        /// Error message (if unsuccessful)
+        /// </summary>
+        public string? ErrorMessage { get; set; }
+
+        /// <summary>
+        /// Original filename
+        /// </summary>
+        public string FileName { get; set; } = string.Empty;
+    }
+
+    /// <summary>
+    /// Result of a blob download operation
+    /// </summary>
+    public class BlobOperationResult
+    {
+        /// <summary>
+        /// Whether the download was successful
+        /// </summary>
+        public bool Success { get; set; }
+
+        /// <summary>
+        /// Name of the blob that was downloaded
+        /// </summary>
+        public string BlobName { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Local file path where blob was saved (if successful)
+        /// </summary>
+        public string? DestinationPath { get; set; }
+
+        /// <summary>
+        /// Error message (if unsuccessful)
+        /// </summary>
+        public string? ErrorMessage { get; set; }
+    }
+
+    /// <summary>
+    /// Result of a blob stream download operation
+    /// </summary>
+    public class BlobStreamDownloadResult
+    {
+        /// <summary>
+        /// Whether the download was successful
+        /// </summary>
+        public bool Success { get; set; }
+
+        /// <summary>
+        /// Name of the blob that was downloaded
+        /// </summary>
+        public string BlobName { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Stream containing the blob data (if successful)
+        /// </summary>
+        public Stream? Stream { get; set; }
+
+        /// <summary>
+        /// Error message (if unsuccessful)
+        /// </summary>
+        public string? ErrorMessage { get; set; }
+    }
+
+    #endregion Blob Supporting Classes
 
 } // end namespace ASCTableStorage.Models
