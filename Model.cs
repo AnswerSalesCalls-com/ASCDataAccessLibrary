@@ -2,6 +2,7 @@
 using ASCTableStorage.Data;
 using Microsoft.Azure.Cosmos.Table;
 using Newtonsoft.Json;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -22,6 +23,210 @@ namespace ASCTableStorage.Models
         /// Ensures all ID values are generically accessible
         /// </summary>
         string GetIDValue();
+    }
+
+    /// <summary>
+    /// Interface for entities that support dynamic properties
+    /// </summary>
+    public interface IDynamicProperties
+    {
+        /// <summary>
+        /// Gets the dynamic properties dictionary
+        /// </summary>
+        IDictionary<string, object> DynamicProperties { get; }
+    }
+
+    /// <summary>
+    /// Allows for the creation of dynamic table entities with flexible properties.
+    /// Useful for scenarios where the schema may vary or is not known at compile time.
+    /// </summary>
+    public class DynamicEntity : TableEntityBase, ITableExtra, IDynamicProperties
+    {
+        private readonly ConcurrentDictionary<string, object> _properties = new();
+        private string _tableName = "DynamicEntities";
+
+        /// <summary>
+        /// Creates a new dynamic table entity
+        /// </summary>
+        public DynamicEntity(string tableName, string partitionKey, string rowKey)
+        {
+            _tableName = tableName ?? throw new ArgumentNullException(nameof(tableName));
+            PartitionKey = partitionKey ?? throw new ArgumentNullException(nameof(partitionKey));
+            RowKey = rowKey ?? throw new ArgumentNullException(nameof(rowKey));
+        }
+
+        /// <summary>
+        /// Parameterless constructor for deserialization
+        /// </summary>
+        public DynamicEntity(){}
+
+        #region ITableExtra Implementation
+
+        /// <summary>
+        /// The table that will get created in your Table Storage account for managing this data.
+        /// </summary>
+        public string TableReference
+        {
+            get => _tableName;
+            set => _tableName = value ?? throw new ArgumentNullException(nameof(value));
+        }
+
+        /// <summary>
+        /// The ID value is always the RowKey for dynamic entities
+        /// </summary>
+        /// <returns></returns>
+        public string GetIDValue() => RowKey ?? Guid.NewGuid().ToString();
+
+        #endregion ITableExtra Implementation
+
+        #region IDynamicProperties Implementation
+
+        /// <summary>
+        /// Maintains the dynamic properties for the entity
+        /// </summary>
+        public IDictionary<string, object> DynamicProperties => _properties;
+
+        #endregion IDynamicProperties Implementation
+
+        #region Property Management Methods
+
+        /// <summary>
+        /// Attempts to set a dynamic property by name
+        /// </summary>
+        /// <param name="name">The name of the property to set</param>
+        /// <param name="value">The value of the property to set</param>
+        public void SetProperty(string name, object value)
+        {
+            ValidatePropertyName(name);
+            if (value == null)
+                _properties.TryRemove(name, out _);
+            else
+                _properties[name] = value;
+        }
+
+        /// <summary>
+        /// Attempts to retrieve a dynamic property by name and convert it to the specified type
+        /// </summary>
+        /// <typeparam name="T">The datatype to convert to</typeparam>
+        /// <param name="name">The name of the property to retrieve</param>
+        public T GetProperty<T>(string name)
+        {
+            if (_properties.TryGetValue(name, out var value))
+            {
+                if (value is T typedValue)
+                    return typedValue;
+                try
+                {
+                    return (T)Convert.ChangeType(value, typeof(T));
+                }
+                catch
+                {
+                    return default!;
+                }
+            }
+            return default!;
+        }
+
+        /// <summary>
+        /// Retrieves a dynamic property by name
+        /// </summary>
+        /// <param name="name">The name of the property to retrieve</param>
+        public object GetProperty(string name)
+        {
+            return _properties.TryGetValue(name, out var value) ? value : null!;
+        }
+
+        /// <summary>
+        /// True if the named property exists
+        /// </summary>
+        /// <param name="name">The name of the property to check</param>
+        public bool HasProperty(string name) => _properties.ContainsKey(name);
+
+        /// <summary>
+        /// Removes a dynamic property by name
+        /// </summary>
+        /// <param name="name">The name of the property to remove</param>
+        public void RemoveProperty(string name) => _properties.TryRemove(name, out _);
+
+        /// <summary>
+        /// Returns a copy of all dynamic properties managed by this entity
+        /// </summary>
+        public Dictionary<string, object> GetAllProperties() => new(_properties);
+
+        /// <summary>
+        /// Provides an indexer for dynamic property access
+        /// </summary>
+        /// <param name="propertyName">The name of the property to access</param>
+        public object this[string propertyName]
+        {
+            get => GetProperty(propertyName);
+            set => SetProperty(propertyName, value);
+        }
+
+        private void ValidatePropertyName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                throw new ArgumentException("Property name cannot be null or empty");
+
+            var reserved = new[] { "PartitionKey", "RowKey", "Timestamp", "ETag" };
+            if (reserved.Contains(name))
+                throw new ArgumentException($"'{name}' is a reserved property name");
+
+            if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^[a-zA-Z_][a-zA-Z0-9_]*$"))
+                throw new ArgumentException($"Property name '{name}' contains invalid characters");
+        }
+
+        #endregion Property Management Methods
+
+        /// <summary>
+        /// Provides a string representation of the dynamic entity for debugging purposes
+        /// </summary>
+        public override string ToString()
+            => $"DynamicEntity[Table={TableReference}, PK={PartitionKey}, RK={RowKey}, Properties={_properties.Count}]";       
+    }
+
+    /// <summary>
+    /// Lightweight type cache specifically for TableEntityBase serialization performance
+    /// </summary>
+    internal static class TableEntityTypeCache
+    {
+        private static readonly ConcurrentDictionary<Type, PropertyInfo[]> _writablePropertiesCache = new();
+        private static readonly ConcurrentDictionary<Type, bool> _isDateTimeTypeCache = new();
+        private static readonly ConcurrentDictionary<Type, Dictionary<string, PropertyInfo>> _propertyLookupCache = new();
+
+        /// <summary>
+        /// Gets cached writable properties for a type
+        /// </summary>
+        public static PropertyInfo[] GetWritableProperties(Type type)
+        {
+            return _writablePropertiesCache.GetOrAdd(type, t =>
+                t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                 .Where(p => p.CanWrite)
+                 .ToArray());
+        }
+
+        /// <summary>
+        /// Gets a dictionary for fast property lookup by name
+        /// </summary>
+        public static Dictionary<string, PropertyInfo> GetPropertyLookup(Type type)
+        {
+            return _propertyLookupCache.GetOrAdd(type, t =>
+            {
+                var props = GetWritableProperties(t);
+                return props.ToDictionary(p => p.Name, p => p, StringComparer.OrdinalIgnoreCase);
+            });
+        }
+
+        /// <summary>
+        /// Checks if a type is DateTime or DateTime?
+        /// </summary>
+        public static bool IsDateTimeType(Type type)
+        {
+            return _isDateTimeTypeCache.GetOrAdd(type, t =>
+                t == typeof(DateTime) ||
+                t == typeof(DateTime?) ||
+                t.AssemblyQualifiedName?.Contains("DateTime") == true);
+        }
     }
 
     /// <summary>
@@ -56,29 +261,40 @@ namespace ASCTableStorage.Models
         /// <param name="ctx">The data context</param>
         public virtual void ReadEntity(IDictionary<string, EntityProperty> props, OperationContext ctx)
         {
-            PropertyInfo[] pInfo = this.GetType().GetProperties();
-            PropertyInfo p;
+            // Get cached property lookup for this type
+            var propertyLookup = TableEntityTypeCache.GetPropertyLookup(this.GetType());
 
-            //Find string overflow fields within the dB. Discover which Object Prop the field reps and append the data to that Prop
-            var overflowFields = props.Where(p => p.Value.PropertyType == EdmType.String && p.Key.Contains(fieldExtendedName)).ToList(); //Coming from the dB
+            // Track which properties we've processed
+            var processedProps = new HashSet<string>();
+
+            // Find string overflow fields
+            var overflowFields = props.Where(p => p.Value.PropertyType == EdmType.String && p.Key.Contains(fieldExtendedName)).ToList();
             if (overflowFields.Any())
             {
-                //Find and add the original Field Names as well.
+                // Process chunked fields
                 List<string> origFieldNames = overflowFields.Select(p => p.Key.Substring(0, p.Key.IndexOf(fieldExtendedName))).Distinct().ToList();
-                foreach (string origField in origFieldNames) overflowFields.Insert(0, new KeyValuePair<string, EntityProperty>(origField, props[origField]));
+                foreach (string origField in origFieldNames)
+                {
+                    overflowFields.Insert(0, new KeyValuePair<string, EntityProperty>(origField, props[origField]));
+                    processedProps.Add(origField);
+                }
+
                 List<(string Key, string Value, bool IsLastTrip)> propData = new();
                 string pBaseName;
                 int extNameIndex = -1;
                 int pdIndex = -1;
-                foreach (var eP in overflowFields) //extract the name of the Object Field and combine/append the data into a Dictionary to go into the object property
+
+                foreach (var eP in overflowFields)
                 {
+                    processedProps.Add(eP.Key);
                     extNameIndex = eP.Key.IndexOf(fieldExtendedName);
                     pBaseName = (extNameIndex > 0) ? eP.Key.Substring(0, extNameIndex) : eP.Key;
                     pdIndex = propData.FindIndex(v => v.Key == pBaseName);
+
                     if (pdIndex != -1)
                     {
                         var pD = propData[pdIndex];
-                        if (!pD.IsLastTrip) pD = (pD.Key, pD.Value + eP.Value.StringValue, pD.IsLastTrip); //considers contracting data sizes. Stop adding data when its noticed the field size is below threshold
+                        if (!pD.IsLastTrip) pD = (pD.Key, pD.Value + eP.Value.StringValue, pD.IsLastTrip);
                         pD.IsLastTrip = eP.Value.StringValue.Length < maxFieldSize;
                         propData[pdIndex] = pD;
                     }
@@ -88,35 +304,49 @@ namespace ASCTableStorage.Models
                     }
                 }
 
+                // Use cached property lookup instead of repeated LINQ searches
                 foreach (var data in propData)
                 {
-                    p = pInfo.FirstOrDefault(p => p.CanWrite && p.Name == data.Key)!;
-                    if (p != null) p.SetValue(this, data.Value); //put combined data into the object property
+                    if (propertyLookup.TryGetValue(data.Key, out var prop))
+                    {
+                        prop.SetValue(this, data.Value);
+                    }
+                    else if (this is IDynamicProperties dynamic)
+                    {
+                        dynamic.DynamicProperties[data.Key] = data.Value;
+                    }
                 }
             }
 
-            //otherwise take all other fields and append them to the output. Everything still needs to get processed
-            var nonOverflowFields = props.Where(p => !overflowFields.Select(of => of.Key).Contains(p.Key));
+            // Skip system properties
+            var systemProps = new HashSet<string> { "PartitionKey", "RowKey", "Timestamp", "ETag", "odata.etag" };
+
+            // Process all other fields
+            var nonOverflowFields = props.Where(p => !processedProps.Contains(p.Key) && !systemProps.Contains(p.Key) && !p.Key.StartsWith("odata."));
             foreach (var f in nonOverflowFields)
             {
-                p = pInfo.FirstOrDefault(p => p.CanWrite && p.Name == f.Key)!;
-                if (p != null)
+                processedProps.Add(f.Key);
+
+                if (propertyLookup.TryGetValue(f.Key, out var prop))
                 {
                     try
                     {
-                        //fill the property with the appropriate datatype
-                        //TODO: This may cause issues later as we find out datatypes not considered
-                        if (p.PropertyType.AssemblyQualifiedName!.Contains("DateTime"))
-                            p.SetValue(this, Convert.ToDateTime(f.Value.PropertyAsObject));
-                        else if (p.PropertyType.IsEnum)
-                            p.SetValue(this, Enum.Parse(p.PropertyType, f.Value.ToString()));
+                        // Use cached type check for DateTime
+                        if (TableEntityTypeCache.IsDateTimeType(prop.PropertyType))
+                            prop.SetValue(this, Convert.ToDateTime(f.Value.PropertyAsObject));
+                        else if (prop.PropertyType.IsEnum)
+                            prop.SetValue(this, Enum.Parse(prop.PropertyType, f.Value.ToString()));
                         else
-                            p.SetValue(this, Convert.ChangeType(f.Value.PropertyAsObject, p.PropertyType));
+                            prop.SetValue(this, Convert.ChangeType(f.Value.PropertyAsObject, prop.PropertyType));
                     }
                     catch (Exception) { }
                 }
+                else if (this is IDynamicProperties dynamic)
+                {
+                    dynamic.DynamicProperties[f.Key] = ConvertFromEntityProperty(f.Value);
+                }
             }
-        }
+        } //end ReadEntity
 
         /// <summary>
         /// Serialize the data to the database chunking any large data blocks into separated DB fields
@@ -125,40 +355,105 @@ namespace ASCTableStorage.Models
         public virtual IDictionary<string, EntityProperty> WriteEntity(OperationContext ctx)
         {
             Dictionary<string, EntityProperty> ret = new();
-            string currValue;
-            int howManyChunks;
-            int cursor;
-            string fieldName;
-            int charsToGrab;
-            foreach (PropertyInfo pI in this.GetType().GetProperties())
+
+            // Get cached properties once instead of using reflection each time
+            var properties = TableEntityTypeCache.GetWritableProperties(this.GetType());
+
+            foreach (PropertyInfo pI in properties)
             {
                 if (pI.PropertyType == typeof(string))
                 {
-                    currValue = (string)pI.GetValue(this)!;
+                    var currValue = (string)pI.GetValue(this)!;
                     if (!string.IsNullOrEmpty(currValue) && currValue.Length > maxFieldSize)
                     {
-                        cursor = 0;
-                        howManyChunks = (int)Math.Ceiling((double)currValue.Length / maxFieldSize);
+                        // Chunk large strings
+                        int cursor = 0;
+                        int howManyChunks = (int)Math.Ceiling((double)currValue.Length / maxFieldSize);
                         for (int i = 0; i < howManyChunks; i++)
                         {
-                            charsToGrab = Math.Min(maxFieldSize, (currValue.Length - cursor));//NOTE: the Substring cannot exceed the loaction of the remaining characters
-                            fieldName = (i == 0) ? pI.Name : pI.Name + fieldExtendedName + i.ToString(); //Always define overflow fields with the extension so start with pt_1, but also fill the original field to now have orphaned fields
-                            ret.Add(fieldName, new EntityProperty(currValue.Substring(cursor, charsToGrab))); //Keep appending new fields with the extension name to the dB.
+                            int charsToGrab = Math.Min(maxFieldSize, (currValue.Length - cursor));
+                            string fieldName = (i == 0) ? pI.Name : pI.Name + fieldExtendedName + i.ToString();
+                            ret.Add(fieldName, new EntityProperty(currValue.Substring(cursor, charsToGrab)));
                             cursor += charsToGrab;
                         }
                     }
                     else
-                        ret.Add(pI.Name, new EntityProperty(currValue));//value may be null or the right size
+                    {
+                        ret.Add(pI.Name, new EntityProperty(currValue));
+                    }
                 }
                 else
                 {
-                    //Everything else also needs to get processed into the DB AS IS
                     ret.Add(pI.Name, EntityProperty.CreateEntityPropertyFromObject(pI.GetValue(this)));
                 }
             }
 
+            // Process dynamic properties if entity implements IDynamicProperties
+            if (this is IDynamicProperties dynamic)
+            {
+                foreach (var prop in dynamic.DynamicProperties)
+                {
+                    if (ret.ContainsKey(prop.Key))
+                        continue;
+
+                    // Handle string chunking for dynamic properties
+                    if (prop.Value is string strValue && !string.IsNullOrEmpty(strValue) && strValue.Length > maxFieldSize)
+                    {
+                        int cursor = 0;
+                        int howManyChunks = (int)Math.Ceiling((double)strValue.Length / maxFieldSize);
+                        for (int i = 0; i < howManyChunks; i++)
+                        {
+                            int charsToGrab = Math.Min(maxFieldSize, (strValue.Length - cursor));
+                            string fieldName = (i == 0) ? prop.Key : prop.Key + fieldExtendedName + i.ToString();
+                            ret.Add(fieldName, new EntityProperty(strValue.Substring(cursor, charsToGrab)));
+                            cursor += charsToGrab;
+                        }
+                    }
+                    else
+                    {
+                        var entityProp = ConvertToEntityProperty(prop.Value);
+                        if (entityProp != null)
+                        {
+                            ret.Add(prop.Key, entityProp);
+                        }
+                    }
+                }
+            }
+
             return ret;
-        }
+        } // end WriteEntity
+
+        private static EntityProperty? ConvertToEntityProperty(object? value) =>
+            value switch
+            {
+                null => null,
+                string s => new EntityProperty(s),
+                bool b => new EntityProperty(b),
+                int i => new EntityProperty(i),
+                long l => new EntityProperty(l),
+                double d => new EntityProperty(d),
+                DateTime dt => new EntityProperty(dt),
+                DateTimeOffset dto => new EntityProperty(dto),
+                Guid g => new EntityProperty(g),
+                byte[] bytes => new EntityProperty(bytes),
+                float f => new EntityProperty((double)f),
+                decimal dec => new EntityProperty(Convert.ToDouble(dec)),
+                _ => new EntityProperty(value.ToString())
+            };
+
+        private static object? ConvertFromEntityProperty(EntityProperty? prop) =>
+            prop is null ? null : prop.PropertyType switch
+            {
+                EdmType.String => prop.StringValue,
+                EdmType.Binary => prop.BinaryValue,
+                EdmType.Boolean => prop.BooleanValue,
+                EdmType.DateTime => prop.DateTime,
+                EdmType.Double => prop.DoubleValue,
+                EdmType.Guid => prop.GuidValue,
+                EdmType.Int32 => prop.Int32Value,
+                EdmType.Int64 => prop.Int64Value,
+                _ => prop.PropertyAsObject
+            };
     }//End Class TableEntityBase
 
     /// <summary>
@@ -878,6 +1173,34 @@ namespace ASCTableStorage.Models
         public void LogError(string accountName, string accountKey)
         {
             new DataAccess<ErrorLogData>(accountName, accountKey).ManageData(this); //InsertUpdates the Data
+        }
+
+        /// <summary>
+        /// Allows for clearing out old data from the Error Log Table
+        /// </summary>
+        /// <param name="accountName">The name of the account used to authenticate the data access operation. Cannot be null or empty.</param>
+        /// <param name="accountKey">The key associated with the account used to authenticate the data access operation. Cannot be null or empty.</param>
+        /// <param name="daysOld">Defaults to 60 days old</param>
+        static public async Task ClearOldDataAsync(string accountName, string accountKey, int daysOld = 60)
+        {
+            DataAccess<ErrorLogData> da = new DataAccess<ErrorLogData>(accountName, accountKey);
+            List<ErrorLogData> old = await da.GetCollectionAsync(e => e.Timestamp < DateTime.UtcNow.AddDays(-daysOld)); // Clean errors older than specified days
+            await da.BatchUpdateListAsync(old, TableOperationType.Delete);
+        }
+
+        /// <summary>
+        /// Clears old data from the Error Log Table based on the specified error type and age.
+        /// </summary>
+        /// <param name="accountName">The name of the account used to authenticate the data access operation. Cannot be null or empty.</param>
+        /// <param name="accountKey">The key associated with the account used to authenticate the data access operation. Cannot be null or empty.</param>
+        /// <param name="type">The type of error to clear.</param>
+        /// <param name="daysOld">Defaults to 60 days old</param>
+        /// <returns></returns>
+        static public async Task ClearOldDataByType(string accountName, string accountKey, ErrorCodeTypes type, int daysOld = 60)
+        {
+            DataAccess<ErrorLogData> da = new DataAccess<ErrorLogData>(accountName, accountKey);
+            List<ErrorLogData> old = await da.GetCollectionAsync(e => e.ErrorSeverity == type.ToString() && e.Timestamp < DateTime.UtcNow.AddDays(-daysOld));
+            await da.BatchUpdateListAsync(old, TableOperationType.Delete);
         }
     } //end class ErrorLogData
 
