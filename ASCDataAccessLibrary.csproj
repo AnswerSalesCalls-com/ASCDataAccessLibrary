@@ -12,21 +12,22 @@
     <Copyright>2025 Answer Sales Calls Inc.</Copyright>
     <PackageIcon>Azure DB Cloud.png</PackageIcon>
     <GenerateDocumentationFile>True</GenerateDocumentationFile>
-    <AssemblyVersion>2.1</AssemblyVersion>
+    <AssemblyVersion>2.2</AssemblyVersion>
     <PackageOutputPath>Files</PackageOutputPath>
     <BaseOutputPath></BaseOutputPath>
     <DocumentationFile></DocumentationFile>
     <RootNamespace>ASCTableStorage</RootNamespace>
-    <Version>2.1</Version>
-    <PackageReadmeFile>getting-started-guide-20.md</PackageReadmeFile>
+    <Version>2.2</Version>
+    <PackageReadmeFile>getting-started-guide-22.md</PackageReadmeFile>
     <PackageReleaseNotes>
-       ## **Release Notes - ASCDataAccessLibrary v2.1**
+       ## **Release Notes - ASCDataAccessLibrary v2.2**
 
        **Minor Release: Dynamic Object Support**
 
        This release adds updated code to allow for Dynamically generated Entities for scenarios where you don't actually know the schema during development.
        Also improved reflection performance across entities with TypeCaching. Especially performant in batch scenarios.
        And added a long awaited cleaning of error log data older than a specified number of days.
+       Updated Queuing to utilize the new StateList object which manages position where a queue needs to pick back up from.
     </PackageReleaseNotes>
     <PackageLicenseFile>mit_license.md</PackageLicenseFile>
     <PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
@@ -45,19 +46,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Update="getting-started-guide-102.md">
-      <Pack>True</Pack>
-      <PackagePath>\</PackagePath>
-    </None>
-    <None Update="getting-started-guide-103.md">
-      <Pack>True</Pack>
-      <PackagePath>\</PackagePath>
-    </None>
-    <None Update="getting-started-guide-20.md">
-      <Pack>True</Pack>
-      <PackagePath>\</PackagePath>
-    </None>
-     <None Update="getting-started-guide-21.md">
+     <None Update="getting-started-guide-22.md">
         <Pack>True</Pack>
         <PackagePath>\</PackagePath>
      </None>

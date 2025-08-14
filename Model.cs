@@ -2,10 +2,14 @@
 using ASCTableStorage.Data;
 using Microsoft.Azure.Cosmos.Table;
 using Newtonsoft.Json;
+using System.Collections;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Text.Json.Serialization;
 using System.Xml.Serialization;
 
 namespace ASCTableStorage.Models
@@ -830,7 +834,7 @@ namespace ASCTableStorage.Models
     }
 
     /// <summary>
-    /// Allows for collections of data to be stored in the DB for State Management
+    /// Allows for collections of data to be stored in the DB for State Management with position tracking and paging support
     /// </summary>
     public class QueueData<T> : TableEntityBase, ITableExtra
     {
@@ -842,6 +846,7 @@ namespace ASCTableStorage.Models
             get => this.RowKey;
             set => this.RowKey = value;
         }
+
         /// <summary>
         /// Name the type of data that's going to be stored.
         /// </summary>
@@ -850,25 +855,99 @@ namespace ASCTableStorage.Models
             get => this.PartitionKey;
             set => this.PartitionKey = value;
         }
+
         /// <summary>
-        /// The Actual Serialized Collection of Type T Data being Stored
+        /// The Actual Serialized StateList Data being Stored (includes position information)
         /// </summary>
         public string? Value { get; set; }
+
         /// <summary>
-        /// Explodes the data into usable form
+        /// Optional metadata about the queue processing state
         /// </summary>
-        public List<T> GetData()
+        public string? ProcessingStatus { get; set; }
+
+        /// <summary>
+        /// Percentage complete based on StateList position
+        /// </summary>
+        public double PercentComplete { get; set; }
+
+        /// <summary>
+        /// The starting index for this queue segment (for position-aware paging)
+        /// </summary>
+        public int SegmentStartIndex { get; set; } = 0;
+
+        /// <summary>
+        /// Total items across all segments (for tracking overall progress)
+        /// </summary>
+        public int TotalItemCount { get; set; } = 0;
+
+        /// <summary>
+        /// Explodes the data into usable StateList form with preserved position
+        /// </summary>
+        public StateList<T> GetData()
         {
-            return JsonConvert.DeserializeObject<List<T>>(Value!)!;
+            if (string.IsNullOrEmpty(Value))
+                return new StateList<T>();
+
+            // Try to deserialize as StateList first (new format)
+            try
+            {
+                var stateList = JsonConvert.DeserializeObject<StateList<T>>(Value);
+                return stateList ?? new StateList<T>();
+            }
+            catch
+            {
+                // Fallback: If it's old format (List<T>), convert to StateList
+                try
+                {
+                    var list = JsonConvert.DeserializeObject<List<T>>(Value);
+                    return new StateList<T>(list ?? new List<T>());
+                }
+                catch
+                {
+                    return new StateList<T>();
+                }
+            }
         }
+
         /// <summary>
-        /// Shrinks the data to a string to store
+        /// Shrinks the StateList to a string to store (preserves position)
         /// </summary>
-        /// <param name="data">The collection</param>
-        public void PutData(List<T> data)
+        /// <param name="data">The StateList with position information</param>
+        public void PutData(StateList<T> data)
         {
             Value = JsonConvert.SerializeObject(data, Functions.NewtonSoftRemoveNulls());
+            TotalItemCount = data.Count;
+
+            // Calculate and store completion percentage
+            if (data.Count > 0)
+            {
+                PercentComplete = ((double)(data.CurrentIndex + 1) / data.Count) * 100;
+            }
+            else
+            {
+                PercentComplete = 0;
+            }
+
+            // Set processing status based on position
+            if (data.CurrentIndex < 0)
+                ProcessingStatus = "Not Started";
+            else if (data.CurrentIndex >= data.Count - 1)
+                ProcessingStatus = "Completed";
+            else
+                ProcessingStatus = $"In Progress (Item {data.CurrentIndex + 1} of {data.Count})";
         }
+
+        /// <summary>
+        /// Overload to accept regular List<T> and convert to StateList
+        /// </summary>
+        /// <param name="data">Regular list to convert to StateList</param>
+        public void PutData(List<T> data)
+        {
+            var stateList = new StateList<T>(data);
+            PutData(stateList);
+        }
+
         /// <summary>
         /// Preserves the queued data to the DB
         /// </summary>
@@ -878,6 +957,7 @@ namespace ASCTableStorage.Models
         {
             new DataAccess<QueueData<T>>(accountName, accountKey).ManageData(this);
         }
+
         /// <summary>
         /// Preserves the queued data to the DB asynchronously
         /// </summary>
@@ -887,43 +967,632 @@ namespace ASCTableStorage.Models
         {
             await new DataAccess<QueueData<T>>(accountName, accountKey).ManageDataAsync(this);
         }
-        /// <summary>
-        /// Returns a list of Queued data that is ready to be worked on again. Removes the data once complete
-        /// </summary>
-        /// <param name="name">The name stored to identify the type of data</param>
-        /// <param name="accountName">The Azure Account name for the Table Store</param>
-        /// <param name="accountKey">The Azure Account key for Table Storage</param>
-        public List<T> GetQueues(string name, string accountName, string accountKey)
-        {
-            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
-            List<QueueData<T>> d = da.GetCollection(name).OrderBy(x => x.Timestamp).ToList();//Make sure to handle the data in the correct order of importance
-            da.BatchUpdateListAsync(d, TableOperationType.Delete);
 
-            //Convert the data back to an enumerable that can be used in code
-            List<T> allData = new();
-            foreach (QueueData<T> q in d)
-                allData.AddRange(q.GetData());
-            return allData;
-        }
         /// <summary>
-        /// Asynchronously returns a list of Queued data that is ready to be worked on again. Removes the data once complete
+        /// Saves current progress without removing from queue (for checkpointing)
+        /// </summary>
+        public async Task SaveProgressAsync(StateList<T> currentState, string accountName, string accountKey)
+        {
+            PutData(currentState);
+            await SaveQueueAsync(accountName, accountKey);
+        }
+
+        #region Non-Paged Methods (Original)
+
+        /// <summary>
+        /// Returns StateList of Queued data that is ready to be worked on again. 
+        /// Optionally removes the data once complete.
         /// </summary>
         /// <param name="name">The name stored to identify the type of data</param>
         /// <param name="accountName">The Azure Account name for the Table Store</param>
         /// <param name="accountKey">The Azure Account key for Table Storage</param>
-        public Task<List<T>> GetQueuesAsync(string name, string accountName, string accountKey)
+        /// <param name="deleteAfterRetrieve">Whether to delete the queue items after retrieval (default: true)</param>
+        public StateList<T> GetQueues(string name, string accountName, string accountKey, bool deleteAfterRetrieve = true)
         {
             DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
-            return da.GetCollectionAsync(name).ContinueWith(t =>
+            List<QueueData<T>> d = da.GetCollection(name).OrderBy(x => x.Timestamp).ToList();
+
+            if (deleteAfterRetrieve)
             {
-                List<QueueData<T>> d = t.Result.OrderBy(x => x.Timestamp).ToList(); // Make sure to handle the data in the correct order of importance
-                _ = Task.Run(async () => { await da.BatchUpdateListAsync(d, TableOperationType.Delete); }); // This is in a thread so it does not delay the return
-                // Convert the data back to an enumerable that can be used in code
-                List<T> allData = new();
-                foreach (QueueData<T> q in d)
-                    allData.AddRange(q.GetData());
-                return allData;
-            });
+                da.BatchUpdateList(d, TableOperationType.Delete);
+            }
+
+            return ConvertToStateList(d);
+        }
+
+        /// <summary>
+        /// Asynchronously returns StateList of Queued data that is ready to be worked on again.
+        /// Optionally removes the data once complete.
+        /// </summary>
+        /// <param name="name">The name stored to identify the type of data</param>
+        /// <param name="accountName">The Azure Account name for the Table Store</param>
+        /// <param name="accountKey">The Azure Account key for Table Storage</param>
+        /// <param name="deleteAfterRetrieve">Whether to delete the queue items after retrieval (default: true)</param>
+        public async Task<StateList<T>> GetQueuesAsync(string name, string accountName, string accountKey, bool deleteAfterRetrieve = true)
+        {
+            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+            var queues = await da.GetCollectionAsync(name);
+            List<QueueData<T>> d = queues.OrderBy(x => x.Timestamp).ToList();
+
+            if (deleteAfterRetrieve)
+            {
+                _ = Task.Run(async () => { await da.BatchUpdateListAsync(d, TableOperationType.Delete); });
+            }
+
+            return ConvertToStateList(d);
+        }
+
+        #endregion Non-Paged Methods (Original)
+
+        #region Position-Aware Paged Queue Methods
+
+        /// <summary>
+        /// Gets a paged collection of queues with position-aware options
+        /// </summary>
+        /// <param name="name">The name stored to identify the type of data</param>
+        /// <param name="accountName">The Azure Account name for the Table Store</param>
+        /// <param name="accountKey">The Azure Account key for Table Storage</param>
+        /// <param name="pageSize">Number of queue items per page (default: 10)</param>
+        /// <param name="continuationToken">Token to continue from previous page (null for first page)</param>
+        /// <param name="resumeFromPosition">If true and no continuation token, starts from last known CurrentIndex</param>
+        /// <returns>Paged result with queue items and continuation information</returns>
+        public async Task<PagedQueueResult<T>> GetPagedQueuesAsync(string name, string accountName, string accountKey, 
+            int pageSize = 10, string? continuationToken = null, bool resumeFromPosition = false)
+        {
+            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+
+            // If resuming from position and no continuation token, find the appropriate starting point
+            if (resumeFromPosition && string.IsNullOrEmpty(continuationToken))
+            {
+                // Get only queues that have progress (not completed)
+                var inProgressQueues = await da.GetCollectionAsync(x =>
+                    x.PartitionKey == name &&
+                    x.ProcessingStatus != null &&
+                    x.ProcessingStatus.Contains("In Progress"));
+
+                if (inProgressQueues.Any())
+                {
+                    var lastPosition = inProgressQueues
+                        .OrderByDescending(x => x.Timestamp)
+                        .FirstOrDefault();
+
+                    if (lastPosition != null)
+                    {
+                        continuationToken = CreatePositionBasedToken(lastPosition);
+                    }
+                }
+            }
+            var pagedResult = await da.GetPagedCollectionAsync(name, pageSize, continuationToken);
+
+            // Sort the items by timestamp
+            var sortedItems = pagedResult.Items.OrderBy(x => x.Timestamp).ToList();
+
+            // Convert to StateList and handle position
+            var stateList = ConvertToStateListWithPosition(sortedItems, resumeFromPosition);
+
+            return new PagedQueueResult<T>
+            {
+                Items = stateList,
+                ContinuationToken = pagedResult.ContinuationToken,
+                HasMore = pagedResult.HasMore,
+                PageSize = pagedResult.Count,
+                QueueIds = sortedItems.Select(q => q.QueueID ?? "Unknown").ToList(),
+                CurrentGlobalPosition = stateList.CurrentIndex >= 0 ?
+                    CalculateGlobalPosition(sortedItems, stateList.CurrentIndex) : -1,
+                TotalProcessed = CountTotalProcessed(sortedItems)
+            };
+        }
+
+        /// <summary>
+        /// Gets a paged collection of queues starting from a specific position - OPTIMIZED VERSION
+        /// </summary>
+        /// <param name="name">The name stored to identify the type of data</param>
+        /// <param name="accountName">The Azure Account name for the Table Store</param>
+        /// <param name="accountKey">The Azure Account key for Table Storage</param>
+        /// <param name="startFromIndex">The global index to start from (across all queue segments)</param>
+        /// <param name="pageSize">Number of items to retrieve</param>
+        /// <returns>Paged result starting from the specified position</returns>
+        public async Task<PagedQueueResult<T>> GetPagedQueuesFromPositionAsync(string name, string accountName, string accountKey, int startFromIndex, int pageSize = 10)
+        {
+            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+
+            // OPTIMIZATION 1: First, get just the metadata to find our position
+            // We only need to know the counts and order, not the full data
+            var queueMetadata = await da.GetCollectionAsync(q => q.PartitionKey == name);
+
+            if (!queueMetadata.Any())
+            {
+                return new PagedQueueResult<T>
+                {
+                    Items = new StateList<T>(),
+                    HasMore = false,
+                    PageSize = 0,
+                    CurrentGlobalPosition = -1
+                };
+            }
+
+            var sortedQueues = queueMetadata.OrderBy(x => x.Timestamp).ToList();
+
+            // OPTIMIZATION 2: Find the target queue without deserializing all data
+            int currentPosition = 0;
+            int targetQueueIndex = -1;
+            int indexWithinQueue = 0;
+            List<(string QueueId, int StartPos, int ItemCount)> queueMap = new List<(string, int, int)>();
+
+            for (int i = 0; i < sortedQueues.Count; i++)
+            {
+                var queue = sortedQueues[i];
+
+                // Only deserialize to get count if we haven't found our position yet
+                int itemCount = queue.TotalItemCount; // Use stored count if available
+
+                if (itemCount == 0)
+                {
+                    // Fallback: deserialize just to get count
+                    var data = queue.GetData();
+                    itemCount = data.Count;
+                }
+
+                queueMap.Add((queue.QueueID!, currentPosition, itemCount));
+
+                if (targetQueueIndex == -1 && currentPosition + itemCount > startFromIndex)
+                {
+                    targetQueueIndex = i;
+                    indexWithinQueue = startFromIndex - currentPosition;
+                }
+
+                currentPosition += itemCount;
+
+                // OPTIMIZATION 3: Stop counting once we've found our target and have enough for the page
+                if (targetQueueIndex >= 0 && currentPosition >= startFromIndex + pageSize)
+                {
+                    break;
+                }
+            }
+
+            if (targetQueueIndex == -1)
+            {
+                // Position is beyond all queues
+                return new PagedQueueResult<T>
+                {
+                    Items = new StateList<T>(),
+                    HasMore = false,
+                    PageSize = 0,
+                    CurrentGlobalPosition = -1
+                };
+            }
+
+            // OPTIMIZATION 4: Only get the queues we need for this page
+            var queuesNeeded = new List<string>();
+            int itemsNeeded = pageSize;
+
+            for (int i = targetQueueIndex; i < queueMap.Count && itemsNeeded > 0; i++)
+            {
+                queuesNeeded.Add(queueMap[i].QueueId);
+
+                if (i == targetQueueIndex)
+                {
+                    // First queue: we need items from indexWithinQueue to end
+                    itemsNeeded -= (queueMap[i].ItemCount - indexWithinQueue);
+                }
+                else
+                {
+                    // Subsequent queues: we need up to itemsNeeded items
+                    itemsNeeded -= Math.Min(queueMap[i].ItemCount, itemsNeeded);
+                }
+            }
+
+            // OPTIMIZATION 5: Fetch only the queues we need using lambda
+            var relevantQueues = await da.GetCollectionAsync(
+                q => queuesNeeded.Contains(q.RowKey!)
+            );
+
+            // Sort them back in the correct order
+            relevantQueues = relevantQueues
+                .OrderBy(q => queuesNeeded.IndexOf(q.QueueID!))
+                .ToList();
+
+            // OPTIMIZATION 6: Build the result with just what we need
+            var resultList = new StateList<T>();
+            int itemsAdded = 0;
+
+            foreach (var queue in relevantQueues)
+            {
+                var data = queue.GetData();
+                int skipCount = 0;
+                int takeCount = pageSize - itemsAdded;
+
+                if (queue.QueueID == queueMap[targetQueueIndex].QueueId)
+                {
+                    // This is our starting queue
+                    skipCount = indexWithinQueue;
+                }
+
+                var itemsToAdd = data
+                    .Skip(skipCount)
+                    .Take(takeCount)
+                    .ToList();
+
+                resultList.AddRange(itemsToAdd);
+                itemsAdded = resultList.Count;
+
+                if (itemsAdded >= pageSize)
+                    break;
+            }
+
+            // Set the current index to the beginning of our result
+            if (resultList.Count > 0)
+            {
+                resultList.CurrentIndex = 0;
+            }
+
+            // Calculate if there are more items after this page
+            bool hasMore = (startFromIndex + itemsAdded) < currentPosition;
+
+            return new PagedQueueResult<T>
+            {
+                Items = resultList,
+                HasMore = hasMore,
+                PageSize = resultList.Count,
+                CurrentGlobalPosition = startFromIndex,
+                TotalProcessed = startFromIndex,
+                QueueIds = relevantQueues.Select(q => q.QueueID!).ToList()
+            };
+        } // End GetPagedQueuesFromPositionAsync
+
+        /// <summary>
+        /// Processes queues in pages with position awareness
+        /// </summary>
+        /// <param name="name">The name stored to identify the type of data</param>
+        /// <param name="accountName">The Azure Account name for the Table Store</param>
+        /// <param name="accountKey">The Azure Account key for Table Storage</param>
+        /// <param name="pageSize">Number of items to process per batch</param>
+        /// <param name="processPage">Async function to process each page of items</param>
+        /// <param name="deleteAfterProcess">Whether to delete items after processing</param>
+        /// <param name="resumeFromLastPosition">Start from last known position</param>
+        /// <param name="maxPages">Maximum number of pages to process (null for all)</param>
+        public async Task<ProcessingResult> ProcessQueuesPagesAsync(string name, string accountName, string accountKey, int pageSize, Func<StateList<T>, 
+            Task<bool>> processPage, bool deleteAfterProcess = true, bool resumeFromLastPosition = true, int? maxPages = null)
+        {
+            var result = new ProcessingResult();
+            string? continuationToken = null;
+            int pagesProcessed = 0;
+            bool isFirstPage = true;
+
+            do
+            {
+                var pageResult = await GetPagedQueuesAsync(
+                    name,
+                    accountName,
+                    accountKey,
+                    pageSize,
+                    continuationToken,
+                    resumeFromLastPosition && isFirstPage);
+
+                isFirstPage = false;
+
+                if (pageResult.Items.Count == 0)
+                    break;
+
+                result.TotalItemsRetrieved += pageResult.Items.Count;
+
+                // Process the page
+                bool continueProcessing = await processPage(pageResult.Items);
+
+                result.TotalItemsProcessed += pageResult.Items.Count;
+                result.LastProcessedIndex = pageResult.CurrentGlobalPosition;
+
+                if (!continueProcessing)
+                {
+                    result.StoppedEarly = true;
+                    break;
+                }
+
+                // Delete if requested
+                if (deleteAfterProcess && pageResult.QueueIds.Any())
+                {
+                    await DeleteQueueItemsAsync(pageResult.QueueIds, accountName, accountKey);
+                }
+
+                continuationToken = pageResult.ContinuationToken;
+                pagesProcessed++;
+                result.PagesProcessed = pagesProcessed;
+
+                if (maxPages.HasValue && pagesProcessed >= maxPages.Value)
+                {
+                    result.ReachedMaxPages = true;
+                    break;
+                }
+
+            } while (!string.IsNullOrEmpty(continuationToken));
+
+            result.Completed = !result.StoppedEarly && !result.ReachedMaxPages;
+            return result;
+        }
+
+        #endregion Position-Aware Paged Queue Methods
+
+        #region Helper Methods
+
+        /// <summary>
+        /// Converts a list of QueueData items to a single StateList
+        /// </summary>
+        private StateList<T> ConvertToStateList(List<QueueData<T>> queueItems)
+        {
+            var result = new StateList<T>();
+
+            foreach (QueueData<T> q in queueItems)
+            {
+                var stateList = q.GetData();
+
+                // If this is the first queue item, preserve its position
+                if (result.Count == 0 && stateList.Count > 0)
+                {
+                    result.AddRange(stateList);
+                    result.CurrentIndex = stateList.CurrentIndex;
+                    result.Description = stateList.Description ?? q.ProcessingStatus;
+                }
+                else
+                {
+                    // Append additional items
+                    result.AddRange(stateList);
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Converts queue items to StateList with position awareness
+        /// </summary>
+        private StateList<T> ConvertToStateListWithPosition(List<QueueData<T>> queueItems, bool resumeFromPosition)
+        {
+            var result = new StateList<T>();
+            int globalIndex = -1;
+            bool positionSet = false;
+
+            foreach (QueueData<T> q in queueItems)
+            {
+                var stateList = q.GetData();
+                int startCount = result.Count;
+
+                result.AddRange(stateList);
+
+                // Track position if resuming
+                if (resumeFromPosition && !positionSet)
+                {
+                    if (stateList.CurrentIndex >= 0 && stateList.CurrentIndex < stateList.Count - 1)
+                    {
+                        // This queue was partially processed
+                        globalIndex = startCount + stateList.CurrentIndex + 1; // Next item to process
+                        positionSet = true;
+                    }
+                    else if (stateList.CurrentIndex >= stateList.Count - 1)
+                    {
+                        // This queue was fully processed, continue checking
+                        continue;
+                    }
+                }
+
+                // Copy description from first queue
+                if (string.IsNullOrEmpty(result.Description))
+                {
+                    result.Description = stateList.Description ?? q.ProcessingStatus;
+                }
+            }
+
+            // Set the position if found
+            if (positionSet && globalIndex >= 0 && globalIndex < result.Count)
+            {
+                result.CurrentIndex = globalIndex;
+            }
+            else if (resumeFromPosition && result.Count > 0)
+            {
+                // No position found, start from beginning
+                result.CurrentIndex = 0;
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Finds the last processed position across queue items
+        /// </summary>
+        private QueueData<T>? FindLastProcessedPosition(List<QueueData<T>> queueItems)
+        {
+            // Find the last queue with processing progress
+            for (int i = queueItems.Count - 1; i >= 0; i--)
+            {
+                var data = queueItems[i].GetData();
+                if (data.CurrentIndex >= 0 && data.CurrentIndex < data.Count - 1)
+                {
+                    // This queue is partially processed
+                    return queueItems[i];
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Creates a position-based continuation token
+        /// </summary>
+        private string CreatePositionBasedToken(QueueData<T> fromQueue)
+        {
+            // This is a simplified version - in production you'd encode this properly
+            return $"{fromQueue.PartitionKey}|{fromQueue.RowKey}";
+        }
+
+        /// <summary>
+        /// Calculates the global position across all queue segments
+        /// </summary>
+        private int CalculateGlobalPosition(List<QueueData<T>> queues, int localIndex)
+        {
+            int globalPosition = 0;
+
+            foreach (var queue in queues)
+            {
+                var data = queue.GetData();
+                if (data.CurrentIndex >= 0)
+                {
+                    globalPosition += data.CurrentIndex;
+                    break;
+                }
+                globalPosition += data.Count;
+            }
+
+            return globalPosition + localIndex;
+        }
+
+        /// <summary>
+        /// Counts total processed items across queues
+        /// </summary>
+        private int CountTotalProcessed(List<QueueData<T>> queues)
+        {
+            int total = 0;
+
+            foreach (var queue in queues)
+            {
+                var data = queue.GetData();
+                if (data.CurrentIndex >= 0)
+                {
+                    total += data.CurrentIndex + 1;
+                }
+            }
+
+            return total;
+        }
+
+        /// <summary>
+        /// Gets total item count across all queues
+        /// </summary>
+        private int GetTotalItemCount(List<QueueData<T>> queues)
+        {
+            return queues.Sum(q => q.GetData().Count);
+        }
+
+        /// <summary>
+        /// Deletes specific queue items by their IDs - OPTIMIZED VERSION
+        /// </summary>
+        private async Task DeleteQueueItemsAsync(List<string> queueIds, string accountName, string accountKey)
+        {
+            if (!queueIds.Any()) return;
+
+            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+
+            // Get all items at once using lambda expression
+            var itemsToDelete = await da.GetCollectionAsync(q => queueIds.Contains(q.RowKey));
+
+            if (itemsToDelete.Any())
+            {
+                await da.BatchUpdateListAsync(itemsToDelete, TableOperationType.Delete);
+            }
+        }
+
+        #endregion Helper Methods
+
+        #region Monitoring Methods
+
+        /// <summary>
+        /// Gets a single queue item without deleting it (for monitoring/inspection)
+        /// </summary>
+        public async Task<StateList<T>?> PeekQueueAsync(string queueId, string accountName, string accountKey)
+        {
+            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+            var queue = await da.GetRowObjectAsync(queueId);
+            return queue?.GetData();
+        }
+
+        /// <summary>
+        /// Peek multiple queues at once
+        /// </summary>
+        public async Task<Dictionary<string, StateList<T>>> PeekQueuesAsync(List<string> queueIds, string accountName, string accountKey)
+        {
+            if (!queueIds.Any())
+                return new Dictionary<string, StateList<T>>();
+
+            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+
+            // Get all at once
+            var queues = await da.GetCollectionAsync(q => queueIds.Contains(q.RowKey!));
+
+            return queues.ToDictionary(
+                q => q.QueueID ?? "Unknown",
+                q => q.GetData());
+        }
+
+        /// <summary>
+        /// Gets the processing progress across all queues
+        /// </summary>
+        // OPTIMIZED VERSION using aggregation in chunks:
+        public static async Task<ProgressSummary> GetProgressSummaryAsync(string name, string accountName, string accountKey)
+        {
+            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+            var summary = new ProgressSummary { QueueName = name };
+
+            // Use paging to avoid loading everything at once
+            string? continuationToken = null;
+            do
+            {
+                var page = await da.GetPagedCollectionAsync(name, 100, continuationToken);
+
+                foreach (var queue in page.Items)
+                {
+                    var data = queue.GetData();
+                    summary.TotalItems += data.Count;
+
+                    if (data.CurrentIndex >= 0)
+                    {
+                        summary.ProcessedItems += data.CurrentIndex + 1;
+                    }
+
+                    summary.QueueCount++;
+                }
+
+                continuationToken = page.ContinuationToken;
+            } while (!string.IsNullOrEmpty(continuationToken));
+
+            if (summary.TotalItems > 0)
+            {
+                summary.PercentComplete = (summary.ProcessedItems * 100.0) / summary.TotalItems;
+            }
+
+            return summary;
+        }
+
+        /// <summary>
+        /// Batch deletes items matching a condition
+        /// </summary>
+        public async Task<int> DeleteQueuesMatchingAsync(string accountName, string accountKey, Expression<Func<QueueData<T>, bool>> predicate)
+        {
+            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+
+            // Get all matching items at once
+            var itemsToDelete = await da.GetCollectionAsync(predicate);
+
+            if (itemsToDelete.Any())
+            {
+                var result = await da.BatchUpdateListAsync(itemsToDelete, TableOperationType.Delete);
+                return result.SuccessfulItems;
+            }
+
+            return 0;
+        }
+
+        #endregion Monitoring Methods
+
+        /// <summary>
+        /// Creates a QueueData instance from a StateList with automatic ID generation
+        /// </summary>
+        public static QueueData<T> CreateFromStateList(StateList<T> stateList, string name)
+        {
+            var queue = new QueueData<T>
+            {
+                QueueID = Guid.NewGuid().ToString(),
+                Name = name
+            };
+            queue.PutData(stateList);
+            return queue;
         }
 
         /// <summary>
@@ -931,12 +1600,677 @@ namespace ASCTableStorage.Models
         /// </summary>
         [XmlIgnore]
         public string TableReference => "AppQueueData";
+
         /// <summary>
         /// Retrieves the unique identifier associated with the current queue.
         /// </summary>
         /// <returns>A string representing the unique identifier of the queue. This value is never null.</returns>
         public string GetIDValue() => this.QueueID!;
-    }// end class QueueData
+    }
+
+    /// <summary>
+    /// A List that maintains its current position through serialization/deserialization
+    /// </summary>
+    /// <typeparam name="T">The datatype to manage</typeparam>
+    public class StateList<T> : IList<T>, IReadOnlyList<T>
+    {
+        private List<T> _items = new List<T>();
+
+        /// <summary>
+        /// The current position being inspected - preserved through serialization
+        /// </summary>
+        [JsonInclude]
+        [JsonPropertyName("CurrentIndex")]
+        [JsonProperty("CurrentIndex")]
+        public int CurrentIndex { get; set; } = -1;
+
+        /// <summary>
+        /// Description of the data contained within the collection - preserved through serialization
+        /// </summary>
+        [JsonInclude]
+        [JsonPropertyName("Description")]
+        [JsonProperty("Description")]
+        public string? Description { get; set; }
+
+        /// <summary>
+        /// Gets or sets the internal items for serialization
+        /// </summary>
+        [JsonInclude]
+        [JsonPropertyName("Items")]
+        [JsonProperty("Items")]
+        public List<T> Items
+        {
+            get => _items;
+            set => _items = value ?? new List<T>();
+        }
+
+        #region Constructors
+
+        /// <summary>
+        /// Default constructor
+        /// </summary>
+        public StateList() { }
+
+        /// <summary>
+        /// Constructor to build from existing collection
+        /// </summary>
+        /// <param name="source">List of items to manage</param>
+        public StateList(IEnumerable<T> source)
+        {
+            if (source != null)
+                _items.AddRange(source);
+        }
+
+        /// <summary>
+        /// Constructor with initial capacity
+        /// </summary>
+        /// <param name="capacity">Initial capacity</param>
+        public StateList(int capacity)
+        {
+            _items.Capacity = capacity;
+        }
+
+        #endregion
+
+        #region IList<T> Implementation
+
+        /// <summary>
+        /// Gets or sets the element at the specified index
+        /// </summary>
+        public T this[int index]
+        {
+            get => _items[index];
+            set => _items[index] = value;
+        }
+
+        /// <summary>
+        /// Gets the number of elements contained in the StateList
+        /// </summary>
+        public int Count => _items.Count;
+
+        /// <summary>
+        /// Gets a value indicating whether the StateList is read-only
+        /// </summary>
+        public bool IsReadOnly => false;
+
+        /// <summary>
+        /// Adds an item to the StateList
+        /// </summary>
+        public void Add(T item)
+        {
+            _items.Add(item);
+        }
+
+        /// <summary>
+        /// Removes all items from the StateList
+        /// </summary>
+        public void Clear()
+        {
+            _items.Clear();
+            CurrentIndex = -1;
+        }
+
+        /// <summary>
+        /// Determines whether the StateList contains a specific value
+        /// </summary>
+        public bool Contains(T item) => _items.Contains(item);
+
+        /// <summary>
+        /// Copies the elements of the StateList to an Array, starting at a particular Array index
+        /// </summary>
+        public void CopyTo(T[] array, int arrayIndex) => _items.CopyTo(array, arrayIndex);
+
+        /// <summary>
+        /// Returns an enumerator that iterates through the collection
+        /// </summary>
+        public IEnumerator<T> GetEnumerator() => _items.GetEnumerator();
+
+        /// <summary>
+        /// Determines the index of a specific item in the StateList
+        /// </summary>
+        public int IndexOf(T item) => _items.IndexOf(item);
+
+        /// <summary>
+        /// Inserts an item to the StateList at the specified index
+        /// </summary>
+        public void Insert(int index, T item)
+        {
+            _items.Insert(index, item);
+
+            // Adjust CurrentIndex if necessary
+            if (CurrentIndex >= index)
+                CurrentIndex++;
+        }
+
+        /// <summary>
+        /// Removes the first occurrence of a specific object from the StateList
+        /// </summary>
+        public bool Remove(T item)
+        {
+            int index = _items.IndexOf(item);
+            if (index == -1) return false;
+
+            RemoveAt(index);
+            return true;
+        }
+
+        /// <summary>
+        /// Removes the StateList item at the specified index
+        /// </summary>
+        public void RemoveAt(int index)
+        {
+            if (index < 0 || index >= Count)
+                throw new ArgumentOutOfRangeException(nameof(index));
+
+            _items.RemoveAt(index);
+
+            // Adjust CurrentIndex after removal
+            if (CurrentIndex > index)
+                CurrentIndex--;
+            else if (CurrentIndex == index && CurrentIndex >= Count)
+                CurrentIndex = Count - 1;
+        }
+
+        /// <summary>
+        /// Returns an enumerator that iterates through a collection
+        /// </summary>
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+        #endregion
+
+        #region Navigation Methods
+
+        /// <summary>
+        /// Moves the position of Current Index up by 1
+        /// </summary>
+        public bool MoveNext()
+        {
+            if (CurrentIndex + 1 >= Count) return false;
+            CurrentIndex++;
+            return true;
+        }
+
+        /// <summary>
+        /// Moves the position of Current Index back by 1
+        /// </summary>
+        public bool MovePrevious()
+        {
+            if (CurrentIndex - 1 < 0) return false;
+            CurrentIndex--;
+            return true;
+        }
+
+        /// <summary>
+        /// Moves Current Index to the first item in the collection
+        /// </summary>
+        public void First() => CurrentIndex = Count > 0 ? 0 : -1;
+
+        /// <summary>
+        /// Moves Current Index to the last item in the collection
+        /// </summary>
+        public void Last() => CurrentIndex = Count > 0 ? Count - 1 : -1;
+
+        /// <summary>
+        /// Moves Current Index before the first item in the collection
+        /// </summary>
+        public void Reset() => CurrentIndex = -1;
+
+        #endregion
+
+        #region Current Item Access
+
+        /// <summary>
+        /// Gets the object at the current index position
+        /// </summary>
+        public T? Current
+        {
+            get
+            {
+                if (!IsValidIndex && Count > 0)
+                    CurrentIndex = 0;
+
+                return IsValidIndex ? _items[CurrentIndex] : default(T);
+            }
+        }
+
+        /// <summary>
+        /// Gets the current item and its index as a tuple
+        /// </summary>
+        public (T Data, int Index)? Peek
+        {
+            get
+            {
+                if (IsValidIndex)
+                    return (_items[CurrentIndex], CurrentIndex);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// True if the collection can move the current index forward
+        /// </summary>
+        public bool HasNext => CurrentIndex + 1 < Count;
+
+        /// <summary>
+        /// True if the collection can move the current index backward
+        /// </summary>
+        public bool HasPrevious => CurrentIndex - 1 >= 0;
+
+        /// <summary>
+        /// True if the current index is within bounds
+        /// </summary>
+        public bool IsValidIndex => CurrentIndex >= 0 && CurrentIndex < Count;
+
+        #endregion
+
+        #region String-based Indexer
+
+        /// <summary>
+        /// Allows for quick case-insensitive searches by string representation. Updates Current Index when found.
+        /// </summary>
+        /// <param name="name">The string to search for</param>
+        public T? this[string name]
+        {
+            get
+            {
+                for (int i = 0; i < Count; i++)
+                {
+                    var item = _items[i];
+                    if (item != null && item.ToString() != null &&
+                        item.ToString()!.Equals(name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        CurrentIndex = i;
+                        return item;
+                    }
+                }
+                return default(T);
+            }
+        }
+
+        #endregion
+
+        #region Enhanced List Operations
+
+        /// <summary>
+        /// Adds an item and optionally sets it as current
+        /// </summary>
+        /// <param name="item">Item to add</param>
+        /// <param name="setCurrent">Whether to set this as the current item (default: true)</param>
+        public void Add(T item, bool setCurrent)
+        {
+            _items.Add(item);
+            if (setCurrent)
+                CurrentIndex = Count - 1;
+        }
+
+        /// <summary>
+        /// Adds a range of items with optional state management
+        /// </summary>
+        /// <param name="collection">Items to add</param>
+        /// <param name="setCurrentToFirst">Set current index to first added item</param>
+        /// <param name="setCurrentToLast">Set current index to last added item</param>
+        public void AddRange(IEnumerable<T> collection, bool setCurrentToFirst = false, bool setCurrentToLast = false)
+        {
+            if (collection == null) return;
+
+            int startIndex = Count;
+            _items.AddRange(collection);
+            int endIndex = Count - 1;
+
+            // Set current index based on parameters
+            if (setCurrentToLast && endIndex >= startIndex)
+                CurrentIndex = endIndex;
+            else if (setCurrentToFirst && startIndex < Count)
+                CurrentIndex = startIndex;
+        }
+
+        /// <summary>
+        /// Adds a range and returns the StateList for method chaining
+        /// </summary>
+        /// <param name="collection">Items to add</param>
+        /// <returns>This StateList instance</returns>
+        public StateList<T> AddRangeAndReturn(IEnumerable<T> collection)
+        {
+            AddRange(collection);
+            return this;
+        }
+
+        /// <summary>
+        /// Inserts a range of items at the specified index
+        /// </summary>
+        public void InsertRange(int index, IEnumerable<T> collection)
+        {
+            var items = collection?.ToList();
+            if (items == null || items.Count == 0) return;
+
+            _items.InsertRange(index, items);
+
+            // Adjust CurrentIndex if necessary
+            if (CurrentIndex >= index)
+                CurrentIndex += items.Count;
+        }
+
+        /// <summary>
+        /// Removes all items matching the predicate
+        /// </summary>
+        public int RemoveAll(Predicate<T> match)
+        {
+            if (match == null)
+                throw new ArgumentNullException(nameof(match));
+
+            // Track which indices will be removed
+            var indicesToRemove = new List<int>();
+            for (int i = 0; i < Count; i++)
+            {
+                if (match(_items[i]))
+                    indicesToRemove.Add(i);
+            }
+
+            int originalCurrentIndex = CurrentIndex;
+            int removed = _items.RemoveAll(match);
+
+            // Adjust CurrentIndex based on removals
+            if (removed > 0 && originalCurrentIndex >= 0)
+            {
+                // Count how many items before current were removed
+                int itemsRemovedBeforeCurrent = indicesToRemove.Count(i => i < originalCurrentIndex);
+
+                // Check if current item was removed
+                bool currentItemRemoved = indicesToRemove.Contains(originalCurrentIndex);
+
+                if (currentItemRemoved)
+                {
+                    // Current item was removed, try to maintain position
+                    CurrentIndex = Math.Min(originalCurrentIndex - itemsRemovedBeforeCurrent, Count - 1);
+                }
+                else
+                {
+                    // Current item still exists, adjust its index
+                    CurrentIndex = originalCurrentIndex - itemsRemovedBeforeCurrent;
+                }
+            }
+
+            return removed;
+        }
+
+        /// <summary>
+        /// Removes a range of items
+        /// </summary>
+        public void RemoveRange(int index, int count)
+        {
+            if (index < 0)
+                throw new ArgumentOutOfRangeException(nameof(index));
+            if (count < 0)
+                throw new ArgumentOutOfRangeException(nameof(count));
+            if (index + count > Count)
+                throw new ArgumentException("Index and count exceed list bounds");
+
+            _items.RemoveRange(index, count);
+
+            // Adjust CurrentIndex
+            if (CurrentIndex >= index + count)
+            {
+                // Current is after removed range
+                CurrentIndex -= count;
+            }
+            else if (CurrentIndex >= index)
+            {
+                // Current was in removed range
+                CurrentIndex = Math.Min(index, Count - 1);
+            }
+        }
+
+        /// <summary>
+        /// Sorts the list while maintaining the current item
+        /// </summary>
+        public void Sort()
+        {
+            T? currentItem = IsValidIndex ? _items[CurrentIndex] : default(T);
+            _items.Sort();
+
+            if (currentItem != null)
+                CurrentIndex = _items.IndexOf(currentItem);
+        }
+
+        /// <summary>
+        /// Sorts the list using a comparison while maintaining the current item
+        /// </summary>
+        public void Sort(Comparison<T> comparison)
+        {
+            T? currentItem = IsValidIndex ? _items[CurrentIndex] : default(T);
+            _items.Sort(comparison);
+
+            if (currentItem != null)
+                CurrentIndex = _items.IndexOf(currentItem);
+        }
+
+        /// <summary>
+        /// Sorts the list using a comparer while maintaining the current item
+        /// </summary>
+        public void Sort(IComparer<T>? comparer)
+        {
+            T? currentItem = IsValidIndex ? _items[CurrentIndex] : default(T);
+            _items.Sort(comparer);
+
+            if (currentItem != null)
+                CurrentIndex = _items.IndexOf(currentItem);
+        }
+
+        /// <summary>
+        /// Sorts a range of the list
+        /// </summary>
+        public void Sort(int index, int count, IComparer<T>? comparer)
+        {
+            T? currentItem = IsValidIndex ? _items[CurrentIndex] : default(T);
+            _items.Sort(index, count, comparer);
+
+            if (currentItem != null)
+                CurrentIndex = _items.IndexOf(currentItem);
+        }
+
+        /// <summary>
+        /// Reverses the entire list
+        /// </summary>
+        public void Reverse()
+        {
+            _items.Reverse();
+
+            if (IsValidIndex)
+                CurrentIndex = Count - 1 - CurrentIndex;
+        }
+
+        /// <summary>
+        /// Reverses a range of the list
+        /// </summary>
+        public void Reverse(int index, int count)
+        {
+            _items.Reverse(index, count);
+
+            // Adjust CurrentIndex if it's within the reversed range
+            if (CurrentIndex >= index && CurrentIndex < index + count)
+            {
+                int relativePos = CurrentIndex - index;
+                CurrentIndex = index + count - 1 - relativePos;
+            }
+        }
+
+        #endregion
+
+        #region Search and Filter Methods
+
+        /// <summary>
+        /// Finds a specific item and sets it as current if found
+        /// </summary>
+        /// <param name="match">Predicate to match</param>
+        /// <returns>The found item or default</returns>
+        public T? Find(Predicate<T> match)
+        {
+            if (match == null) return default(T);
+
+            int index = _items.FindIndex(match);
+            if (index >= 0)
+            {
+                CurrentIndex = index;
+                return _items[index];
+            }
+            return default(T);
+        }
+
+        /// <summary>
+        /// Finds the index of the first item matching the predicate
+        /// </summary>
+        public int FindIndex(Predicate<T> match) => _items.FindIndex(match);
+
+        /// <summary>
+        /// Finds the index of the first item matching the predicate within a range
+        /// </summary>
+        public int FindIndex(int startIndex, Predicate<T> match) => _items.FindIndex(startIndex, match);
+
+        /// <summary>
+        /// Finds the index of the first item matching the predicate within a range
+        /// </summary>
+        public int FindIndex(int startIndex, int count, Predicate<T> match) =>
+            _items.FindIndex(startIndex, count, match);
+
+        /// <summary>
+        /// Finds all items matching the predicate
+        /// </summary>
+        public List<T> FindAll(Predicate<T> match) => _items.FindAll(match);
+
+        /// <summary>
+        /// Creates a new StateList with items that match the predicate
+        /// </summary>
+        /// <param name="predicate">Filter predicate</param>
+        /// <returns>New StateList with filtered items</returns>
+        public StateList<T> Where(Func<T, bool> predicate) =>
+            new StateList<T>(_items.Where(predicate));
+
+        /// <summary>
+        /// Returns items not in the other collection
+        /// </summary>
+        /// <param name="other">Collection to exclude</param>
+        /// <returns>New StateList with excluded items</returns>
+        public StateList<T> Except(IEnumerable<T> other) =>
+            new StateList<T>(_items.Except(other));
+
+        /// <summary>
+        /// Returns items that exist in both collections
+        /// </summary>
+        /// <param name="other">Collection to intersect with</param>
+        /// <returns>New StateList with intersected items</returns>
+        public StateList<T> Intersect(IEnumerable<T> other) =>
+            new StateList<T>(_items.Intersect(other));
+
+        /// <summary>
+        /// Determines whether any element matches the conditions
+        /// </summary>
+        public bool Exists(Predicate<T> match) => _items.Exists(match);
+
+        /// <summary>
+        /// Determines whether all elements match the conditions
+        /// </summary>
+        public bool TrueForAll(Predicate<T> match) => _items.TrueForAll(match);
+
+        #endregion
+
+        #region Additional List Methods
+
+        /// <summary>
+        /// Gets or sets the capacity of the list
+        /// </summary>
+        public int Capacity
+        {
+            get => _items.Capacity;
+            set => _items.Capacity = value;
+        }
+
+        /// <summary>
+        /// Copies the list to an array
+        /// </summary>
+        public T[] ToArray() => _items.ToArray();
+
+        /// <summary>
+        /// Creates a shallow copy of a range of elements
+        /// </summary>
+        public List<T> GetRange(int index, int count) => _items.GetRange(index, count);
+
+        /// <summary>
+        /// Performs an action on each element
+        /// </summary>
+        public void ForEach(Action<T> action) => _items.ForEach(action);
+
+        /// <summary>
+        /// Binary search for an item (list must be sorted)
+        /// </summary>
+        public int BinarySearch(T item) => _items.BinarySearch(item);
+
+        /// <summary>
+        /// Binary search for an item using a comparer (list must be sorted)
+        /// </summary>
+        public int BinarySearch(T item, IComparer<T>? comparer) =>
+            _items.BinarySearch(item, comparer);
+
+        /// <summary>
+        /// Binary search within a range (list must be sorted)
+        /// </summary>
+        public int BinarySearch(int index, int count, T item, IComparer<T>? comparer) =>
+            _items.BinarySearch(index, count, item, comparer);
+
+        /// <summary>
+        /// Converts all elements to another type
+        /// </summary>
+        public List<TOutput> ConvertAll<TOutput>(Converter<T, TOutput> converter) =>
+            _items.ConvertAll(converter);
+
+        /// <summary>
+        /// Gets the last index of an item
+        /// </summary>
+        public int LastIndexOf(T item) => _items.LastIndexOf(item);
+
+        /// <summary>
+        /// Gets the last index of an item within a range
+        /// </summary>
+        public int LastIndexOf(T item, int index) => _items.LastIndexOf(item, index);
+
+        /// <summary>
+        /// Gets the last index of an item within a range
+        /// </summary>
+        public int LastIndexOf(T item, int index, int count) =>
+            _items.LastIndexOf(item, index, count);
+
+        /// <summary>
+        /// Reduces the capacity to the actual number of elements
+        /// </summary>
+        public void TrimExcess() => _items.TrimExcess();
+
+        #endregion
+
+        #region Implicit Conversions
+
+        /// <summary>
+        /// Implicit conversion from array
+        /// </summary>
+        public static implicit operator StateList<T>(T[] source) => new StateList<T>(source);
+
+        /// <summary>
+        /// Implicit conversion from List
+        /// </summary>
+        public static implicit operator StateList<T>(List<T> source) => new StateList<T>(source);
+
+        #endregion
+
+        #region Overrides
+
+        /// <summary>
+        /// Returns a string representation of the StateList
+        /// </summary>
+        public override string ToString()
+        {
+            return $"StateList<{typeof(T).Name}>[Count={Count}, Current={CurrentIndex}, Description={Description ?? "None"}]";
+        }
+
+        #endregion
+    } //end class StateList<T>
 
     /// <summary>
     /// The various acceptable error codes to report
@@ -1203,6 +2537,77 @@ namespace ASCTableStorage.Models
             await da.BatchUpdateListAsync(old, TableOperationType.Delete);
         }
     } //end class ErrorLogData
+
+    #region Queue Supporting Classes
+    /// <summary>
+    /// Represents a paged result of queue items with position tracking
+    /// </summary>
+    public class PagedQueueResult<T>
+    {
+        /// <summary>
+        /// The StateList containing items from this page
+        /// </summary>
+        public StateList<T> Items { get; set; } = new StateList<T>();
+
+        /// <summary>
+        /// Token to continue to the next page (null if no more pages)
+        /// </summary>
+        public string? ContinuationToken { get; set; }
+
+        /// <summary>
+        /// Indicates if there are more pages available
+        /// </summary>
+        public bool HasMore { get; set; }
+
+        /// <summary>
+        /// Number of items in this page
+        /// </summary>
+        public int PageSize { get; set; }
+
+        /// <summary>
+        /// List of QueueIDs in this page (for deletion tracking)
+        /// </summary>
+        public List<string> QueueIds { get; set; } = new List<string>();
+
+        /// <summary>
+        /// The current global position across all queue segments
+        /// </summary>
+        public int CurrentGlobalPosition { get; set; } = -1;
+
+        /// <summary>
+        /// Total items processed across all segments
+        /// </summary>
+        public int TotalProcessed { get; set; } = 0;
+    }
+
+    /// <summary>
+    /// Result of processing queues in pages
+    /// </summary>
+    public class ProcessingResult
+    {
+        public int PagesProcessed { get; set; }
+        public int TotalItemsRetrieved { get; set; }
+        public int TotalItemsProcessed { get; set; }
+        public int LastProcessedIndex { get; set; } = -1;
+        public bool Completed { get; set; }
+        public bool StoppedEarly { get; set; }
+        public bool ReachedMaxPages { get; set; }
+    }
+
+    /// <summary>
+    /// Summary of processing progress across all queues
+    /// </summary>
+    public class ProgressSummary
+    {
+        public string QueueName { get; set; } = string.Empty;
+        public int QueueCount { get; set; }
+        public int TotalItems { get; set; }
+        public int ProcessedItems { get; set; }
+        public double PercentComplete { get; set; }
+        public int CurrentPosition { get; set; } = -1;
+        public string? CurrentQueueDescription { get; set; }
+    }
+    #endregion Queue Supporting Classes
 
 
     #region Blob Supporting Classes
