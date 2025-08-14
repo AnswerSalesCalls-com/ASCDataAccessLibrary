@@ -347,7 +347,7 @@ namespace ASCTableStorage.Models
                 }
                 else if (this is IDynamicProperties dynamic)
                 {
-                    dynamic.DynamicProperties[f.Key] = ConvertFromEntityProperty(f.Value);
+                    dynamic.DynamicProperties[f.Key] = ConvertFromEntityProperty(f.Value)!;
                 }
             }
         } //end ReadEntity
@@ -834,7 +834,8 @@ namespace ASCTableStorage.Models
     }
 
     /// <summary>
-    /// Allows for collections of data to be stored in the DB for State Management with position tracking and paging support
+    /// Allows for a single collection of data to be stored in the DB for State Management with position tracking
+    /// One QueueData = One StateList = One logical queue of work
     /// </summary>
     public class QueueData<T> : TableEntityBase, ITableExtra
     {
@@ -848,7 +849,7 @@ namespace ASCTableStorage.Models
         }
 
         /// <summary>
-        /// Name the type of data that's going to be stored.
+        /// Name/category of the queue (used as PartitionKey for grouping similar queues)
         /// </summary>
         public string? Name
         {
@@ -872,14 +873,14 @@ namespace ASCTableStorage.Models
         public double PercentComplete { get; set; }
 
         /// <summary>
-        /// The starting index for this queue segment (for position-aware paging)
-        /// </summary>
-        public int SegmentStartIndex { get; set; } = 0;
-
-        /// <summary>
-        /// Total items across all segments (for tracking overall progress)
+        /// Total items in this queue
         /// </summary>
         public int TotalItemCount { get; set; } = 0;
+
+        /// <summary>
+        /// Last processed index in the queue
+        /// </summary>
+        public int LastProcessedIndex { get; set; } = -1;
 
         /// <summary>
         /// Explodes the data into usable StateList form with preserved position
@@ -889,7 +890,6 @@ namespace ASCTableStorage.Models
             if (string.IsNullOrEmpty(Value))
                 return new StateList<T>();
 
-            // Try to deserialize as StateList first (new format)
             try
             {
                 var stateList = JsonConvert.DeserializeObject<StateList<T>>(Value);
@@ -918,9 +918,10 @@ namespace ASCTableStorage.Models
         {
             Value = JsonConvert.SerializeObject(data, Functions.NewtonSoftRemoveNulls());
             TotalItemCount = data.Count;
+            LastProcessedIndex = data.CurrentIndex;
 
             // Calculate and store completion percentage
-            if (data.Count > 0)
+            if (data.Count > 0 && data.CurrentIndex >= 0)
             {
                 PercentComplete = ((double)(data.CurrentIndex + 1) / data.Count) * 100;
             }
@@ -948,11 +949,11 @@ namespace ASCTableStorage.Models
             PutData(stateList);
         }
 
+        #region Save Methods
+
         /// <summary>
         /// Preserves the queued data to the DB
         /// </summary>
-        /// <param name="accountName">The Azure Account name for the Table Store</param>
-        /// <param name="accountKey">The Azure Account key for Table Storage</param>
         public void SaveQueue(string accountName, string accountKey)
         {
             new DataAccess<QueueData<T>>(accountName, accountKey).ManageData(this);
@@ -961,8 +962,6 @@ namespace ASCTableStorage.Models
         /// <summary>
         /// Preserves the queued data to the DB asynchronously
         /// </summary>
-        /// <param name="accountName">The Azure Account name for the Table Store</param>
-        /// <param name="accountKey">The Azure Account key for Table Storage</param>
         public async Task SaveQueueAsync(string accountName, string accountKey)
         {
             await new DataAccess<QueueData<T>>(accountName, accountKey).ManageDataAsync(this);
@@ -970,6 +969,7 @@ namespace ASCTableStorage.Models
 
         /// <summary>
         /// Saves current progress without removing from queue (for checkpointing)
+        /// Updates the existing queue with new position information
         /// </summary>
         public async Task SaveProgressAsync(StateList<T> currentState, string accountName, string accountKey)
         {
@@ -977,618 +977,264 @@ namespace ASCTableStorage.Models
             await SaveQueueAsync(accountName, accountKey);
         }
 
-        #region Non-Paged Methods (Original)
+        #endregion Save Methods
+
+        #region Single Queue Retrieval Methods
 
         /// <summary>
-        /// Returns StateList of Queued data that is ready to be worked on again. 
-        /// Optionally removes the data once complete.
+        /// Gets a single queue by its ID
         /// </summary>
-        /// <param name="name">The name stored to identify the type of data</param>
-        /// <param name="accountName">The Azure Account name for the Table Store</param>
-        /// <param name="accountKey">The Azure Account key for Table Storage</param>
-        /// <param name="deleteAfterRetrieve">Whether to delete the queue items after retrieval (default: true)</param>
-        public StateList<T> GetQueues(string name, string accountName, string accountKey, bool deleteAfterRetrieve = true)
-        {
-            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
-            List<QueueData<T>> d = da.GetCollection(name).OrderBy(x => x.Timestamp).ToList();
-
-            if (deleteAfterRetrieve)
-            {
-                da.BatchUpdateList(d, TableOperationType.Delete);
-            }
-
-            return ConvertToStateList(d);
-        }
-
-        /// <summary>
-        /// Asynchronously returns StateList of Queued data that is ready to be worked on again.
-        /// Optionally removes the data once complete.
-        /// </summary>
-        /// <param name="name">The name stored to identify the type of data</param>
-        /// <param name="accountName">The Azure Account name for the Table Store</param>
-        /// <param name="accountKey">The Azure Account key for Table Storage</param>
-        /// <param name="deleteAfterRetrieve">Whether to delete the queue items after retrieval (default: true)</param>
-        public async Task<StateList<T>> GetQueuesAsync(string name, string accountName, string accountKey, bool deleteAfterRetrieve = true)
-        {
-            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
-            var queues = await da.GetCollectionAsync(name);
-            List<QueueData<T>> d = queues.OrderBy(x => x.Timestamp).ToList();
-
-            if (deleteAfterRetrieve)
-            {
-                _ = Task.Run(async () => { await da.BatchUpdateListAsync(d, TableOperationType.Delete); });
-            }
-
-            return ConvertToStateList(d);
-        }
-
-        #endregion Non-Paged Methods (Original)
-
-        #region Position-Aware Paged Queue Methods
-
-        /// <summary>
-        /// Gets a paged collection of queues with position-aware options
-        /// </summary>
-        /// <param name="name">The name stored to identify the type of data</param>
-        /// <param name="accountName">The Azure Account name for the Table Store</param>
-        /// <param name="accountKey">The Azure Account key for Table Storage</param>
-        /// <param name="pageSize">Number of queue items per page (default: 10)</param>
-        /// <param name="continuationToken">Token to continue from previous page (null for first page)</param>
-        /// <param name="resumeFromPosition">If true and no continuation token, starts from last known CurrentIndex</param>
-        /// <returns>Paged result with queue items and continuation information</returns>
-        public async Task<PagedQueueResult<T>> GetPagedQueuesAsync(string name, string accountName, string accountKey, 
-            int pageSize = 10, string? continuationToken = null, bool resumeFromPosition = false)
-        {
-            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
-
-            // If resuming from position and no continuation token, find the appropriate starting point
-            if (resumeFromPosition && string.IsNullOrEmpty(continuationToken))
-            {
-                // Get only queues that have progress (not completed)
-                var inProgressQueues = await da.GetCollectionAsync(x =>
-                    x.PartitionKey == name &&
-                    x.ProcessingStatus != null &&
-                    x.ProcessingStatus.Contains("In Progress"));
-
-                if (inProgressQueues.Any())
-                {
-                    var lastPosition = inProgressQueues
-                        .OrderByDescending(x => x.Timestamp)
-                        .FirstOrDefault();
-
-                    if (lastPosition != null)
-                    {
-                        continuationToken = CreatePositionBasedToken(lastPosition);
-                    }
-                }
-            }
-            var pagedResult = await da.GetPagedCollectionAsync(name, pageSize, continuationToken);
-
-            // Sort the items by timestamp
-            var sortedItems = pagedResult.Items.OrderBy(x => x.Timestamp).ToList();
-
-            // Convert to StateList and handle position
-            var stateList = ConvertToStateListWithPosition(sortedItems, resumeFromPosition);
-
-            return new PagedQueueResult<T>
-            {
-                Items = stateList,
-                ContinuationToken = pagedResult.ContinuationToken,
-                HasMore = pagedResult.HasMore,
-                PageSize = pagedResult.Count,
-                QueueIds = sortedItems.Select(q => q.QueueID ?? "Unknown").ToList(),
-                CurrentGlobalPosition = stateList.CurrentIndex >= 0 ?
-                    CalculateGlobalPosition(sortedItems, stateList.CurrentIndex) : -1,
-                TotalProcessed = CountTotalProcessed(sortedItems)
-            };
-        }
-
-        /// <summary>
-        /// Gets a paged collection of queues starting from a specific position - OPTIMIZED VERSION
-        /// </summary>
-        /// <param name="name">The name stored to identify the type of data</param>
-        /// <param name="accountName">The Azure Account name for the Table Store</param>
-        /// <param name="accountKey">The Azure Account key for Table Storage</param>
-        /// <param name="startFromIndex">The global index to start from (across all queue segments)</param>
-        /// <param name="pageSize">Number of items to retrieve</param>
-        /// <returns>Paged result starting from the specified position</returns>
-        public async Task<PagedQueueResult<T>> GetPagedQueuesFromPositionAsync(string name, string accountName, string accountKey, int startFromIndex, int pageSize = 10)
-        {
-            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
-
-            // OPTIMIZATION 1: First, get just the metadata to find our position
-            // We only need to know the counts and order, not the full data
-            var queueMetadata = await da.GetCollectionAsync(q => q.PartitionKey == name);
-
-            if (!queueMetadata.Any())
-            {
-                return new PagedQueueResult<T>
-                {
-                    Items = new StateList<T>(),
-                    HasMore = false,
-                    PageSize = 0,
-                    CurrentGlobalPosition = -1
-                };
-            }
-
-            var sortedQueues = queueMetadata.OrderBy(x => x.Timestamp).ToList();
-
-            // OPTIMIZATION 2: Find the target queue without deserializing all data
-            int currentPosition = 0;
-            int targetQueueIndex = -1;
-            int indexWithinQueue = 0;
-            List<(string QueueId, int StartPos, int ItemCount)> queueMap = new List<(string, int, int)>();
-
-            for (int i = 0; i < sortedQueues.Count; i++)
-            {
-                var queue = sortedQueues[i];
-
-                // Only deserialize to get count if we haven't found our position yet
-                int itemCount = queue.TotalItemCount; // Use stored count if available
-
-                if (itemCount == 0)
-                {
-                    // Fallback: deserialize just to get count
-                    var data = queue.GetData();
-                    itemCount = data.Count;
-                }
-
-                queueMap.Add((queue.QueueID!, currentPosition, itemCount));
-
-                if (targetQueueIndex == -1 && currentPosition + itemCount > startFromIndex)
-                {
-                    targetQueueIndex = i;
-                    indexWithinQueue = startFromIndex - currentPosition;
-                }
-
-                currentPosition += itemCount;
-
-                // OPTIMIZATION 3: Stop counting once we've found our target and have enough for the page
-                if (targetQueueIndex >= 0 && currentPosition >= startFromIndex + pageSize)
-                {
-                    break;
-                }
-            }
-
-            if (targetQueueIndex == -1)
-            {
-                // Position is beyond all queues
-                return new PagedQueueResult<T>
-                {
-                    Items = new StateList<T>(),
-                    HasMore = false,
-                    PageSize = 0,
-                    CurrentGlobalPosition = -1
-                };
-            }
-
-            // OPTIMIZATION 4: Only get the queues we need for this page
-            var queuesNeeded = new List<string>();
-            int itemsNeeded = pageSize;
-
-            for (int i = targetQueueIndex; i < queueMap.Count && itemsNeeded > 0; i++)
-            {
-                queuesNeeded.Add(queueMap[i].QueueId);
-
-                if (i == targetQueueIndex)
-                {
-                    // First queue: we need items from indexWithinQueue to end
-                    itemsNeeded -= (queueMap[i].ItemCount - indexWithinQueue);
-                }
-                else
-                {
-                    // Subsequent queues: we need up to itemsNeeded items
-                    itemsNeeded -= Math.Min(queueMap[i].ItemCount, itemsNeeded);
-                }
-            }
-
-            // OPTIMIZATION 5: Fetch only the queues we need using lambda
-            var relevantQueues = await da.GetCollectionAsync(
-                q => queuesNeeded.Contains(q.RowKey!)
-            );
-
-            // Sort them back in the correct order
-            relevantQueues = relevantQueues
-                .OrderBy(q => queuesNeeded.IndexOf(q.QueueID!))
-                .ToList();
-
-            // OPTIMIZATION 6: Build the result with just what we need
-            var resultList = new StateList<T>();
-            int itemsAdded = 0;
-
-            foreach (var queue in relevantQueues)
-            {
-                var data = queue.GetData();
-                int skipCount = 0;
-                int takeCount = pageSize - itemsAdded;
-
-                if (queue.QueueID == queueMap[targetQueueIndex].QueueId)
-                {
-                    // This is our starting queue
-                    skipCount = indexWithinQueue;
-                }
-
-                var itemsToAdd = data
-                    .Skip(skipCount)
-                    .Take(takeCount)
-                    .ToList();
-
-                resultList.AddRange(itemsToAdd);
-                itemsAdded = resultList.Count;
-
-                if (itemsAdded >= pageSize)
-                    break;
-            }
-
-            // Set the current index to the beginning of our result
-            if (resultList.Count > 0)
-            {
-                resultList.CurrentIndex = 0;
-            }
-
-            // Calculate if there are more items after this page
-            bool hasMore = (startFromIndex + itemsAdded) < currentPosition;
-
-            return new PagedQueueResult<T>
-            {
-                Items = resultList,
-                HasMore = hasMore,
-                PageSize = resultList.Count,
-                CurrentGlobalPosition = startFromIndex,
-                TotalProcessed = startFromIndex,
-                QueueIds = relevantQueues.Select(q => q.QueueID!).ToList()
-            };
-        } // End GetPagedQueuesFromPositionAsync
-
-        /// <summary>
-        /// Processes queues in pages with position awareness
-        /// </summary>
-        /// <param name="name">The name stored to identify the type of data</param>
-        /// <param name="accountName">The Azure Account name for the Table Store</param>
-        /// <param name="accountKey">The Azure Account key for Table Storage</param>
-        /// <param name="pageSize">Number of items to process per batch</param>
-        /// <param name="processPage">Async function to process each page of items</param>
-        /// <param name="deleteAfterProcess">Whether to delete items after processing</param>
-        /// <param name="resumeFromLastPosition">Start from last known position</param>
-        /// <param name="maxPages">Maximum number of pages to process (null for all)</param>
-        public async Task<ProcessingResult> ProcessQueuesPagesAsync(string name, string accountName, string accountKey, int pageSize, Func<StateList<T>, 
-            Task<bool>> processPage, bool deleteAfterProcess = true, bool resumeFromLastPosition = true, int? maxPages = null)
-        {
-            var result = new ProcessingResult();
-            string? continuationToken = null;
-            int pagesProcessed = 0;
-            bool isFirstPage = true;
-
-            do
-            {
-                var pageResult = await GetPagedQueuesAsync(
-                    name,
-                    accountName,
-                    accountKey,
-                    pageSize,
-                    continuationToken,
-                    resumeFromLastPosition && isFirstPage);
-
-                isFirstPage = false;
-
-                if (pageResult.Items.Count == 0)
-                    break;
-
-                result.TotalItemsRetrieved += pageResult.Items.Count;
-
-                // Process the page
-                bool continueProcessing = await processPage(pageResult.Items);
-
-                result.TotalItemsProcessed += pageResult.Items.Count;
-                result.LastProcessedIndex = pageResult.CurrentGlobalPosition;
-
-                if (!continueProcessing)
-                {
-                    result.StoppedEarly = true;
-                    break;
-                }
-
-                // Delete if requested
-                if (deleteAfterProcess && pageResult.QueueIds.Any())
-                {
-                    await DeleteQueueItemsAsync(pageResult.QueueIds, accountName, accountKey);
-                }
-
-                continuationToken = pageResult.ContinuationToken;
-                pagesProcessed++;
-                result.PagesProcessed = pagesProcessed;
-
-                if (maxPages.HasValue && pagesProcessed >= maxPages.Value)
-                {
-                    result.ReachedMaxPages = true;
-                    break;
-                }
-
-            } while (!string.IsNullOrEmpty(continuationToken));
-
-            result.Completed = !result.StoppedEarly && !result.ReachedMaxPages;
-            return result;
-        }
-
-        #endregion Position-Aware Paged Queue Methods
-
-        #region Helper Methods
-
-        /// <summary>
-        /// Converts a list of QueueData items to a single StateList
-        /// </summary>
-        private StateList<T> ConvertToStateList(List<QueueData<T>> queueItems)
-        {
-            var result = new StateList<T>();
-
-            foreach (QueueData<T> q in queueItems)
-            {
-                var stateList = q.GetData();
-
-                // If this is the first queue item, preserve its position
-                if (result.Count == 0 && stateList.Count > 0)
-                {
-                    result.AddRange(stateList);
-                    result.CurrentIndex = stateList.CurrentIndex;
-                    result.Description = stateList.Description ?? q.ProcessingStatus;
-                }
-                else
-                {
-                    // Append additional items
-                    result.AddRange(stateList);
-                }
-            }
-
-            return result;
-        }
-
-        /// <summary>
-        /// Converts queue items to StateList with position awareness
-        /// </summary>
-        private StateList<T> ConvertToStateListWithPosition(List<QueueData<T>> queueItems, bool resumeFromPosition)
-        {
-            var result = new StateList<T>();
-            int globalIndex = -1;
-            bool positionSet = false;
-
-            foreach (QueueData<T> q in queueItems)
-            {
-                var stateList = q.GetData();
-                int startCount = result.Count;
-
-                result.AddRange(stateList);
-
-                // Track position if resuming
-                if (resumeFromPosition && !positionSet)
-                {
-                    if (stateList.CurrentIndex >= 0 && stateList.CurrentIndex < stateList.Count - 1)
-                    {
-                        // This queue was partially processed
-                        globalIndex = startCount + stateList.CurrentIndex + 1; // Next item to process
-                        positionSet = true;
-                    }
-                    else if (stateList.CurrentIndex >= stateList.Count - 1)
-                    {
-                        // This queue was fully processed, continue checking
-                        continue;
-                    }
-                }
-
-                // Copy description from first queue
-                if (string.IsNullOrEmpty(result.Description))
-                {
-                    result.Description = stateList.Description ?? q.ProcessingStatus;
-                }
-            }
-
-            // Set the position if found
-            if (positionSet && globalIndex >= 0 && globalIndex < result.Count)
-            {
-                result.CurrentIndex = globalIndex;
-            }
-            else if (resumeFromPosition && result.Count > 0)
-            {
-                // No position found, start from beginning
-                result.CurrentIndex = 0;
-            }
-
-            return result;
-        }
-
-        /// <summary>
-        /// Finds the last processed position across queue items
-        /// </summary>
-        private QueueData<T>? FindLastProcessedPosition(List<QueueData<T>> queueItems)
-        {
-            // Find the last queue with processing progress
-            for (int i = queueItems.Count - 1; i >= 0; i--)
-            {
-                var data = queueItems[i].GetData();
-                if (data.CurrentIndex >= 0 && data.CurrentIndex < data.Count - 1)
-                {
-                    // This queue is partially processed
-                    return queueItems[i];
-                }
-            }
-
-            return null;
-        }
-
-        /// <summary>
-        /// Creates a position-based continuation token
-        /// </summary>
-        private string CreatePositionBasedToken(QueueData<T> fromQueue)
-        {
-            // This is a simplified version - in production you'd encode this properly
-            return $"{fromQueue.PartitionKey}|{fromQueue.RowKey}";
-        }
-
-        /// <summary>
-        /// Calculates the global position across all queue segments
-        /// </summary>
-        private int CalculateGlobalPosition(List<QueueData<T>> queues, int localIndex)
-        {
-            int globalPosition = 0;
-
-            foreach (var queue in queues)
-            {
-                var data = queue.GetData();
-                if (data.CurrentIndex >= 0)
-                {
-                    globalPosition += data.CurrentIndex;
-                    break;
-                }
-                globalPosition += data.Count;
-            }
-
-            return globalPosition + localIndex;
-        }
-
-        /// <summary>
-        /// Counts total processed items across queues
-        /// </summary>
-        private int CountTotalProcessed(List<QueueData<T>> queues)
-        {
-            int total = 0;
-
-            foreach (var queue in queues)
-            {
-                var data = queue.GetData();
-                if (data.CurrentIndex >= 0)
-                {
-                    total += data.CurrentIndex + 1;
-                }
-            }
-
-            return total;
-        }
-
-        /// <summary>
-        /// Gets total item count across all queues
-        /// </summary>
-        private int GetTotalItemCount(List<QueueData<T>> queues)
-        {
-            return queues.Sum(q => q.GetData().Count);
-        }
-
-        /// <summary>
-        /// Deletes specific queue items by their IDs - OPTIMIZED VERSION
-        /// </summary>
-        private async Task DeleteQueueItemsAsync(List<string> queueIds, string accountName, string accountKey)
-        {
-            if (!queueIds.Any()) return;
-
-            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
-
-            // Get all items at once using lambda expression
-            var itemsToDelete = await da.GetCollectionAsync(q => queueIds.Contains(q.RowKey));
-
-            if (itemsToDelete.Any())
-            {
-                await da.BatchUpdateListAsync(itemsToDelete, TableOperationType.Delete);
-            }
-        }
-
-        #endregion Helper Methods
-
-        #region Monitoring Methods
-
-        /// <summary>
-        /// Gets a single queue item without deleting it (for monitoring/inspection)
-        /// </summary>
-        public async Task<StateList<T>?> PeekQueueAsync(string queueId, string accountName, string accountKey)
+        /// <param name="queueId">The unique queue identifier</param>
+        /// <param name="accountName">The Azure Account name</param>
+        /// <param name="accountKey">The Azure Account key</param>
+        /// <param name="deleteAfterRetrieve">Whether to delete after retrieval</param>
+        /// <returns>The StateList for this queue, or null if not found</returns>
+        public static async Task<StateList<T>?> GetQueueAsync(string queueId, string accountName, string accountKey, bool deleteAfterRetrieve = false)
         {
             DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
             var queue = await da.GetRowObjectAsync(queueId);
-            return queue?.GetData();
-        }
 
-        /// <summary>
-        /// Peek multiple queues at once
-        /// </summary>
-        public async Task<Dictionary<string, StateList<T>>> PeekQueuesAsync(List<string> queueIds, string accountName, string accountKey)
-        {
-            if (!queueIds.Any())
-                return new Dictionary<string, StateList<T>>();
+            if (queue == null)
+                return null;
 
-            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+            var stateList = queue.GetData();
 
-            // Get all at once
-            var queues = await da.GetCollectionAsync(q => queueIds.Contains(q.RowKey!));
-
-            return queues.ToDictionary(
-                q => q.QueueID ?? "Unknown",
-                q => q.GetData());
-        }
-
-        /// <summary>
-        /// Gets the processing progress across all queues
-        /// </summary>
-        // OPTIMIZED VERSION using aggregation in chunks:
-        public static async Task<ProgressSummary> GetProgressSummaryAsync(string name, string accountName, string accountKey)
-        {
-            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
-            var summary = new ProgressSummary { QueueName = name };
-
-            // Use paging to avoid loading everything at once
-            string? continuationToken = null;
-            do
+            if (deleteAfterRetrieve)
             {
-                var page = await da.GetPagedCollectionAsync(name, 100, continuationToken);
-
-                foreach (var queue in page.Items)
-                {
-                    var data = queue.GetData();
-                    summary.TotalItems += data.Count;
-
-                    if (data.CurrentIndex >= 0)
-                    {
-                        summary.ProcessedItems += data.CurrentIndex + 1;
-                    }
-
-                    summary.QueueCount++;
-                }
-
-                continuationToken = page.ContinuationToken;
-            } while (!string.IsNullOrEmpty(continuationToken));
-
-            if (summary.TotalItems > 0)
-            {
-                summary.PercentComplete = (summary.ProcessedItems * 100.0) / summary.TotalItems;
+                await da.ManageDataAsync(queue, TableOperationType.Delete);
             }
 
-            return summary;
+            return stateList;
         }
 
         /// <summary>
-        /// Batch deletes items matching a condition
+        /// Gets a single queue without deleting it (for monitoring/inspection)
         /// </summary>
-        public async Task<int> DeleteQueuesMatchingAsync(string accountName, string accountKey, Expression<Func<QueueData<T>, bool>> predicate)
+        public static async Task<StateList<T>?> PeekQueueAsync(string queueId, string accountName, string accountKey)
+            => await GetQueueAsync(queueId, accountName, accountKey, deleteAfterRetrieve: false);
+        
+
+        #endregion Single Queue Retrieval Methods
+
+        #region Multiple Queue Management (Each is Independent)
+
+        /// <summary>
+        /// Gets all queues with a given name/category
+        /// Returns a dictionary where each QueueID maps to its own independent StateList
+        /// </summary>
+        /// <param name="name">The name/category of queues</param>
+        /// <param name="accountName">The Azure Account name</param>
+        /// <param name="accountKey">The Azure Account key</param>
+        /// <param name="deleteAfterRetrieve">Whether to delete after retrieval</param>
+        /// <returns>Dictionary of QueueID to StateList</returns>
+        public static async Task<Dictionary<string, StateList<T>>> GetQueuesAsync(string name, string accountName, string accountKey, bool deleteAfterRetrieve = true)
         {
             DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+            var queues = await da.GetCollectionAsync(name);
+            var result = new Dictionary<string, StateList<T>>();
 
-            // Get all matching items at once
-            var itemsToDelete = await da.GetCollectionAsync(predicate);
-
-            if (itemsToDelete.Any())
+            foreach (var queue in queues.OrderBy(q => q.Timestamp))
             {
-                var result = await da.BatchUpdateListAsync(itemsToDelete, TableOperationType.Delete);
+                result[queue.QueueID ?? Guid.NewGuid().ToString()] = queue.GetData();
+            }
+
+            if (deleteAfterRetrieve && queues.Any())
+            {
+                await da.BatchUpdateListAsync(queues, TableOperationType.Delete);
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Gets paged collection of independent queues
+        /// </summary>
+        /// <param name="name">The name/category of queues</param>
+        /// <param name="accountName">The Azure Account name</param>
+        /// <param name="accountKey">The Azure Account key</param>
+        /// <param name="pageSize">Number of queues per page</param>
+        /// <param name="continuationToken">Continuation token for paging</param>
+        /// <returns>Paged result with independent queues</returns>
+        public static async Task<PagedQueueResult<T>> GetPagedQueuesAsync(string name, string accountName, string accountKey, int pageSize = 10, string? continuationToken = null)
+        {
+            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+            var pagedResult = await da.GetPagedCollectionAsync(name, pageSize, continuationToken!);
+
+            var result = new PagedQueueResult<T>
+            {
+                Queues = new Dictionary<string, StateList<T>>(),
+                ContinuationToken = pagedResult.ContinuationToken,
+                HasMore = pagedResult.HasMore,
+                PageSize = pagedResult.Count
+            };
+
+            foreach (var queue in pagedResult.Items.OrderBy(q => q.Timestamp))
+            {
+                var queueId = queue.QueueID ?? Guid.NewGuid().ToString();
+                result.Queues[queueId] = queue.GetData();
+                result.QueueMetadata.Add(new QueueMetadata
+                {
+                    QueueID = queueId,
+                    ProcessingStatus = queue.ProcessingStatus ?? "Unknown",
+                    PercentComplete = queue.PercentComplete,
+                    TotalItems = queue.TotalItemCount,
+                    LastProcessedIndex = queue.LastProcessedIndex,
+                    LastModified = queue.Timestamp.DateTime
+                });
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Processes multiple independent queues with a callback
+        /// </summary>
+        /// <param name="name">The name/category of queues</param>
+        /// <param name="accountName">The Azure Account name</param>
+        /// <param name="accountKey">The Azure Account key</param>
+        /// <param name="processQueue">Function to process each queue</param>
+        /// <param name="deleteAfterProcess">Whether to delete after processing</param>
+        /// <param name="maxQueues">Maximum number of queues to process</param>
+        public static async Task<ProcessingResult> ProcessQueuesAsync(string name, string accountName,string accountKey, 
+            Func<string, StateList<T>, Task<bool>> processQueue, bool deleteAfterProcess = true, int? maxQueues = null)
+        {
+            var result = new ProcessingResult();
+            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+
+            var queues = await da.GetCollectionAsync(name);
+            var sortedQueues = queues.OrderBy(q => q.Timestamp).ToList();
+
+            if (maxQueues.HasValue)
+            {
+                sortedQueues = sortedQueues.Take(maxQueues.Value).ToList();
+            }
+
+            foreach (var queue in sortedQueues)
+            {
+                var queueId = queue.QueueID ?? "Unknown";
+                var stateList = queue.GetData();
+
+                result.TotalQueuesRetrieved++;
+
+                bool success = await processQueue(queueId, stateList);
+
+                if (success)
+                {
+                    result.TotalQueuesProcessed++;
+
+                    if (deleteAfterProcess)
+                    {
+                        await da.ManageDataAsync(queue, TableOperationType.Delete);
+                    }
+                }
+                else
+                {
+                    result.FailedQueueIds.Add(queueId);
+                }
+            }
+
+            result.Completed = result.FailedQueueIds.Count == 0;
+            return result;
+        }
+
+        #endregion Multiple Queue Management (Each is Independent)
+
+        #region Batch Operations
+
+        /// <summary>
+        /// Deletes multiple queues by their IDs
+        /// </summary>
+        public static async Task<int> DeleteQueuesAsync(List<string> queueIds, string accountName, string accountKey)
+        {
+            if (!queueIds.Any()) return 0;
+
+            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+
+            // Get all queues at once using lambda
+            var queuesToDelete = await da.GetCollectionAsync(q => queueIds.Contains(q.RowKey!));
+
+            if (queuesToDelete.Any())
+            {
+                var result = await da.BatchUpdateListAsync(queuesToDelete, TableOperationType.Delete);
                 return result.SuccessfulItems;
             }
 
             return 0;
         }
 
-        #endregion Monitoring Methods
+        /// <summary>
+        /// Deletes queues matching a condition
+        /// </summary>
+        public static async Task<int> DeleteQueuesMatchingAsync(string accountName, string accountKey, Expression<Func<QueueData<T>, bool>> predicate)
+        {
+            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+
+            var queuesToDelete = await da.GetCollectionAsync(predicate);
+
+            if (queuesToDelete.Any())
+            {
+                var result = await da.BatchUpdateListAsync(queuesToDelete, TableOperationType.Delete);
+                return result.SuccessfulItems;
+            }
+
+            return 0;
+        }
+
+        #endregion Batch Operations
+
+        #region Monitoring and Statistics
 
         /// <summary>
-        /// Creates a QueueData instance from a StateList with automatic ID generation
+        /// Gets status of all queues in a category
         /// </summary>
-        public static QueueData<T> CreateFromStateList(StateList<T> stateList, string name)
+        public static async Task<List<QueueMetadata>> GetQueueStatusesAsync(string name, string accountName, string accountKey)
+        {
+            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+            var queues = await da.GetCollectionAsync(name);
+
+            return queues.Select(q => new QueueMetadata
+            {
+                QueueID = q.QueueID ?? "Unknown",
+                ProcessingStatus = q.ProcessingStatus ?? "Unknown",
+                PercentComplete = q.PercentComplete,
+                TotalItems = q.TotalItemCount,
+                LastProcessedIndex = q.LastProcessedIndex,
+                LastModified = q.Timestamp.DateTime
+            }).OrderBy(q => q.LastModified).ToList();
+        }
+
+        /// <summary>
+        /// Gets aggregate statistics for a queue category
+        /// </summary>
+        public static async Task<QueueCategoryStatistics> GetCategoryStatisticsAsync(string name, string accountName, string accountKey)
+        {
+            var statuses = await GetQueueStatusesAsync(name, accountName, accountKey);
+
+            return new QueueCategoryStatistics
+            {
+                CategoryName = name,
+                TotalQueues = statuses.Count,
+                NotStartedCount = statuses.Count(s => s.ProcessingStatus.Contains("Not Started")),
+                InProgressCount = statuses.Count(s => s.ProcessingStatus.Contains("In Progress")),
+                CompletedCount = statuses.Count(s => s.ProcessingStatus.Contains("Completed")),
+                AveragePercentComplete = statuses.Any() ? statuses.Average(s => s.PercentComplete) : 0,
+                TotalItems = statuses.Sum(s => s.TotalItems),
+                TotalProcessedItems = statuses.Sum(s => s.LastProcessedIndex >= 0 ? s.LastProcessedIndex + 1 : 0)
+            };
+        }
+
+        #endregion Monitoring and Statistics
+
+        #region Factory Methods
+
+        /// <summary>
+        /// Creates a new QueueData instance from a StateList
+        /// </summary>
+        public static QueueData<T> CreateFromStateList(StateList<T> stateList, string name, string? queueId = null)
         {
             var queue = new QueueData<T>
             {
-                QueueID = Guid.NewGuid().ToString(),
+                QueueID = queueId ?? Guid.NewGuid().ToString(),
                 Name = name
             };
             queue.PutData(stateList);
@@ -1596,17 +1242,24 @@ namespace ASCTableStorage.Models
         }
 
         /// <summary>
-        /// Gets the reference name of the table associated with application queue data.
+        /// Creates a new QueueData instance from a List
+        /// </summary>
+        public static QueueData<T> CreateFromList(List<T> list, string name, string? queueId = null)
+            => CreateFromStateList(new StateList<T>(list), name, queueId);        
+
+        #endregion Factory Methods
+
+        /// <summary>
+        /// Gets the reference name of the table
         /// </summary>
         [XmlIgnore]
         public string TableReference => "AppQueueData";
 
         /// <summary>
-        /// Retrieves the unique identifier associated with the current queue.
+        /// Gets the unique identifier
         /// </summary>
-        /// <returns>A string representing the unique identifier of the queue. This value is never null.</returns>
         public string GetIDValue() => this.QueueID!;
-    }
+    } // end class QueueData<T>
 
     /// <summary>
     /// A List that maintains its current position through serialization/deserialization
@@ -2540,17 +2193,22 @@ namespace ASCTableStorage.Models
 
     #region Queue Supporting Classes
     /// <summary>
-    /// Represents a paged result of queue items with position tracking
+    /// Represents a paged result of INDEPENDENT queues
     /// </summary>
     public class PagedQueueResult<T>
     {
         /// <summary>
-        /// The StateList containing items from this page
+        /// Dictionary of QueueID to its StateList (each queue is independent)
         /// </summary>
-        public StateList<T> Items { get; set; } = new StateList<T>();
+        public Dictionary<string, StateList<T>> Queues { get; set; } = new Dictionary<string, StateList<T>>();
 
         /// <summary>
-        /// Token to continue to the next page (null if no more pages)
+        /// Metadata for each queue in this page
+        /// </summary>
+        public List<QueueMetadata> QueueMetadata { get; set; } = new List<QueueMetadata>();
+
+        /// <summary>
+        /// Token to continue to the next page
         /// </summary>
         public string? ContinuationToken { get; set; }
 
@@ -2560,53 +2218,50 @@ namespace ASCTableStorage.Models
         public bool HasMore { get; set; }
 
         /// <summary>
-        /// Number of items in this page
+        /// Number of queues in this page
         /// </summary>
         public int PageSize { get; set; }
-
-        /// <summary>
-        /// List of QueueIDs in this page (for deletion tracking)
-        /// </summary>
-        public List<string> QueueIds { get; set; } = new List<string>();
-
-        /// <summary>
-        /// The current global position across all queue segments
-        /// </summary>
-        public int CurrentGlobalPosition { get; set; } = -1;
-
-        /// <summary>
-        /// Total items processed across all segments
-        /// </summary>
-        public int TotalProcessed { get; set; } = 0;
     }
 
     /// <summary>
-    /// Result of processing queues in pages
+    /// Metadata about a single queue
+    /// </summary>
+    public class QueueMetadata
+    {
+        public string QueueID { get; set; } = string.Empty;
+        public string ProcessingStatus { get; set; } = string.Empty;
+        public double PercentComplete { get; set; }
+        public int TotalItems { get; set; }
+        public int LastProcessedIndex { get; set; }
+        public DateTime LastModified { get; set; }
+    }
+
+    /// <summary>
+    /// Result of processing multiple queues
     /// </summary>
     public class ProcessingResult
     {
-        public int PagesProcessed { get; set; }
-        public int TotalItemsRetrieved { get; set; }
-        public int TotalItemsProcessed { get; set; }
-        public int LastProcessedIndex { get; set; } = -1;
+        public int TotalQueuesRetrieved { get; set; }
+        public int TotalQueuesProcessed { get; set; }
+        public List<string> FailedQueueIds { get; set; } = new List<string>();
         public bool Completed { get; set; }
-        public bool StoppedEarly { get; set; }
-        public bool ReachedMaxPages { get; set; }
     }
 
     /// <summary>
-    /// Summary of processing progress across all queues
+    /// Statistics for a category of queues
     /// </summary>
-    public class ProgressSummary
+    public class QueueCategoryStatistics
     {
-        public string QueueName { get; set; } = string.Empty;
-        public int QueueCount { get; set; }
+        public string CategoryName { get; set; } = string.Empty;
+        public int TotalQueues { get; set; }
+        public int NotStartedCount { get; set; }
+        public int InProgressCount { get; set; }
+        public int CompletedCount { get; set; }
+        public double AveragePercentComplete { get; set; }
         public int TotalItems { get; set; }
-        public int ProcessedItems { get; set; }
-        public double PercentComplete { get; set; }
-        public int CurrentPosition { get; set; } = -1;
-        public string? CurrentQueueDescription { get; set; }
+        public int TotalProcessedItems { get; set; }
     }
+
     #endregion Queue Supporting Classes
 
 

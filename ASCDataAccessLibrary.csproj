@@ -12,15 +12,16 @@
     <Copyright>2025 Answer Sales Calls Inc.</Copyright>
     <PackageIcon>Azure DB Cloud.png</PackageIcon>
     <GenerateDocumentationFile>True</GenerateDocumentationFile>
-    <AssemblyVersion>2.2</AssemblyVersion>
+    <AssemblyVersion>2.3</AssemblyVersion>
     <PackageOutputPath>Files</PackageOutputPath>
     <BaseOutputPath></BaseOutputPath>
     <DocumentationFile></DocumentationFile>
     <RootNamespace>ASCTableStorage</RootNamespace>
-    <Version>2.2</Version>
-    <PackageReadmeFile>getting-started-guide-22.md</PackageReadmeFile>
+    <Version>2.3</Version>
+    <PackageReadmeFile>getting-started-guide-23.md</PackageReadmeFile>
     <PackageReleaseNotes>
-       ## **Release Notes - ASCDataAccessLibrary v2.2**
+       ## **Release Notes - ASCDataAccessLibrary v2.3**
+       ### **Bug Fixes for v2.2**
 
        **Minor Release: Dynamic Object Support**
 
@@ -46,7 +47,7 @@
   </ItemGroup>
 
   <ItemGroup>
-     <None Update="getting-started-guide-22.md">
+     <None Update="getting-started-guide-23.md">
         <Pack>True</Pack>
         <PackagePath>\</PackagePath>
      </None>
