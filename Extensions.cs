@@ -44,9 +44,7 @@ namespace ASCTableStorage.Common
             if (coll.Current.data != null) newColl.Add(coll.Current.data); // Needs to also include the CURRENT location
             while (coll.MoveNext()) newColl.Add(coll.Current.data); // Appends from the last known working position
 
-            QueueData<T> q = new() { QueueID = Guid.NewGuid().ToString(), Name = name };
-            q.PutData(newColl);
-            return q;
+            return QueueData<T>.CreateFromList(newColl, name);
         }
     }// class Extensions
 

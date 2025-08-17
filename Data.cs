@@ -220,7 +220,7 @@ namespace ASCTableStorage.Data
             string queryString = $"{fieldName} {howToCompare} '{fieldValue}'";
             TableQuery<T> q = new TableQuery<T>().Where(queryString);
             var results = await GetCollectionCore(q);
-            return results.FirstOrDefault();
+            return results.FirstOrDefault()!;
         }
 
         /// <summary>
@@ -229,21 +229,20 @@ namespace ASCTableStorage.Data
         private async Task<T> GetRowObjectCore(Expression<Func<T, bool>> predicate)
         {
             var results = await GetCollectionCore(predicate);
-            return results.FirstOrDefault();
+            return results.FirstOrDefault()!;
         }
 
         /// <summary>
         /// Core implementation for paginated collection retrieval with hybrid filtering support
         /// </summary>
-        private async Task<PagedResult<T>> GetPagedCollectionCore(int pageSize = DEFAULT_PAGE_SIZE,
-            string continuationToken = null, TableQuery<T> definedQuery = null,
-            Expression<Func<T, bool>> predicate = null)
+        private async Task<PagedResult<T>> GetPagedCollectionCore(int pageSize = DEFAULT_PAGE_SIZE, string continuationToken = null, 
+            TableQuery<T> definedQuery = null!, Expression<Func<T, bool>> predicate = null!)
         {
             T obj = Activator.CreateInstance<T>();
             CloudTable table = await GetTableCore(obj.TableReference);
 
             TableQuery<T> query;
-            Func<T, bool> clientFilter = null;
+            Func<T, bool> clientFilter = null!;
 
             // Handle hybrid filtering for lambda expressions
             if (predicate != null)
@@ -261,7 +260,7 @@ namespace ASCTableStorage.Data
 
                 if (hybridResult.RequiresClientFiltering)
                 {
-                    clientFilter = hybridResult.ClientSidePredicate;
+                    clientFilter = hybridResult.ClientSidePredicate!;
                 }
             }
             else
@@ -271,7 +270,7 @@ namespace ASCTableStorage.Data
 
             query = query.Take(pageSize);
 
-            TableContinuationToken token = null;
+            TableContinuationToken token = null!;
             if (!string.IsNullOrEmpty(continuationToken))
             {
                 token = DeserializeContinuationToken(continuationToken);
@@ -288,7 +287,7 @@ namespace ASCTableStorage.Data
 
             return new PagedResult<T>
             {
-                Items = results,
+                Data = results,
                 ContinuationToken = SerializeContinuationToken(segment.ContinuationToken),
                 HasMore = segment.ContinuationToken != null,
                 Count = results.Count
@@ -653,11 +652,23 @@ namespace ASCTableStorage.Data
         /// <summary>
         /// Represents a paginated result set
         /// </summary>
-        public class PagedResult<TEntity>
+        public class PagedResult<T>
         {
-            public List<TEntity> Items { get; set; } = new List<TEntity>();
-            public string ContinuationToken { get; set; }
+            /// <summary>
+            /// The data items in the current page
+            /// </summary>
+            public List<T> Data { get; set; } = new();
+            /// <summary>
+            /// The continuation token for the next page
+            /// </summary>
+            public string? ContinuationToken { get; set; }
+            /// <summary>
+            /// Determines if there are more pages available
+            /// </summary>
             public bool HasMore { get; set; }
+            /// <summary>
+            /// The total count of items in the collection
+            /// </summary>
             public int Count { get; set; }
         }
 

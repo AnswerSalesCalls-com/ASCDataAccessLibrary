@@ -12,23 +12,27 @@
     <Copyright>2025 Answer Sales Calls Inc.</Copyright>
     <PackageIcon>Azure DB Cloud.png</PackageIcon>
     <GenerateDocumentationFile>True</GenerateDocumentationFile>
-    <AssemblyVersion>2.3</AssemblyVersion>
+    <AssemblyVersion>2.5</AssemblyVersion>
     <PackageOutputPath>Files</PackageOutputPath>
-    <BaseOutputPath></BaseOutputPath>
+    <BaseOutputPath>C:\Users\osieb\source\repos\ASCDataAccessLibrary\Files</BaseOutputPath>
     <DocumentationFile></DocumentationFile>
     <RootNamespace>ASCTableStorage</RootNamespace>
-    <Version>2.3</Version>
-    <PackageReadmeFile>getting-started-guide-23.md</PackageReadmeFile>
+    <Version>2.5</Version>
+    <PackageReadmeFile>getting-started-guide-25.md</PackageReadmeFile>
     <PackageReleaseNotes>
-       ## **Release Notes - ASCDataAccessLibrary v2.3**
-       ### **Bug Fixes for v2.2**
+       ## **Release Notes - ASCDataAccessLibrary v2.5**
+       ### **Bug Fixes for v2.4**
 
-       **Minor Release: Dynamic Object Support**
+       **Minor Release: Solved minor bugs in error logging and queueing.**
 
        This release adds updated code to allow for Dynamically generated Entities for scenarios where you don't actually know the schema during development.
        Also improved reflection performance across entities with TypeCaching. Especially performant in batch scenarios.
        And added a long awaited cleaning of error log data older than a specified number of days.
        Updated Queuing to utilize the new StateList object which manages position where a queue needs to pick back up from.
+
+       Removed Paged Queues as this does not make sense due to the fact there should never be an occurence of storing Queues of data within several batches. 
+       All Queue data (the collection) exists within the inner StateList to manage position and movement. You can save status updates of progress within the 
+       queue by calling queue.SaveQueueAsync again -- just like initial save.              
     </PackageReleaseNotes>
     <PackageLicenseFile>mit_license.md</PackageLicenseFile>
     <PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
@@ -47,9 +51,13 @@
   </ItemGroup>
 
   <ItemGroup>
-     <None Update="getting-started-guide-23.md">
+     <None Update="getting-started-guide-24.md">
         <Pack>True</Pack>
         <PackagePath>\</PackagePath>
+     </None>
+     <None Update="getting-started-guide-25.md">
+       <Pack>True</Pack>
+       <PackagePath>\</PackagePath>
      </None>
      <None Update="MIT License.pdf">
       <Pack>True</Pack>

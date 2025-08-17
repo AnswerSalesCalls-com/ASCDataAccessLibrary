@@ -4,11 +4,11 @@ using Microsoft.Azure.Cosmos.Table;
 using Newtonsoft.Json;
 using System.Collections;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json.Serialization;
 using System.Xml.Serialization;
 
@@ -482,7 +482,7 @@ namespace ASCTableStorage.Models
             set { base.RowKey = value; }
         }
         /// <summary>
-        /// Value of the object for retrieval
+        /// Data of the object for retrieval
         /// </summary>
         public string? Value { get; set; }
         /// <summary>
@@ -835,12 +835,12 @@ namespace ASCTableStorage.Models
 
     /// <summary>
     /// Allows for a single collection of data to be stored in the DB for State Management with position tracking
-    /// One QueueData = One StateList = One logical queue of work
+    /// One QueueData = One StateList = One logical Queue of work
     /// </summary>
     public class QueueData<T> : TableEntityBase, ITableExtra
     {
         /// <summary>
-        /// Gets or sets the unique identifier for the queue.
+        /// Gets or sets the unique identifier for the q.
         /// </summary>
         public string? QueueID
         {
@@ -849,7 +849,7 @@ namespace ASCTableStorage.Models
         }
 
         /// <summary>
-        /// Name/category of the queue (used as PartitionKey for grouping similar queues)
+        /// Name/category of the q (used as PartitionKey for grouping similar queues)
         /// </summary>
         public string? Name
         {
@@ -858,96 +858,55 @@ namespace ASCTableStorage.Models
         }
 
         /// <summary>
-        /// The Actual Serialized StateList Data being Stored (includes position information)
+        /// The StateList data with position tracking (automatically serialized/deserialized)
         /// </summary>
-        public string? Value { get; set; }
+        public StateList<T> Data { get; set; } = new();
 
         /// <summary>
-        /// Optional metadata about the queue processing state
+        /// Optional metadata about the q processing state
         /// </summary>
-        public string? ProcessingStatus { get; set; }
+        public string ProcessingStatus
+        {
+            get
+            {
+                if (Data == null || Data.Count == 0)
+                    return "Empty";
+
+                if (Data.CurrentIndex < 0)
+                    return "Not Started";
+                else if (Data.CurrentIndex >= Data.Count - 1)
+                    return "Completed";
+                else
+                    return $"In Progress (Item {Data.CurrentIndex + 1} of {Data.Count})";
+            }
+        }
 
         /// <summary>
         /// Percentage complete based on StateList position
         /// </summary>
-        public double PercentComplete { get; set; }
-
-        /// <summary>
-        /// Total items in this queue
-        /// </summary>
-        public int TotalItemCount { get; set; } = 0;
-
-        /// <summary>
-        /// Last processed index in the queue
-        /// </summary>
-        public int LastProcessedIndex { get; set; } = -1;
-
-        /// <summary>
-        /// Explodes the data into usable StateList form with preserved position
-        /// </summary>
-        public StateList<T> GetData()
+        public double PercentComplete
         {
-            if (string.IsNullOrEmpty(Value))
-                return new StateList<T>();
+            get
+            {
+                if (Data == null || Data.Count == 0)
+                    return 0;
 
-            try
-            {
-                var stateList = JsonConvert.DeserializeObject<StateList<T>>(Value);
-                return stateList ?? new StateList<T>();
-            }
-            catch
-            {
-                // Fallback: If it's old format (List<T>), convert to StateList
-                try
-                {
-                    var list = JsonConvert.DeserializeObject<List<T>>(Value);
-                    return new StateList<T>(list ?? new List<T>());
-                }
-                catch
-                {
-                    return new StateList<T>();
-                }
+                if (Data.CurrentIndex >= 0)
+                    return ((double)(Data.CurrentIndex + 1) / Data.Count) * 100;
+
+                return 0;
             }
         }
 
         /// <summary>
-        /// Shrinks the StateList to a string to store (preserves position)
+        /// Total items in this q
         /// </summary>
-        /// <param name="data">The StateList with position information</param>
-        public void PutData(StateList<T> data)
-        {
-            Value = JsonConvert.SerializeObject(data, Functions.NewtonSoftRemoveNulls());
-            TotalItemCount = data.Count;
-            LastProcessedIndex = data.CurrentIndex;
-
-            // Calculate and store completion percentage
-            if (data.Count > 0 && data.CurrentIndex >= 0)
-            {
-                PercentComplete = ((double)(data.CurrentIndex + 1) / data.Count) * 100;
-            }
-            else
-            {
-                PercentComplete = 0;
-            }
-
-            // Set processing status based on position
-            if (data.CurrentIndex < 0)
-                ProcessingStatus = "Not Started";
-            else if (data.CurrentIndex >= data.Count - 1)
-                ProcessingStatus = "Completed";
-            else
-                ProcessingStatus = $"In Progress (Item {data.CurrentIndex + 1} of {data.Count})";
-        }
+        public int TotalItemCount => Data?.Count ?? 0;
 
         /// <summary>
-        /// Overload to accept regular List<T> and convert to StateList
+        /// Last processed index in the q
         /// </summary>
-        /// <param name="data">Regular list to convert to StateList</param>
-        public void PutData(List<T> data)
-        {
-            var stateList = new StateList<T>(data);
-            PutData(stateList);
-        }
+        public int LastProcessedIndex => Data?.CurrentIndex ?? -1;
 
         #region Save Methods
 
@@ -960,21 +919,11 @@ namespace ASCTableStorage.Models
         }
 
         /// <summary>
-        /// Preserves the queued data to the DB asynchronously
+        /// Saves OR Updates the queued data and its State to the DB asynchronously.
         /// </summary>
         public async Task SaveQueueAsync(string accountName, string accountKey)
         {
             await new DataAccess<QueueData<T>>(accountName, accountKey).ManageDataAsync(this);
-        }
-
-        /// <summary>
-        /// Saves current progress without removing from queue (for checkpointing)
-        /// Updates the existing queue with new position information
-        /// </summary>
-        public async Task SaveProgressAsync(StateList<T> currentState, string accountName, string accountKey)
-        {
-            PutData(currentState);
-            await SaveQueueAsync(accountName, accountKey);
         }
 
         #endregion Save Methods
@@ -984,162 +933,91 @@ namespace ASCTableStorage.Models
         /// <summary>
         /// Gets a single queue by its ID
         /// </summary>
-        /// <param name="queueId">The unique queue identifier</param>
+        /// <param name="queueId">The unique q identifier</param>
         /// <param name="accountName">The Azure Account name</param>
         /// <param name="accountKey">The Azure Account key</param>
-        /// <param name="deleteAfterRetrieve">Whether to delete after retrieval</param>
-        /// <returns>The StateList for this queue, or null if not found</returns>
-        public static async Task<StateList<T>?> GetQueueAsync(string queueId, string accountName, string accountKey, bool deleteAfterRetrieve = false)
+        /// <returns>The QueueData object, or null if not found</returns>
+        public static async Task<QueueData<T>?> GetQueueAsync(string queueId, string accountName, string accountKey)
+            => await new DataAccess<QueueData<T>>(accountName, accountKey).GetRowObjectAsync(queueId);
+        
+
+        /// <summary>
+        /// Gets a single queue by its ID (synchronous)
+        /// </summary>
+        /// <param name="queueId">The unique q identifier</param>
+        /// <param name="accountName">The Azure Account name</param>
+        /// <param name="accountKey">The Azure Account key</param>
+        /// <returns>The QueueData object, or null if not found</returns>
+        public static QueueData<T>? GetQueue(string queueId, string accountName, string accountKey)
+            => new DataAccess<QueueData<T>>(accountName, accountKey).GetRowObject(queueId);       
+
+        /// <summary>
+        /// Gets a single queue without deleting it (alias for GetQueueAsync for clarity)
+        /// </summary>
+        public static async Task<QueueData<T>?> PeekQueueAsync(string queueId, string accountName, string accountKey)
+            => await GetQueueAsync(queueId, accountName, accountKey);
+
+        /// <summary>
+        /// Gets all queues for a given name/category
+        /// </summary>
+        /// <param name="name">The name/category (PartitionKey)</param>
+        /// <param name="accountName">The Azure Account name</param>
+        /// <param name="accountKey">The Azure Account key</param>
+        /// <returns>List of QueueData objects</returns>
+        public static async Task<List<QueueData<T>>> GetQueuesAsync(string name, string accountName, string accountKey)
+            => await new DataAccess<QueueData<T>>(accountName, accountKey).GetCollectionAsync(name);
+
+        /// <summary>
+        /// Gets all queues for a given name/category (synchronous)
+        /// </summary>
+        /// <param name="name">The name/category (PartitionKey)</param>
+        /// <param name="accountName">The Azure Account name</param>
+        /// <param name="accountKey">The Azure Account key</param>
+        /// <returns>List of QueueData objects</returns>
+        public static List<QueueData<T>> GetQueues(string name, string accountName, string accountKey)
+            => new DataAccess<QueueData<T>>(accountName, accountKey).GetCollection(name);
+        
+
+        /// <summary>
+        /// Gets and deletes a queue (for backward compatibility and one-shot processing)
+        /// </summary>
+        /// <param name="queueId">The unique q identifier</param>
+        /// <param name="accountName">The Azure Account name</param>
+        /// <param name="accountKey">The Azure Account key</param>
+        /// <returns>The QueueData object, or null if not found</returns>
+        public static async Task<QueueData<T>?> GetAndDeleteQueueAsync(string queueId, string accountName, string accountKey)
         {
             DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
             var queue = await da.GetRowObjectAsync(queueId);
 
-            if (queue == null)
-                return null;
-
-            var stateList = queue.GetData();
-
-            if (deleteAfterRetrieve)
+            if (queue != null)
             {
                 await da.ManageDataAsync(queue, TableOperationType.Delete);
             }
 
-            return stateList;
+            return queue;
         }
-
-        /// <summary>
-        /// Gets a single queue without deleting it (for monitoring/inspection)
-        /// </summary>
-        public static async Task<StateList<T>?> PeekQueueAsync(string queueId, string accountName, string accountKey)
-            => await GetQueueAsync(queueId, accountName, accountKey, deleteAfterRetrieve: false);
-        
 
         #endregion Single Queue Retrieval Methods
 
-        #region Multiple Queue Management (Each is Independent)
-
-        /// <summary>
-        /// Gets all queues with a given name/category
-        /// Returns a dictionary where each QueueID maps to its own independent StateList
-        /// </summary>
-        /// <param name="name">The name/category of queues</param>
-        /// <param name="accountName">The Azure Account name</param>
-        /// <param name="accountKey">The Azure Account key</param>
-        /// <param name="deleteAfterRetrieve">Whether to delete after retrieval</param>
-        /// <returns>Dictionary of QueueID to StateList</returns>
-        public static async Task<Dictionary<string, StateList<T>>> GetQueuesAsync(string name, string accountName, string accountKey, bool deleteAfterRetrieve = true)
-        {
-            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
-            var queues = await da.GetCollectionAsync(name);
-            var result = new Dictionary<string, StateList<T>>();
-
-            foreach (var queue in queues.OrderBy(q => q.Timestamp))
-            {
-                result[queue.QueueID ?? Guid.NewGuid().ToString()] = queue.GetData();
-            }
-
-            if (deleteAfterRetrieve && queues.Any())
-            {
-                await da.BatchUpdateListAsync(queues, TableOperationType.Delete);
-            }
-
-            return result;
-        }
-
-        /// <summary>
-        /// Gets paged collection of independent queues
-        /// </summary>
-        /// <param name="name">The name/category of queues</param>
-        /// <param name="accountName">The Azure Account name</param>
-        /// <param name="accountKey">The Azure Account key</param>
-        /// <param name="pageSize">Number of queues per page</param>
-        /// <param name="continuationToken">Continuation token for paging</param>
-        /// <returns>Paged result with independent queues</returns>
-        public static async Task<PagedQueueResult<T>> GetPagedQueuesAsync(string name, string accountName, string accountKey, int pageSize = 10, string? continuationToken = null)
-        {
-            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
-            var pagedResult = await da.GetPagedCollectionAsync(name, pageSize, continuationToken!);
-
-            var result = new PagedQueueResult<T>
-            {
-                Queues = new Dictionary<string, StateList<T>>(),
-                ContinuationToken = pagedResult.ContinuationToken,
-                HasMore = pagedResult.HasMore,
-                PageSize = pagedResult.Count
-            };
-
-            foreach (var queue in pagedResult.Items.OrderBy(q => q.Timestamp))
-            {
-                var queueId = queue.QueueID ?? Guid.NewGuid().ToString();
-                result.Queues[queueId] = queue.GetData();
-                result.QueueMetadata.Add(new QueueMetadata
-                {
-                    QueueID = queueId,
-                    ProcessingStatus = queue.ProcessingStatus ?? "Unknown",
-                    PercentComplete = queue.PercentComplete,
-                    TotalItems = queue.TotalItemCount,
-                    LastProcessedIndex = queue.LastProcessedIndex,
-                    LastModified = queue.Timestamp.DateTime
-                });
-            }
-
-            return result;
-        }
-
-        /// <summary>
-        /// Processes multiple independent queues with a callback
-        /// </summary>
-        /// <param name="name">The name/category of queues</param>
-        /// <param name="accountName">The Azure Account name</param>
-        /// <param name="accountKey">The Azure Account key</param>
-        /// <param name="processQueue">Function to process each queue</param>
-        /// <param name="deleteAfterProcess">Whether to delete after processing</param>
-        /// <param name="maxQueues">Maximum number of queues to process</param>
-        public static async Task<ProcessingResult> ProcessQueuesAsync(string name, string accountName,string accountKey, 
-            Func<string, StateList<T>, Task<bool>> processQueue, bool deleteAfterProcess = true, int? maxQueues = null)
-        {
-            var result = new ProcessingResult();
-            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
-
-            var queues = await da.GetCollectionAsync(name);
-            var sortedQueues = queues.OrderBy(q => q.Timestamp).ToList();
-
-            if (maxQueues.HasValue)
-            {
-                sortedQueues = sortedQueues.Take(maxQueues.Value).ToList();
-            }
-
-            foreach (var queue in sortedQueues)
-            {
-                var queueId = queue.QueueID ?? "Unknown";
-                var stateList = queue.GetData();
-
-                result.TotalQueuesRetrieved++;
-
-                bool success = await processQueue(queueId, stateList);
-
-                if (success)
-                {
-                    result.TotalQueuesProcessed++;
-
-                    if (deleteAfterProcess)
-                    {
-                        await da.ManageDataAsync(queue, TableOperationType.Delete);
-                    }
-                }
-                else
-                {
-                    result.FailedQueueIds.Add(queueId);
-                }
-            }
-
-            result.Completed = result.FailedQueueIds.Count == 0;
-            return result;
-        }
-
-        #endregion Multiple Queue Management (Each is Independent)
-
         #region Batch Operations
+
+        /// <summary>
+        /// Deletes a single queue by its ID
+        /// </summary>
+        public static async Task<bool> DeleteQueueAsync(string queueId, string accountName, string accountKey)
+        {
+            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+            var queue = await da.GetRowObjectAsync(queueId);
+
+            if (queue != null)
+            {
+                await da.ManageDataAsync(queue, TableOperationType.Delete);
+                return true;
+            }
+
+            return false;
+        }
 
         /// <summary>
         /// Deletes multiple queues by their IDs
@@ -1180,50 +1058,24 @@ namespace ASCTableStorage.Models
             return 0;
         }
 
+        /// <summary>
+        /// Deletes all queues in a category and returns the data (for migration/cleanup)
+        /// </summary>
+        public static async Task<List<StateList<T>>> DeleteAndReturnAllAsync(string name, string accountName, string accountKey)
+        {
+            var queues = await GetQueuesAsync(name, accountName, accountKey);
+            var dataLists = queues.Select(q => q.Data).ToList();
+
+            if (queues.Any())
+            {
+                DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
+                await da.BatchUpdateListAsync(queues, TableOperationType.Delete);
+            }
+
+            return dataLists;
+        }
+
         #endregion Batch Operations
-
-        #region Monitoring and Statistics
-
-        /// <summary>
-        /// Gets status of all queues in a category
-        /// </summary>
-        public static async Task<List<QueueMetadata>> GetQueueStatusesAsync(string name, string accountName, string accountKey)
-        {
-            DataAccess<QueueData<T>> da = new DataAccess<QueueData<T>>(accountName, accountKey);
-            var queues = await da.GetCollectionAsync(name);
-
-            return queues.Select(q => new QueueMetadata
-            {
-                QueueID = q.QueueID ?? "Unknown",
-                ProcessingStatus = q.ProcessingStatus ?? "Unknown",
-                PercentComplete = q.PercentComplete,
-                TotalItems = q.TotalItemCount,
-                LastProcessedIndex = q.LastProcessedIndex,
-                LastModified = q.Timestamp.DateTime
-            }).OrderBy(q => q.LastModified).ToList();
-        }
-
-        /// <summary>
-        /// Gets aggregate statistics for a queue category
-        /// </summary>
-        public static async Task<QueueCategoryStatistics> GetCategoryStatisticsAsync(string name, string accountName, string accountKey)
-        {
-            var statuses = await GetQueueStatusesAsync(name, accountName, accountKey);
-
-            return new QueueCategoryStatistics
-            {
-                CategoryName = name,
-                TotalQueues = statuses.Count,
-                NotStartedCount = statuses.Count(s => s.ProcessingStatus.Contains("Not Started")),
-                InProgressCount = statuses.Count(s => s.ProcessingStatus.Contains("In Progress")),
-                CompletedCount = statuses.Count(s => s.ProcessingStatus.Contains("Completed")),
-                AveragePercentComplete = statuses.Any() ? statuses.Average(s => s.PercentComplete) : 0,
-                TotalItems = statuses.Sum(s => s.TotalItems),
-                TotalProcessedItems = statuses.Sum(s => s.LastProcessedIndex >= 0 ? s.LastProcessedIndex + 1 : 0)
-            };
-        }
-
-        #endregion Monitoring and Statistics
 
         #region Factory Methods
 
@@ -1232,20 +1084,19 @@ namespace ASCTableStorage.Models
         /// </summary>
         public static QueueData<T> CreateFromStateList(StateList<T> stateList, string name, string? queueId = null)
         {
-            var queue = new QueueData<T>
+            return new QueueData<T>
             {
                 QueueID = queueId ?? Guid.NewGuid().ToString(),
-                Name = name
+                Name = name,
+                Data = stateList
             };
-            queue.PutData(stateList);
-            return queue;
         }
 
         /// <summary>
         /// Creates a new QueueData instance from a List
         /// </summary>
         public static QueueData<T> CreateFromList(List<T> list, string name, string? queueId = null)
-            => CreateFromStateList(new StateList<T>(list), name, queueId);        
+            => CreateFromStateList(list, name, queueId);
 
         #endregion Factory Methods
 
@@ -1559,7 +1410,7 @@ namespace ASCTableStorage.Models
         /// <summary>
         /// Adds a range of items with optional state management
         /// </summary>
-        /// <param name="collection">Items to add</param>
+        /// <param name="collection">Data to add</param>
         /// <param name="setCurrentToFirst">Set current index to first added item</param>
         /// <param name="setCurrentToLast">Set current index to last added item</param>
         public void AddRange(IEnumerable<T> collection, bool setCurrentToFirst = false, bool setCurrentToLast = false)
@@ -1580,7 +1431,7 @@ namespace ASCTableStorage.Models
         /// <summary>
         /// Adds a range and returns the StateList for method chaining
         /// </summary>
-        /// <param name="collection">Items to add</param>
+        /// <param name="collection">Data to add</param>
         /// <returns>This StateList instance</returns>
         public StateList<T> AddRangeAndReturn(IEnumerable<T> collection)
         {
@@ -1988,13 +1839,15 @@ namespace ASCTableStorage.Models
         /// <param name="errDescription">A custom description of the error. This is typically additional context or details about the error.</param>
         /// <param name="severity">The severity level of the error, represented as an <see cref="ErrorCodeTypes"/> value.</param>
         /// <param name="cID">The customer identifier associated with the error. Defaults to "undefined" if not provided.</param>
-        public ErrorLogData(Exception e, string errDescription, ErrorCodeTypes severity, string cID = "undefined")
+        public ErrorLogData(Exception? e, string errDescription, ErrorCodeTypes severity, string cID = "undefined")
         {
             var callStackInfo = GetCallStackInfo();
 
             this.ApplicationName = callStackInfo.ApplicationName;
             this.ErrorSeverity = severity.ToString();
-            this.ErrorMessage = errDescription + " " + e.Message;
+            this.ErrorMessage = string.IsNullOrWhiteSpace(errDescription)
+                ? e?.Message ?? "No message provided."
+                : $"{errDescription} {(e?.Message ?? "")}".Trim();
             this.FunctionName = callStackInfo.CallingFunction;
             this.CustomerID = cID;
         }
@@ -2023,6 +1876,58 @@ namespace ASCTableStorage.Models
 
             return errorLog;
         }
+        /// <summary>
+        /// Creates an ErrorLogData instance with caller information and formatted message.
+        /// Attempts to thoroughly capture the error context including exception details and caller information.
+        /// </summary>
+        /// <typeparam name="TState">The type of the state object.</typeparam>
+        /// <param name="state">The state object.</param>
+        /// <param name="exception">The exception that occurred.</param>
+        /// <param name="formatter">A function to format the error message.</param>
+        /// <param name="severity">The severity level of the error.</param>
+        /// <param name="customerId">The customer identifier associated with the error.</param>
+        /// <param name="callerMemberName">Automatically captured caller member name.</param>
+        /// <param name="callerFilePath">Automatically captured caller file path.</param>
+        /// <param name="callerLineNumber">Automatically captured caller line number.</param>
+        /// <returns>A new ErrorLogData instance.</returns>
+        public static ErrorLogData CreateWithCallerInfo<TState>(TState state, Exception? exception, Func<TState, Exception?, string> formatter,
+            ErrorCodeTypes severity, string customerId = "undefined", [CallerMemberName] string callerMemberName = "", [CallerFilePath] string callerFilePath = "",
+            [CallerLineNumber] int callerLineNumber = 0)
+        {
+            var errorLog = new ErrorLogData();
+            var callStackInfo = GetCallStackInfo();
+
+            var baseMessage = formatter(state, exception);
+            var fullMessage = exception != null
+                ? $"{baseMessage}{Environment.NewLine}{GetFullExceptionDetails(exception)}"
+                : baseMessage;
+
+            errorLog.ApplicationName = callStackInfo.ApplicationName;
+            errorLog.ErrorSeverity = severity.ToString();
+            errorLog.ErrorMessage = fullMessage;
+            errorLog.FunctionName = $"{callerMemberName} (Line: {callerLineNumber})";
+            errorLog.CustomerID = customerId;
+
+            return errorLog;
+        }
+
+        /// <summary>
+        /// Retrieves full exception details including inner exceptions.
+        /// </summary>
+        /// <param name="ex">The exception to retrieve details from.</param>
+        private static string GetFullExceptionDetails(Exception ex)
+        {
+            var sb = new StringBuilder();
+
+            while (ex != null)
+            {
+                sb.AppendLine($"[{ex.GetType().Name}] {ex.Message}");
+                sb.AppendLine(ex.StackTrace);
+                ex = ex.InnerException!;
+            }
+
+            return sb.ToString();
+        }
 
         /// <summary>
         /// Gets detailed information from the current call stack
@@ -2032,60 +1937,36 @@ namespace ASCTableStorage.Models
         {
             try
             {
-                var stackTrace = new StackTrace(true);
+                var stackTrace = new StackTrace(skipFrames: 1, fNeedFileInfo: true);
                 var frames = stackTrace.GetFrames();
+                if (frames == null) return ("Unknown", "Unknown");
 
-                // Skip the current method and constructor frames to find the actual caller
-                MethodBase? callingMethod = null;
-                string applicationName = Assembly.GetExecutingAssembly().GetName().Name ?? "Unknown";
-
-                for (int i = 2; i < frames.Length; i++) // Start at 2 to skip current method and constructor
+                foreach (var frame in frames)
                 {
-                    var frame = frames[i];
                     var method = frame.GetMethod();
+                    var type = method?.DeclaringType;
 
-                    if (method != null &&
-                        method.DeclaringType != typeof(ErrorLogData) &&
-                        !method.DeclaringType?.Name.Contains("Exception") == true)
-                    {
-                        callingMethod = method;
+                    if (type == null || type == typeof(ErrorLogData)) continue;
+                    if (type.Name.Contains("Exception") || type.Name.Contains("Task")) continue;
+                    if (method!.Name == "MoveNext") continue; // async state machine
 
-                        // Get the assembly name from the calling method's declaring type
-                        if (method.DeclaringType?.Assembly != null)
-                        {
-                            applicationName = method.DeclaringType.Assembly.GetName().Name ?? applicationName;
-                        }
-                        break;
-                    }
+                    var appName = type.Assembly.GetName().Name ?? "Unknown";
+                    var className = type.Name;
+                    var methodName = method.Name;
+                    var line = frame.GetFileLineNumber();
+
+                    var functionInfo = line > 0
+                        ? $"{className}.{methodName} (Line: {line})"
+                        : $"{className}.{methodName}";
+
+                    return (appName, functionInfo);
                 }
 
-                string functionInfo = "Unknown";
-                if (callingMethod != null)
-                {
-                    var className = callingMethod.DeclaringType?.Name ?? "Unknown";
-                    var methodName = callingMethod.Name;
-
-                    // Find the frame with file info for line number
-                    var frameWithFileInfo = Array.Find(frames, f =>
-                        f.GetMethod() == callingMethod && f.GetFileName() != null);
-
-                    if (frameWithFileInfo != null)
-                    {
-                        var lineNumber = frameWithFileInfo.GetFileLineNumber();
-                        functionInfo = $"{className}.{methodName} (Line: {lineNumber})";
-                    }
-                    else
-                    {
-                        functionInfo = $"{className}.{methodName}";
-                    }
-                }
-
-                return (applicationName, functionInfo);
+                return ("Unknown", "Unknown");
             }
             catch
             {
-                // Fallback in case of any issues with stack trace analysis
-                return (Assembly.GetExecutingAssembly().GetName().Name ?? "Unknown", "Unknown");
+                return ("Unknown", "Unknown");
             }
         }
 
@@ -2192,60 +2073,6 @@ namespace ASCTableStorage.Models
     } //end class ErrorLogData
 
     #region Queue Supporting Classes
-    /// <summary>
-    /// Represents a paged result of INDEPENDENT queues
-    /// </summary>
-    public class PagedQueueResult<T>
-    {
-        /// <summary>
-        /// Dictionary of QueueID to its StateList (each queue is independent)
-        /// </summary>
-        public Dictionary<string, StateList<T>> Queues { get; set; } = new Dictionary<string, StateList<T>>();
-
-        /// <summary>
-        /// Metadata for each queue in this page
-        /// </summary>
-        public List<QueueMetadata> QueueMetadata { get; set; } = new List<QueueMetadata>();
-
-        /// <summary>
-        /// Token to continue to the next page
-        /// </summary>
-        public string? ContinuationToken { get; set; }
-
-        /// <summary>
-        /// Indicates if there are more pages available
-        /// </summary>
-        public bool HasMore { get; set; }
-
-        /// <summary>
-        /// Number of queues in this page
-        /// </summary>
-        public int PageSize { get; set; }
-    }
-
-    /// <summary>
-    /// Metadata about a single queue
-    /// </summary>
-    public class QueueMetadata
-    {
-        public string QueueID { get; set; } = string.Empty;
-        public string ProcessingStatus { get; set; } = string.Empty;
-        public double PercentComplete { get; set; }
-        public int TotalItems { get; set; }
-        public int LastProcessedIndex { get; set; }
-        public DateTime LastModified { get; set; }
-    }
-
-    /// <summary>
-    /// Result of processing multiple queues
-    /// </summary>
-    public class ProcessingResult
-    {
-        public int TotalQueuesRetrieved { get; set; }
-        public int TotalQueuesProcessed { get; set; }
-        public List<string> FailedQueueIds { get; set; } = new List<string>();
-        public bool Completed { get; set; }
-    }
 
     /// <summary>
     /// Statistics for a category of queues
