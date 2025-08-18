@@ -1,72 +1,66 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
+   <PropertyGroup>
+      <TargetFramework>net9.0</TargetFramework>
+      <ImplicitUsings>enable</ImplicitUsings>
+      <Nullable>enable</Nullable>
+      <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+      <Title>ASC Azure Table Storage Data Access Library</Title>
+      <Authors>O. Brown | M. Chukwuemeka</Authors>
+      <Company>Answer Sales Calls Inc.</Company>
+      <Description>A secure toolkit for using Azure Table Storage as a reliable database for your applications. Lightweight, scalable, model first design that's faster than most ORMs and avoids injection problems. Latest version adds capability for using table storage for Error Logging and Queueing bulk collections of data for later processing -- useful for quickly storage data when a server is about to go down so you can pick up where you left off. Now also allows for lamda functions to define queries. WARNING: v1 uses an obsolete version of Cosmos Table Storage component library.</Description>
+      <Copyright>2025 Answer Sales Calls Inc.</Copyright>
+      <PackageIcon>Azure DB Cloud.png</PackageIcon>
+      <GenerateDocumentationFile>True</GenerateDocumentationFile>
+      <AssemblyVersion>3.0</AssemblyVersion>
+      <PackageOutputPath>Files</PackageOutputPath>
+      <BaseOutputPath>C:\Users\osieb\source\repos\ASCDataAccessLibrary\Files</BaseOutputPath>
+      <DocumentationFile></DocumentationFile>
+      <RootNamespace>ASCTableStorage</RootNamespace>
+      <Version>3.0</Version>
+      <PackageReadmeFile>getting-started-guide-30.md</PackageReadmeFile>
+      <PackageReleaseNotes>
+         ## **Release Notes - ASCDataAccessLibrary v3.0**
+         New Features:
+         Added a proper logger to the DAL so that projects can have a consistent and reliable way of logging
+         to Table Storage within ANY app type.
 
-  <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
-    <Title>ASC Azure Table Storage Data Access Library</Title>
-    <Authors>O. Brown | M. Chukwuemeka</Authors>
-    <Company>Answer Sales Calls Inc.</Company>
-    <Description>A secure toolkit for using Azure Table Storage as a reliable database for your applications. Lightweight, scalable, model first design that's faster than most ORMs and avoids injection problems. Latest version adds capability for using table storage for Error Logging and Queueing bulk collections of data for later processing -- useful for quickly storage data when a server is about to go down so you can pick up where you left off. Now also allows for lamda functions to define queries. WARNING: v1 uses an obsolete version of Cosmos Table Storage component library.</Description>
-    <Copyright>2025 Answer Sales Calls Inc.</Copyright>
-    <PackageIcon>Azure DB Cloud.png</PackageIcon>
-    <GenerateDocumentationFile>True</GenerateDocumentationFile>
-    <AssemblyVersion>2.5</AssemblyVersion>
-    <PackageOutputPath>Files</PackageOutputPath>
-    <BaseOutputPath>C:\Users\osieb\source\repos\ASCDataAccessLibrary\Files</BaseOutputPath>
-    <DocumentationFile></DocumentationFile>
-    <RootNamespace>ASCTableStorage</RootNamespace>
-    <Version>2.5</Version>
-    <PackageReadmeFile>getting-started-guide-25.md</PackageReadmeFile>
-    <PackageReleaseNotes>
-       ## **Release Notes - ASCDataAccessLibrary v2.5**
-       ### **Bug Fixes for v2.4**
+         Looging and Sessions can now be custom loggers and Session Providers in your projects with many options to choose from.
+      </PackageReleaseNotes>
+      <PackageLicenseFile>mit_license.md</PackageLicenseFile>
+      <PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
+   </PropertyGroup>
 
-       **Minor Release: Solved minor bugs in error logging and queueing.**
+   <ItemGroup>
+      <None Include="..\..\..\Pictures\Azure DB Cloud.png">
+         <Pack>True</Pack>
+         <PackagePath>\</PackagePath>
+      </None>
+   </ItemGroup>
 
-       This release adds updated code to allow for Dynamically generated Entities for scenarios where you don't actually know the schema during development.
-       Also improved reflection performance across entities with TypeCaching. Especially performant in batch scenarios.
-       And added a long awaited cleaning of error log data older than a specified number of days.
-       Updated Queuing to utilize the new StateList object which manages position where a queue needs to pick back up from.
+   <ItemGroup>
+      <PackageReference Include="Azure.Storage.Blobs" Version="12.24.0" />
+      <PackageReference Include="Microsoft.AspNetCore.Http.Abstractions" Version="2.3.0" />
+      <PackageReference Include="Microsoft.Azure.Cosmos.Table" Version="1.0.8" />
+      <PackageReference Include="Microsoft.Extensions.Configuration.FileExtensions" Version="9.0.0" />
+      <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="9.0.0" />
+      <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.0" />
+      <PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.0" />
+      <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" />
+      <PackageReference Include="System.Configuration.ConfigurationManager" Version="9.0.0" />
+   </ItemGroup>
 
-       Removed Paged Queues as this does not make sense due to the fact there should never be an occurence of storing Queues of data within several batches. 
-       All Queue data (the collection) exists within the inner StateList to manage position and movement. You can save status updates of progress within the 
-       queue by calling queue.SaveQueueAsync again -- just like initial save.              
-    </PackageReleaseNotes>
-    <PackageLicenseFile>mit_license.md</PackageLicenseFile>
-    <PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <None Include="..\..\..\Pictures\Azure DB Cloud.png">
-      <Pack>True</Pack>
-      <PackagePath>\</PackagePath>
-    </None>
-  </ItemGroup>
-
-  <ItemGroup>
-    <PackageReference Include="Azure.Storage.Blobs" Version="12.24.0" />
-    <PackageReference Include="Microsoft.Azure.Cosmos.Table" Version="1.0.8" />
-  </ItemGroup>
-
-  <ItemGroup>
-     <None Update="getting-started-guide-24.md">
-        <Pack>True</Pack>
-        <PackagePath>\</PackagePath>
-     </None>
-     <None Update="getting-started-guide-25.md">
-       <Pack>True</Pack>
-       <PackagePath>\</PackagePath>
-     </None>
-     <None Update="MIT License.pdf">
-      <Pack>True</Pack>
-      <PackagePath>\</PackagePath>
-    </None>
-    <None Update="mit_license.md">
-      <Pack>True</Pack>
-      <PackagePath>\</PackagePath>
-    </None>
-  </ItemGroup>
-
+   <ItemGroup>
+      <None Update="getting-started-guide-30.md">
+         <Pack>True</Pack>
+         <PackagePath>\</PackagePath>
+      </None>
+      <None Update="MIT License.pdf">
+         <Pack>True</Pack>
+         <PackagePath>\</PackagePath>
+      </None>
+      <None Update="mit_license.md">
+         <Pack>True</Pack>
+         <PackagePath>\</PackagePath>
+      </None>
+   </ItemGroup>
 </Project>

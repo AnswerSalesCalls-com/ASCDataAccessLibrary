@@ -1,5 +1,6 @@
 ﻿using ASCTableStorage.Common;
 using ASCTableStorage.Models;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Azure.Cosmos.Table;
 using System.Linq.Expressions;
 using System.Text;
@@ -1408,11 +1409,16 @@ namespace ASCTableStorage.Data
     /// <summary>
     /// Manages session based data into the database with unified async/sync operations
     /// </summary>
-    public class Session : IDisposable, IAsyncDisposable
+    /// <summary>
+    /// Manages session based data into the database with unified async/sync operations
+    /// Now implements ISession for compatibility with ASP.NET Core
+    /// </summary>
+    public class Session : IDisposable, IAsyncDisposable, ISession
     {
         private string? m_sessionID;
         private List<AppSessionData> m_sessionData = new List<AppSessionData>();
         private readonly DataAccess<AppSessionData> m_da;
+        private readonly Dictionary<string, byte[]> _cache = new Dictionary<string, byte[]>();
 
         /// <summary>
         /// Constructor initializes the configuration and data access setup
@@ -1450,6 +1456,117 @@ namespace ASCTableStorage.Data
             session.m_sessionData = await session.LoadSessionDataCore(sessionID);
             return session;
         }
+
+        #region ISession Implementation
+
+        /// <summary>
+        /// ISession - Indicates whether the session is available
+        /// </summary>
+        public bool IsAvailable => true;
+
+        /// <summary>
+        /// ISession - Gets the session ID
+        /// </summary>
+        public string Id => m_sessionID ?? Guid.NewGuid().ToString();
+
+        /// <summary>
+        /// ISession - Gets all keys in the session
+        /// </summary>
+        public IEnumerable<string> Keys
+        {
+            get
+            {
+                if (m_sessionData != null)
+                {
+                    return m_sessionData.Select(s => s.Key).Where(k => !string.IsNullOrEmpty(k))!;
+                }
+                return Enumerable.Empty<string>();
+            }
+        }
+
+        /// <summary>
+        /// ISession - Clears all session data
+        /// </summary>
+        void ISession.Clear()
+        {
+            RestartSession();
+            _cache.Clear();
+        }
+
+        /// <summary>
+        /// ISession - Commits session changes asynchronously
+        /// </summary>
+        async Task ISession.CommitAsync(CancellationToken cancellationToken)
+        {
+            await CommitDataAsync();
+        }
+
+        /// <summary>
+        /// ISession - Loads session data asynchronously
+        /// </summary>
+        async Task ISession.LoadAsync(CancellationToken cancellationToken)
+        {
+            await RefreshSessionDataAsync();
+        }
+
+        /// <summary>
+        /// ISession - Removes a key from the session
+        /// </summary>
+        void ISession.Remove(string key)
+        {
+            m_sessionData?.RemoveAll(s => s.Key == key);
+            _cache.Remove(key);
+        }
+
+        /// <summary>
+        /// ISession - Sets a byte array value in the session
+        /// </summary>
+        public void Set(string key, byte[] value)
+        {
+            _cache[key] = value;
+            var data = this[key];
+            if (data != null)
+            {
+                data.Value = Convert.ToBase64String(value);
+            }
+        }
+
+        /// <summary>
+        /// ISession - Tries to get a byte array value from the session
+        /// </summary>
+        public bool TryGetValue(string key, out byte[] value)
+        {
+            // Check cache first
+            if (_cache.TryGetValue(key, out value!))
+            {
+                return true;
+            }
+
+            // Check underlying session data
+            var data = this[key];
+            if (data != null && !string.IsNullOrEmpty(data.Value))
+            {
+                try
+                {
+                    // Try to decode as base64
+                    value = Convert.FromBase64String(data.Value);
+                    _cache[key] = value; // Cache it
+                    return true;
+                }
+                catch
+                {
+                    // If not base64, treat as UTF8 string
+                    value = System.Text.Encoding.UTF8.GetBytes(data.Value);
+                    _cache[key] = value;
+                    return true;
+                }
+            }
+
+            value = null!;
+            return false;
+        }
+
+        #endregion
 
         #region Core Implementation Methods (Async-First)
 
@@ -1596,7 +1713,6 @@ namespace ASCTableStorage.Data
         /// </summary>
         public Task RestartSessionAsync() => RestartSessionCore();
 
-
         /// <summary>
         /// Loads session data from the database (Asynchronous)
         /// </summary>
@@ -1632,6 +1748,7 @@ namespace ASCTableStorage.Data
             {
                 b = new AppSessionData() { SessionID = m_sessionID, Key = key };
                 SessionData!.Add(b);
+                DataHasBeenCommitted = false; // Mark as needing commit
             }
             return b;
         }
@@ -1645,7 +1762,11 @@ namespace ASCTableStorage.Data
         public AppSessionData? this[string key]
         {
             get { return Find(key); }
-            set { Find(key)!.Value = value!.ToString(); }
+            set 
+            { 
+                Find(key)!.Value = value!.ToString(); 
+                DataHasBeenCommitted = false; // Mark as needing commit
+            }
         }
 
         /// <summary>

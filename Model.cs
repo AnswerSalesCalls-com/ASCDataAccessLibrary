@@ -1,10 +1,10 @@
-﻿using ASCTableStorage.Common;
-using ASCTableStorage.Data;
+﻿using ASCTableStorage.Data;
 using Microsoft.Azure.Cosmos.Table;
 using Newtonsoft.Json;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.IO;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -489,7 +489,7 @@ namespace ASCTableStorage.Models
         /// The table that will get created in your Table Storage account for managing session data.
         /// </summary>
         [XmlIgnore]
-        public string TableReference => "AppSessionData";
+        public string TableReference => Constants.DefaultSessionTableName;
         /// <summary>
         /// The Session ID
         /// </summary>
@@ -2013,7 +2013,7 @@ namespace ASCTableStorage.Models
         /// Gets the reference name of the table used for storing application error logs.
         /// </summary>
         [XmlIgnore]
-        public string TableReference => "AppErrorLogs";
+        public string TableReference => Constants.DefaultLogTableName;
         /// <summary>
         /// Retrieves the value of the error identifier.
         /// </summary>
@@ -2194,5 +2194,30 @@ namespace ASCTableStorage.Models
     }
 
     #endregion Blob Supporting Classes
+
+    /// <summary>
+    /// Maintains constant values used across the application.
+    /// </summary>
+    public static class Constants
+    {
+        /// <summary>
+        /// The default table name for application session data.
+        /// </summary>
+        public static readonly string DefaultSessionTableName = "AppSessionData";
+        /// <summary>
+        /// The default table name for application logs.
+        /// </summary>
+        public static readonly string DefaultLogTableName = "AppLoggingData";
+
+        /// <summary>
+        /// Maximum batch size for Azure Table operations
+        /// </summary>
+        public static readonly int MaxBatchSize = 100;
+
+        /// <summary>
+        /// Default retention period in days
+        /// </summary>
+        public static readonly int DefaultRetentionDays = 60;
+    }
 
 } // end namespace ASCTableStorage.Models
