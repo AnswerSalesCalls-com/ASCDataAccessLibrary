@@ -148,61 +148,77 @@ namespace ASCTableStorage.Logging
         private static readonly object _lock = new object();
         private static string? _accountName;
         private static string? _accountKey;
-        private static bool _isInitialized = false;
-
+        private static ILoggerFactory? _factory;
 
         /// <summary>
-        /// Initialize logging with explicit credentials
+        /// Initializes the Azure Table logger with explicit credentials and an ambient <see cref="ILoggerFactory"/>.
         /// </summary>
-        public static void Initialize(string accountName, string accountKey, Action<AzureTableLoggerOptions>? configure = null)
+        /// <param name="factory">The <see cref="ILoggerFactory"/> used to create scoped loggers.</param>
+        /// <param name="accountName">Azure Storage account name.</param>
+        /// <param name="accountKey">Azure Storage account key.</param>
+        /// <param name="configure">Optional delegate to configure <see cref="AzureTableLoggerOptions"/>.</param>
+        public static void Initialize(ILoggerFactory factory, string accountName, string accountKey, Action<AzureTableLoggerOptions>? configure = null)
         {
-            lock (_lock)
+            var options = new AzureTableLoggerOptions
             {
-                if (_provider != null)
-                {
-                    _provider.Dispose();
-                }
-
-                _accountName = accountName;
-                _accountKey = accountKey;
-                var options = new AzureTableLoggerOptions
-                {
-                    AccountName = _accountName,
-                    AccountKey = _accountKey
-                };
-
-                configure?.Invoke(options);
-
-                _provider = new AzureTableLoggerProvider(Options.Create(options));
-            }
+                AccountName = accountName,
+                AccountKey = accountKey
+            };
+            configure?.Invoke(options);
+            InitializeInternal(factory, options);
         }
 
         /// <summary>
-        /// Initialize with auto-discovery of credentials
+        /// Initializes the Azure Table logger using auto-discovered credentials and an ambient <see cref="ILoggerFactory"/>.
         /// </summary>
-        public static void Initialize(Action<AzureTableLoggerOptions>? configure = null)
+        /// <param name="factory">The <see cref="ILoggerFactory"/> used to create scoped loggers.</param>
+        /// <param name="configure">Optional delegate to configure <see cref="AzureTableLoggerOptions"/>.</param>
+        /// <exception cref="InvalidOperationException">Thrown if credentials could not be discovered or validated.</exception>
+        public static void Initialize(ILoggerFactory factory, Action<AzureTableLoggerOptions>? configure = null)
         {
             var options = new AzureTableLoggerOptions { AutoDiscoverCredentials = true };
             configure?.Invoke(options);
 
-            // Auto-discover credentials
             DiscoverCredentials(options);
 
             if (!options.IsValid())
             {
-                throw new InvalidOperationException(
-                    "Could not discover Azure credentials. Please provide AccountName and AccountKey explicitly or through configuration.");
+                throw new InvalidOperationException("Could not discover Azure credentials. Please provide AccountName and AccountKey explicitly or through configuration.");
             }
 
+            InitializeInternal(factory, options);
+        }
+
+        /// <summary>
+        /// Internal helper to safely initialize the logger provider and factory.
+        /// Disposes any existing provider before reinitializing.
+        /// </summary>
+        /// <param name="factory">Ambient logger factory for scoped logger creation.</param>
+        /// <param name="options">Configured options for Azure Table logging.</param>
+        private static void InitializeInternal(ILoggerFactory factory, AzureTableLoggerOptions options)
+        {
             lock (_lock)
             {
-                if (_provider != null)
-                {
-                    _provider.Dispose();
-                }
-
+                _provider?.Dispose();
                 _provider = new AzureTableLoggerProvider(Options.Create(options));
+                _factory = factory;
             }
+        }
+
+        /// <summary>
+        /// Retrieves a scoped <see cref="ILogger"/> for the specified category.
+        /// </summary>
+        /// <param name="category">The logging category name (e.g., "Security.Suspicion").</param>
+        /// <returns>An <see cref="ILogger"/> instance scoped to the given category.</returns>
+        /// <exception cref="InvalidOperationException">Thrown if <see cref="Initialize"/> has not been called.</exception>
+        public static ILogger GetLogger(string category)
+        {
+            if (_factory == null)
+            {
+                throw new InvalidOperationException("AzureTableLogger not initialized. Call Initialize(...) during app startup.");
+            }
+
+            return _factory.CreateLogger(category);
         }
 
         /// <summary>
@@ -371,6 +387,7 @@ namespace ASCTableStorage.Logging
         private readonly ConcurrentDictionary<string, AzureTableLogger> _loggers = new();
         private readonly LoggingBackgroundService _backgroundService;
         private IExternalScopeProvider? _scopeProvider;
+        private static ILoggerFactory? _factory;
         private bool _disposed;
 
         /// <summary>
@@ -402,6 +419,46 @@ namespace ASCTableStorage.Logging
         {
             return _loggers.GetOrAdd(categoryName, name => new AzureTableLogger(name, _options, _backgroundService, _scopeProvider));
         }
+
+        /// <summary>
+        /// Initializer to allow for category logger setups outside of immediate classes, like referenced APIs you control.
+        /// </summary>
+        /// <param name="factory">The factory to append</param>
+        public static void Initialize(ILoggerFactory factory)
+        {
+            _factory = factory;
+        }
+
+        /// <summary>
+        /// Retrieves the Logger instance that writes to this custom logger
+        /// </summary>
+        /// <param name="category">The category or class the logs will belong to.</param>
+        public static ILogger GetLogger(string category)
+        {
+            if (_factory == null)
+                throw new InvalidOperationException("LoggerFactory not initialized. Call Initialize() first.");
+
+            return _factory.CreateLogger(category);
+        }
+
+        /// <summary>
+        /// Retrieves a strongly typed <see cref="ILogger{T}"/> for the specified type.
+        /// Requires that <see cref="Initialize(ILoggerFactory)"/> has been called.
+        /// </summary>
+        /// <typeparam name="T">The type whose name will be used as the logging category.</typeparam>
+        /// <returns>An <see cref="ILogger{T}"/> instance scoped to type <typeparamref name="T"/>.</returns>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown if the logger factory has not been initialized.
+        /// </exception>
+        public static ILogger<T> GetLogger<T>()
+        {
+            if (_factory == null)
+                throw new InvalidOperationException("LoggerFactory not initialized. Call Initialize() first.");
+
+            return _factory.CreateLogger<T>();
+        }
+
+
         /// <summary>
         /// Properly disposes of resources used by the logger provider
         /// </summary>
@@ -434,18 +491,35 @@ namespace ASCTableStorage.Logging
             }
         }
         /// <summary>
-        /// Helps discover credentials from various sources if not explicitly provided
+        /// Helps respect ScopeProvider during log emissions
         /// </summary>
+        /// <typeparam name="TState">Manages the type that manages state</typeparam>
+        /// <param name="state">The object managing state</param>
+        public IDisposable BeginScope<TState>(TState state) =>
+            _scopeProvider?.Push(state) ?? NullScope.Instance;
+
+        /// <summary>
+        /// Discovers Azure Storage credentials and reinitializes the Azure Table logger infrastructure.
+        /// Uses the static logger factory previously set via <see cref="Initialize(ILoggerFactory)"/>.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown if the logger factory has not been initialized.
+        /// </exception>
         private void DiscoverCredentials()
         {
-            // Implementation reuses the static helper's discovery logic
-            AzureTableLogging.Initialize(opt =>
+            if (_factory == null)
+            {
+                throw new InvalidOperationException("LoggerFactory not initialized. Call AzureTableLoggerProvider.Initialize(...) before using credential discovery.");
+            }
+
+            AzureTableLogging.Initialize(_factory, opt =>
             {
                 opt.AccountName = _options.AccountName;
                 opt.AccountKey = _options.AccountKey;
                 opt.AutoDiscoverCredentials = true;
             });
         }
+
     } // end class AzureTableLoggerProvider
 
     #endregion Logger Provider
