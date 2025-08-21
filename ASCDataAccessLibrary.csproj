@@ -11,16 +11,20 @@
       <Copyright>2025 Answer Sales Calls Inc.</Copyright>
       <PackageIcon>Azure DB Cloud.png</PackageIcon>
       <GenerateDocumentationFile>True</GenerateDocumentationFile>
-      <AssemblyVersion>3.0</AssemblyVersion>
+      <AssemblyVersion>3.1</AssemblyVersion>
       <PackageOutputPath>Files</PackageOutputPath>
       <BaseOutputPath>C:\Users\osieb\source\repos\ASCDataAccessLibrary\Files</BaseOutputPath>
       <DocumentationFile></DocumentationFile>
       <RootNamespace>ASCTableStorage</RootNamespace>
-      <Version>3.0</Version>
-      <PackageReadmeFile>getting-started-guide-30.md</PackageReadmeFile>
+      <Version>3.1</Version>
+      <PackageReadmeFile>getting-started-guide-31.md</PackageReadmeFile>
       <PackageReleaseNotes>
-         ## **Release Notes - ASCDataAccessLibrary v3.0**
-         New Features:
+         ## **Release Notes - ASCDataAccessLibrary v3.1**
+         Minor bug fixes with Session management not properly cleaning up with registered session configurations. 
+         Improved the reliability of Dynamic Entities ensuring no issues during creation by using pattern based primary key detection.
+         Improved data security and extensibility of Logging
+         
+         New Features:         
          Added a proper logger to the DAL so that projects can have a consistent and reliable way of logging
          to Table Storage within ANY app type.
 
@@ -50,7 +54,7 @@
    </ItemGroup>
 
    <ItemGroup>
-      <None Update="getting-started-guide-30.md">
+      <None Update="getting-started-guide-31.md">
          <Pack>True</Pack>
          <PackagePath>\</PackagePath>
       </None>

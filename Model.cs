@@ -10,6 +10,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using System.Xml.Serialization;
 
 namespace ASCTableStorage.Models
@@ -48,45 +49,542 @@ namespace ASCTableStorage.Models
     {
         private readonly ConcurrentDictionary<string, object> _properties = new();
         private string _tableName = "DynamicEntities";
+        private string? _partitionKeySourceField;
+        private string? _rowKeySourceField;
+
+        // Pattern configuration - can be overridden or extended
+        private static readonly KeyPatternConfig DefaultPatternConfig = new();
+
+        #region Pattern Configuration Classes
 
         /// <summary>
-        /// Creates a new dynamic table entity
+        /// Configuration for key pattern matching
         /// </summary>
+        public class KeyPatternConfig
+        {
+            /// <summary>
+            /// The accepable patterns for determining partition keys
+            /// </summary>
+            public List<PatternRule> PartitionKeyPatterns { get; set; }
+            /// <summary>
+            /// The acceptable patterns for determining row keys
+            /// </summary>
+            public List<PatternRule> RowKeyPatterns { get; set; }
+            /// <summary>
+            /// A settable threshold to help with matching from 0.0 to 1.0.
+            /// Note that 1.0 is absolute match with no fuzzy tolerance while 0.0 means everything matches
+            /// </summary>
+            public double FuzzyMatchThreshold { get; set; } = 0.6;
+
+            /// <summary>
+            /// List of available known patterns to dynamically match and find rowkey field names
+            /// </summary>
+            public KeyPatternConfig()
+            {
+                // Default patterns - these can be modified or replaced
+                PartitionKeyPatterns = new List<PatternRule>
+            {
+                // Pattern for hierarchical/ownership fields
+                new PatternRule {
+                    Pattern = @".*(?:customer|client|tenant|account|company|org|user|owner).*(?:id|key|code|number)?.*",
+                    Priority = 100,
+                    KeyType = KeyGenerationType.DirectValue
+                },
+                // Pattern for system/type classification
+                new PatternRule {
+                    Pattern = @".*(?:system|service|type|category|class|kind).*(?:name|id|code)?.*",
+                    Priority = 90,
+                    KeyType = KeyGenerationType.DirectValue
+                },
+                // Pattern for date-based partitioning
+                new PatternRule {
+                    Pattern = @".*(?:date|time|created|modified|updated).*",
+                    Priority = 80,
+                    KeyType = KeyGenerationType.DateBased
+                },
+                // Generic foreign key pattern
+                new PatternRule {
+                    Pattern = @".*_(?:id|key|code|fk)$",
+                    Priority = 70,
+                    KeyType = KeyGenerationType.DirectValue
+                }
+            };
+
+                RowKeyPatterns = new List<PatternRule>
+            {
+                // Pattern for unique identifiers
+                new PatternRule {
+                    Pattern = @"^(?:id|key|identifier|guid|uuid)$",
+                    Priority = 100,
+                    KeyType = KeyGenerationType.DirectValue
+                },
+                // Pattern for entity-specific IDs
+                new PatternRule {
+                    Pattern = @".*(?:record|entity|item|entry|row).*(?:id|key|number|code).*",
+                    Priority = 95,
+                    KeyType = KeyGenerationType.DirectValue
+                },
+                // Pattern for request/transaction IDs
+                new PatternRule {
+                    Pattern = @".*(?:request|transaction|operation|job|task).*(?:id|number|code).*",
+                    Priority = 90,
+                    KeyType = KeyGenerationType.DirectValue
+                },
+                // Pattern for sequential/time-based ordering
+                new PatternRule {
+                    Pattern = @".*(?:sequence|order|index|position|timestamp).*",
+                    Priority = 85,
+                    KeyType = KeyGenerationType.Sequential
+                },
+                // Generic ID suffix pattern
+                new PatternRule {
+                    Pattern = @".*(?:_id|_key|_code|_number|_no)$",
+                    Priority = 80,
+                    KeyType = KeyGenerationType.DirectValue
+                }
+            };
+            }
+        } //end class KeyPatternConfig
+
+        /// <summary>
+        /// Defines a pattern rule for key matching
+        /// </summary>
+        public class PatternRule
+        {
+            /// <summary>
+            /// The pattern to use to help generate a row key
+            /// </summary>
+            public string? Pattern { get; set; } = "";
+            /// <summary>
+            /// The priority to assign to the pattern
+            /// </summary>
+            public int Priority { get; set; }
+            /// <summary>
+            /// The enumeration of generation types
+            /// </summary>
+            public KeyGenerationType KeyType { get; set; }
+            /// <summary>
+            /// The transform value
+            /// </summary>
+            public Func<object, string>? ValueTransform { get; set; }
+
+            private Regex? _compiledRegex;
+            /// <summary>
+            /// True if the pattern matches with known data
+            /// </summary>
+            /// <param name="fieldName">The field to look for patterns</param>
+            /// <returns></returns>
+            public bool Matches(string fieldName)
+            {
+                _compiledRegex ??= new Regex(Pattern!, RegexOptions.IgnoreCase | RegexOptions.Compiled);
+                return _compiledRegex.IsMatch(fieldName);
+            }
+        }
+
+        /// <summary>
+        /// Enumeration of the Types of RowKey generation styles that can be considered
+        /// </summary>
+        public enum KeyGenerationType
+        {
+            /// <summary>
+            /// Use the field value directly
+            /// </summary>
+            DirectValue,
+            /// <summary>
+            /// Convert to date-based partition (YYYY-MM)
+            /// </summary>
+            DateBased,
+            /// <summary>
+            /// Generate sequential key
+            /// </summary>
+            Sequential,
+            /// <summary>
+            /// Generate reverse timestamp
+            /// </summary>
+            ReverseTimestamp,
+            /// <summary>
+            /// Combine multiple fields
+            /// </summary>
+            Composite,
+            /// <summary>
+            /// Generate new value
+            /// </summary>
+            Generated
+        }
+
+        #endregion Pattern Configuration Classes
+
+        #region Constructors
+
+        /// <summary>
+        /// Creates a new dynamic table entity with explicit keys
+        /// </summary>
+        /// <param name="tableName">Name of the table to assign to manage the objects of this type in the Data Store</param>
+        /// <param name="partitionKey">The name of the foreign key style relationship match for the table to search with</param>
+        /// <param name="rowKey">The unique data to assign as the main field identifyer</param>
         public DynamicEntity(string tableName, string partitionKey, string rowKey)
         {
             _tableName = tableName ?? throw new ArgumentNullException(nameof(tableName));
-            PartitionKey = partitionKey ?? throw new ArgumentNullException(nameof(partitionKey));
-            RowKey = rowKey ?? throw new ArgumentNullException(nameof(rowKey));
+
+            SetPartitionKey(partitionKey);
+            SetRowKey(rowKey);
+
+            EnsureKeysInitialized();
+        }
+
+        /// <summary>
+        /// Creates a new dynamic entity with automatic pattern-based key detection
+        /// </summary>
+        /// <param name="tableName">Name of the table to assign to manage the objects of this type in the Data Store</param>
+        /// <param name="initialProperties">List of properties you know you would like to assign to be stored</param>
+        /// <param name="patternConfig">The pattern to use to help dynamically define the RowKey</param>
+        public DynamicEntity(string tableName, Dictionary<string, object>? initialProperties = null, KeyPatternConfig? patternConfig = null)
+        {
+            _tableName = tableName ?? throw new ArgumentNullException(nameof(tableName));
+
+            // Apply initial properties
+            if (initialProperties != null)
+            {
+                foreach (var kvp in initialProperties)
+                {
+                    _properties[kvp.Key] = kvp.Value;
+                }
+            }
+
+            // Detect and set keys using patterns
+            DetectKeysUsingPatterns(patternConfig ?? DefaultPatternConfig);
+
+            EnsureKeysInitialized();
         }
 
         /// <summary>
         /// Parameterless constructor for deserialization
         /// </summary>
-        public DynamicEntity(){}
+        public DynamicEntity()
+        {
+            EnsureKeysInitialized();
+        }
 
-        #region ITableExtra Implementation
+        #endregion Constructors
+
+        #region Pattern-Based Key Detection
 
         /// <summary>
-        /// The table that will get created in your Table Storage account for managing this data.
+        /// Detects partition and row keys using configurable patterns
+        /// </summary>
+        private void DetectKeysUsingPatterns(KeyPatternConfig config)
+        {
+            // Find best partition key match
+            var partitionKeyMatch = FindBestKeyMatch(_properties, config.PartitionKeyPatterns, config.FuzzyMatchThreshold);
+            if (partitionKeyMatch != null)
+            {
+                _partitionKeySourceField = partitionKeyMatch.FieldName;
+                PartitionKey = GenerateKeyValue(partitionKeyMatch.FieldValue, partitionKeyMatch.Rule.KeyType, true);
+            }
+
+            // Find best row key match
+            var rowKeyMatch = FindBestKeyMatch(_properties, config.RowKeyPatterns, config.FuzzyMatchThreshold);
+            if (rowKeyMatch != null)
+            {
+                _rowKeySourceField = rowKeyMatch.FieldName;
+                RowKey = GenerateKeyValue(rowKeyMatch.FieldValue, rowKeyMatch.Rule.KeyType, false);
+            }
+        }
+
+        /// <summary>
+        /// Finds the best matching field for a key based on patterns
+        /// </summary>
+        private KeyMatch? FindBestKeyMatch(IDictionary<string, object> properties, List<PatternRule> patterns, double fuzzyThreshold)
+        {
+            var matches = new List<KeyMatch>();
+
+            foreach (var kvp in properties)
+            {
+                if (kvp.Value == null || string.IsNullOrWhiteSpace(kvp.Value.ToString()))
+                    continue;
+
+                // Try regex pattern matching first
+                foreach (var pattern in patterns)
+                {
+                    if (pattern.Matches(kvp.Key))
+                    {
+                        matches.Add(new KeyMatch
+                        {
+                            FieldName = kvp.Key,
+                            FieldValue = kvp.Value,
+                            Rule = pattern,
+                            Score = pattern.Priority + 100 // Regex matches get bonus score
+                        });
+                    }
+                }
+
+                // Try fuzzy matching on pattern keywords
+                var fuzzyScore = CalculateFuzzyScore(kvp.Key, patterns);
+                if (fuzzyScore.Score >= fuzzyThreshold)
+                {
+                    matches.Add(new KeyMatch
+                    {
+                        FieldName = kvp.Key,
+                        FieldValue = kvp.Value,
+                        Rule = fuzzyScore.Rule!,
+                        Score = fuzzyScore.Score * 100
+                    });
+                }
+            }
+
+            // Return highest scoring match
+            return matches.OrderByDescending(m => m.Score).FirstOrDefault();
+        }
+
+        /// <summary>
+        /// Calculates fuzzy matching score for a field name against patterns
+        /// </summary>
+        private (double Score, PatternRule? Rule) CalculateFuzzyScore(string fieldName, List<PatternRule> patterns)
+        {
+            double bestScore = 0;
+            PatternRule? bestRule = null;
+
+            var fieldLower = fieldName.ToLowerInvariant();
+
+            foreach (var pattern in patterns)
+            {
+                // Extract keywords from the pattern
+                var keywords = ExtractKeywordsFromPattern(pattern.Pattern);
+
+                double score = 0;
+                int matchCount = 0;
+
+                foreach (var keyword in keywords)
+                {
+                    if (fieldLower.Contains(keyword.ToLowerInvariant()))
+                    {
+                        matchCount++;
+                        // Score based on position and length ratio
+                        var positionScore = 1.0 - (fieldLower.IndexOf(keyword.ToLowerInvariant()) / (double)fieldLower.Length);
+                        var lengthScore = keyword.Length / (double)fieldLower.Length;
+                        score += (positionScore + lengthScore) / 2;
+                    }
+                }
+
+                if (matchCount > 0)
+                {
+                    var normalizedScore = (score / keywords.Count) * (pattern.Priority / 100.0);
+                    if (normalizedScore > bestScore)
+                    {
+                        bestScore = normalizedScore;
+                        bestRule = pattern;
+                    }
+                }
+            }
+
+            return (bestScore, bestRule);
+        }
+
+        /// <summary>
+        /// Extracts meaningful keywords from a regex pattern
+        /// </summary>
+        private List<string> ExtractKeywordsFromPattern(string pattern)
+        {
+            // Extract words from the pattern, ignoring regex syntax
+            var keywords = new List<string>();
+            var matches = Regex.Matches(pattern, @"[a-zA-Z]+");
+
+            foreach (Match match in matches)
+            {
+                var keyword = match.Value;
+                // Skip common regex keywords
+                if (!new[] { "id", "key", "code", "name", "number" }.Contains(keyword.ToLowerInvariant()))
+                {
+                    keywords.Add(keyword);
+                }
+            }
+
+            // Also add the common suffixes as keywords
+            keywords.AddRange(new[] { "id", "key", "code" });
+
+            return keywords.Distinct().ToList();
+        }
+
+        /// <summary>
+        /// Generates a key value based on the generation type
+        /// </summary>
+        /// <param name="value">The object to generate the key for</param>
+        /// <param name="type">Enum of Key types</param>
+        /// <param name="isPartitionKey">True if this represents a partition key value</param>
+        private string GenerateKeyValue(object value, KeyGenerationType type, bool isPartitionKey)
+        {
+            switch (type)
+            {
+                case KeyGenerationType.DirectValue:
+                    return SanitizeKeyValue(value.ToString()!);
+
+                case KeyGenerationType.DateBased:
+                    if (value is DateTime dt)
+                        return dt.ToString("yyyy-MM");
+                    if (DateTime.TryParse(value.ToString(), out var parsedDate))
+                        return parsedDate.ToString("yyyy-MM");
+                    return DateTime.UtcNow.ToString("yyyy-MM");
+
+                case KeyGenerationType.Sequential:
+                    var timestamp = DateTime.UtcNow.Ticks;
+                    return $"{timestamp:D19}_{SanitizeKeyValue(value.ToString()!)}";
+
+                case KeyGenerationType.ReverseTimestamp:
+                    var reverseTimestamp = DateTime.MaxValue.Ticks - DateTime.UtcNow.Ticks;
+                    return $"{reverseTimestamp:D19}_{SanitizeKeyValue(value.ToString()!)}";
+
+                case KeyGenerationType.Composite:
+                    // For composite, combine with other high-scoring fields
+                    return $"{SanitizeKeyValue(value.ToString()!)}_{Guid.NewGuid():N}".Substring(0, 255);
+
+                case KeyGenerationType.Generated:
+                default:
+                    return isPartitionKey
+                        ? SanitizeKeyValue(_tableName.ToUpperInvariant())
+                        : Guid.NewGuid().ToString("N");
+            }
+        }
+
+        private class KeyMatch
+        {
+            public string FieldName { get; set; } = "";
+            public object FieldValue { get; set; } = "";
+            public PatternRule Rule { get; set; } = new();
+            public double Score { get; set; }
+        }
+
+        #endregion Pattern-Based Key Detection
+
+        #region Key Management
+
+        /// <summary>
+        /// Ensures both PartitionKey and RowKey have valid values
+        /// </summary>
+        private void EnsureKeysInitialized()
+        {
+            if (string.IsNullOrEmpty(PartitionKey))
+            {
+                // Try to infer from table name or use default
+                PartitionKey = InferPartitionKeyFromContext();
+            }
+
+            if (string.IsNullOrEmpty(RowKey))
+            {
+                RowKey = GenerateDefaultRowKey();
+            }
+        }
+
+        /// <summary>
+        /// Infers a partition key from available context
+        /// </summary>
+        private string InferPartitionKeyFromContext()
+        {
+            // Try to extract a meaningful partition from the table name
+            var tableNameParts = Regex.Split(_tableName, @"(?=[A-Z])");
+
+            // Look for patterns in table name that suggest partitioning strategy
+            if (Regex.IsMatch(_tableName, @".*(?:log|audit|history|trace).*", RegexOptions.IgnoreCase))
+            {
+                // Time-based partitioning for log-like tables
+                return DateTime.UtcNow.ToString("yyyy-MM-dd");
+            }
+
+            if (tableNameParts.Length > 1)
+            {
+                // Use the first meaningful part of the table name
+                return SanitizeKeyValue(tableNameParts[0].ToUpperInvariant());
+            }
+
+            // Default to sanitized table name
+            return SanitizeKeyValue(_tableName.Replace("Table", "").Replace("Entity", "").ToUpperInvariant());
+        }
+
+        /// <summary>
+        /// Generates a default row key based on context
+        /// </summary>
+        private string GenerateDefaultRowKey()
+        {
+            // Check if any properties suggest time-series data
+            var hasTimeProperty = _properties.Keys.Any(k =>
+                Regex.IsMatch(k, @".*(?:date|time|created|modified|timestamp).*", RegexOptions.IgnoreCase));
+
+            if (hasTimeProperty)
+            {
+                // Use reverse timestamp for time-series data
+                var reverseTimestamp = DateTime.MaxValue.Ticks - DateTime.UtcNow.Ticks;
+                return $"{reverseTimestamp:D19}_{Guid.NewGuid():N}".Substring(0, 255);
+            }
+
+            // Default to GUID
+            return Guid.NewGuid().ToString("N");
+        }
+
+        /// <summary>
+        /// Sanitizes a value to be valid for use as a PartitionKey or RowKey
+        /// </summary>
+        /// <param name="value">The value to scrub for validity</param>
+        private string SanitizeKeyValue(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return "EMPTY";
+
+            // Remove invalid characters for Azure Table Storage keys
+            var sanitized = Regex.Replace(value, @"[^\w\-]", "_");
+
+            // Ensure it doesn't start or end with underscore
+            sanitized = sanitized.Trim('_');
+
+            // Limit length to 255 characters
+            if (sanitized.Length > 255)
+                sanitized = sanitized.Substring(0, 255);
+
+            return string.IsNullOrWhiteSpace(sanitized) ? "INVALID" : sanitized;
+        }
+
+        /// <summary>
+        /// Sets the partition key with validation
+        /// </summary>
+        /// <param name="value">The assigned Foreign Key style relationship to assign to the  data</param>
+        public void SetPartitionKey(string? value)
+        {
+            PartitionKey = string.IsNullOrWhiteSpace(value)
+                ? InferPartitionKeyFromContext()
+                : SanitizeKeyValue(value);
+        }
+
+        /// <summary>
+        /// Sets the row key with validation
+        /// </summary>
+        /// <param name="value">The assigned UNIQUE value for the rowKey</param>
+        public void SetRowKey(string? value)
+        {
+            RowKey = string.IsNullOrWhiteSpace(value)
+                ? GenerateDefaultRowKey()
+                : SanitizeKeyValue(value);
+        }
+
+        #endregion Key Management
+
+        #region ITableExtra Implementation
+        /// <summary>
+        /// The name of the table to assign to the managed entities
         /// </summary>
         public string TableReference
         {
             get => _tableName;
             set => _tableName = value ?? throw new ArgumentNullException(nameof(value));
         }
-
         /// <summary>
-        /// The ID value is always the RowKey for dynamic entities
+        /// The RowKey for proper alignment with Table Storage
         /// </summary>
         /// <returns></returns>
-        public string GetIDValue() => RowKey ?? Guid.NewGuid().ToString();
+        public string GetIDValue() => RowKey ?? GenerateDefaultRowKey();
 
         #endregion ITableExtra Implementation
 
         #region IDynamicProperties Implementation
-
         /// <summary>
-        /// Maintains the dynamic properties for the entity
+        /// Maintains an inner list of the available properties and their assigned values
         /// </summary>
         public IDictionary<string, object> DynamicProperties => _properties;
 
@@ -95,24 +593,80 @@ namespace ASCTableStorage.Models
         #region Property Management Methods
 
         /// <summary>
-        /// Attempts to set a dynamic property by name
+        /// Sets a dynamic property and re-evaluates keys if needed
         /// </summary>
-        /// <param name="name">The name of the property to set</param>
-        /// <param name="value">The value of the property to set</param>
+        /// <param name="name">The name to assign the property</param>
+        /// <param name="value">The value to assign</param>
         public void SetProperty(string name, object value)
         {
             ValidatePropertyName(name);
+
             if (value == null)
+            {
                 _properties.TryRemove(name, out _);
+            }
             else
+            {
                 _properties[name] = value;
+
+                // Re-evaluate keys if they're still using defaults
+                ReevaluateKeysIfNeeded(name, value);
+            }
         }
 
         /// <summary>
-        /// Attempts to retrieve a dynamic property by name and convert it to the specified type
+        /// Re-evaluates keys when new properties are added
         /// </summary>
-        /// <typeparam name="T">The datatype to convert to</typeparam>
-        /// <param name="name">The name of the property to retrieve</param>
+        /// <param name="propertyName">The name to assign the property</param>
+        /// <param name="value">The value to assign</param>
+        private void ReevaluateKeysIfNeeded(string propertyName, object value)
+        {
+            // Only re-evaluate if we're using generated/default keys
+            bool isDefaultPartition = PartitionKey?.Contains(_tableName.ToUpperInvariant()) == true ||
+                                     PartitionKey?.StartsWith("EMPTY") == true ||
+                                     PartitionKey?.StartsWith("INVALID") == true;
+
+            bool isDefaultRow = Guid.TryParse(RowKey?.Replace("-", ""), out _);
+
+            if (!isDefaultPartition && !isDefaultRow)
+                return;
+
+            // Create a temporary config for re-evaluation
+            var config = DefaultPatternConfig;
+
+            if (isDefaultPartition)
+            {
+                var partitionMatch = FindBestKeyMatch(
+                    new Dictionary<string, object> { { propertyName, value } },
+                    config.PartitionKeyPatterns,
+                    config.FuzzyMatchThreshold);
+
+                if (partitionMatch != null && partitionMatch.Score > 50) // Threshold for replacing default
+                {
+                    _partitionKeySourceField = partitionMatch.FieldName;
+                    PartitionKey = GenerateKeyValue(partitionMatch.FieldValue, partitionMatch.Rule.KeyType, true);
+                }
+            }
+
+            if (isDefaultRow)
+            {
+                var rowMatch = FindBestKeyMatch(
+                    new Dictionary<string, object> { { propertyName, value } },
+                    config.RowKeyPatterns,
+                    config.FuzzyMatchThreshold);
+
+                if (rowMatch != null && rowMatch.Score > 50) // Threshold for replacing default
+                {
+                    _rowKeySourceField = rowMatch.FieldName;
+                    RowKey = GenerateKeyValue(rowMatch.FieldValue, rowMatch.Rule.KeyType, false);
+                }
+            }
+        }
+        /// <summary>
+        /// Attempts to retrieve the value of the dynamic property maintained by the object
+        /// </summary>
+        /// <typeparam name="T">The datatype of the property</typeparam>
+        /// <param name="name">The name of the property</param>
         public T GetProperty<T>(string name)
         {
             if (_properties.TryGetValue(name, out var value))
@@ -132,35 +686,33 @@ namespace ASCTableStorage.Models
         }
 
         /// <summary>
-        /// Retrieves a dynamic property by name
+        /// Retrieves the value of the dynamically generated property
         /// </summary>
-        /// <param name="name">The name of the property to retrieve</param>
+        /// <param name="name">The name of the proeprty</param>
+        /// <returns></returns>
         public object GetProperty(string name)
         {
             return _properties.TryGetValue(name, out var value) ? value : null!;
         }
 
         /// <summary>
-        /// True if the named property exists
+        /// True if the property name you are looking for is available
         /// </summary>
-        /// <param name="name">The name of the property to check</param>
+        /// <param name="name">The name of the dynamically generated property</param>
         public bool HasProperty(string name) => _properties.ContainsKey(name);
-
         /// <summary>
-        /// Removes a dynamic property by name
+        /// Attempts to delete the property from the collection of properties maintained by the dynamic instance
         /// </summary>
         /// <param name="name">The name of the property to remove</param>
         public void RemoveProperty(string name) => _properties.TryRemove(name, out _);
-
         /// <summary>
-        /// Returns a copy of all dynamic properties managed by this entity
+        /// Retrieves all the dynamically generated properties within the object
         /// </summary>
         public Dictionary<string, object> GetAllProperties() => new(_properties);
-
         /// <summary>
-        /// Provides an indexer for dynamic property access
+        /// Helpful to inspect the available property values of the dynamic object
         /// </summary>
-        /// <param name="propertyName">The name of the property to access</param>
+        /// <param name="propertyName">The property to inspect</param>
         public object this[string propertyName]
         {
             get => GetProperty(propertyName);
@@ -176,17 +728,68 @@ namespace ASCTableStorage.Models
             if (reserved.Contains(name))
                 throw new ArgumentException($"'{name}' is a reserved property name");
 
-            if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^[a-zA-Z_][a-zA-Z0-9_]*$"))
+            if (!Regex.IsMatch(name, @"^[a-zA-Z_][a-zA-Z0-9_]*$"))
                 throw new ArgumentException($"Property name '{name}' contains invalid characters");
         }
 
         #endregion Property Management Methods
 
+        #region Static Factory Methods with Custom Patterns
+
         /// <summary>
-        /// Provides a string representation of the dynamic entity for debugging purposes
+        /// Creates a DynamicEntity with custom pattern configuration
+        /// </summary>
+        public static DynamicEntity CreateWithPatterns(string tableName, Dictionary<string, object>? properties, KeyPatternConfig patternConfig)
+        {
+            return new DynamicEntity(tableName, properties, patternConfig);
+        }
+
+        /// <summary>
+        /// Creates a pattern configuration from a JSON configuration
+        /// </summary>
+        public static KeyPatternConfig LoadPatternConfig(string jsonConfig)
+        {
+            return JsonConvert.DeserializeObject<KeyPatternConfig>(jsonConfig) ?? new KeyPatternConfig();
+        }
+
+        /// <summary>
+        /// Creates a DynamicEntity from JSON with pattern-based key detection
+        /// </summary>
+        public static DynamicEntity CreateFromJson(string tableName, string json, KeyPatternConfig? patternConfig = null)
+        {
+            var properties = JsonConvert.DeserializeObject<Dictionary<string, object>>(json) ?? new Dictionary<string, object>();
+            return new DynamicEntity(tableName, properties, patternConfig);
+        }
+
+        #endregion Static Factory Methods
+
+        #region Diagnostics
+        /// <summary>
+        /// Retrieves metadata information about the entities properties
+        /// </summary>
+        public Dictionary<string, string> GetDiagnostics()
+        {
+            return new Dictionary<string, string>
+            {
+                ["TableName"] = _tableName,
+                ["PartitionKey"] = PartitionKey ?? "NULL",
+                ["RowKey"] = RowKey ?? "NULL",
+                ["PartitionKeySource"] = _partitionKeySourceField ?? "GENERATED",
+                ["RowKeySource"] = _rowKeySourceField ?? "GENERATED",
+                ["PropertyCount"] = _properties.Count.ToString(),
+                ["Properties"] = string.Join(", ", _properties.Keys.Take(10)) // Limit to first 10
+            };
+        }
+        /// <summary>
+        /// Best used for diagnostic purposes to see what the important serializable data points have
         /// </summary>
         public override string ToString()
-            => $"DynamicEntity[Table={TableReference}, PK={PartitionKey}, RK={RowKey}, Properties={_properties.Count}]";       
+        {
+            var diagnostics = GetDiagnostics();
+            return $"DynamicEntity[Table={diagnostics["TableName"]}, PK={diagnostics["PartitionKey"]}, RK={diagnostics["RowKey"]}, Properties={diagnostics["PropertyCount"]}]";
+        }
+
+        #endregion Diagnostics
     }
 
     /// <summary>

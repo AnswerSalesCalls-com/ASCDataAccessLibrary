@@ -1,9 +1,7 @@
 ﻿using ASCTableStorage.Common;
 using ASCTableStorage.Data;
 using ASCTableStorage.Models;
-using Microsoft.AspNetCore.Http;
 using Microsoft.Azure.Cosmos.Table;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using System.Collections.Concurrent;
@@ -39,14 +37,9 @@ namespace ASCTableStorage.Sessions
         public string TableName { get; set; } = Constants.DefaultSessionTableName;
 
         /// <summary>
-        /// How old session data should be before cleanup (default: 2 hours)
+        /// How old session data should be before cleanup (default: 45 Minutes)
         /// </summary>
-        public TimeSpan StaleDataCleanupAge { get; set; } = TimeSpan.FromHours(2);
-
-        /// <summary>
-        /// Session timeout for inactivity (default: 20 minutes)
-        /// </summary>
-        public TimeSpan SessionTimeout { get; set; } = TimeSpan.FromMinutes(20);
+        public TimeSpan StaleDataCleanupAge { get; set; } = TimeSpan.FromMinutes(45);
 
         /// <summary>
         /// Auto-commit session changes (default: true)
@@ -59,9 +52,11 @@ namespace ASCTableStorage.Sessions
         public bool EnableAutoCleanup { get; set; } = true;
 
         /// <summary>
-        /// Interval for cleanup runs (default: 1 hour)
+        /// Happens when a session becomes stale (no usage) in this amount of time. 
+        /// Then we  mark for cleanup. Interval for cleanup runs (default: 30 Minutes).
+        /// Should be less that the StaleDataCleanupAge to make sure data does not linger too long between cycles
         /// </summary>
-        public TimeSpan CleanupInterval { get; set; } = TimeSpan.FromHours(1);
+        public TimeSpan CleanupInterval { get; set; } = TimeSpan.FromMinutes(30);
 
         /// <summary>
         /// Batch write delay for performance optimization (default: 500ms)
@@ -110,7 +105,13 @@ namespace ASCTableStorage.Sessions
         /// Auto-commit interval (set to TimeSpan.Zero to disable, default is 10 seconds)
         /// </summary>
         public TimeSpan AutoCommitInterval { get; set; } = TimeSpan.FromSeconds(10);
-    }
+
+        /// <summary>
+        /// Delay before starting the first cleanup run (default: 30 seconds)
+        /// This prevents race conditions during initialization
+        /// </summary>
+        public TimeSpan CleanupStartDelay { get; set; } = TimeSpan.FromSeconds(30);
+    } // end class SessionOptions
 
     /// <summary>
     /// Strategies for generating session IDs
@@ -146,7 +147,7 @@ namespace ASCTableStorage.Sessions
         /// Generate a new GUID for each session
         /// </summary>
         Guid
-    }
+    } //end enum SessionIdStrategy
 
     #endregion Session Configuration
 
@@ -166,6 +167,7 @@ namespace ASCTableStorage.Sessions
         private static readonly object _lock = new object();
         private static Timer? _autoCommitTimer;
         private static CancellationTokenSource? _shutdownTokenSource;
+        private static SessionBackgroundService? _backgroundService;
         internal static bool _initialized = false;
 
         /// <summary>
@@ -200,6 +202,9 @@ namespace ASCTableStorage.Sessions
         /// <summary>
         /// Initialize session manager with explicit credentials
         /// </summary>
+        /// <param name="accountName">Azure Table Storage Database name</param>
+        /// <param name="accountKey">Azure Table Storage Database key</param>
+        /// <param name="configure">The options that determine configurations</param>
         public static void Initialize(string accountName, string accountKey, Action<SessionOptions>? configure = null)
         {
             lock (_lock)
@@ -213,7 +218,11 @@ namespace ASCTableStorage.Sessions
                 _accountKey = accountKey;
                 _shutdownTokenSource = new CancellationTokenSource();
 
-                var options = new SessionOptions();
+                var options = new SessionOptions
+                {
+                    AccountName = accountName,
+                    AccountKey = accountKey
+                };
                 configure?.Invoke(options);
 
                 if (options.IdStrategy == SessionIdStrategy.Custom && options.CustomIdProvider != null)
@@ -223,6 +232,14 @@ namespace ASCTableStorage.Sessions
                 else if (!string.IsNullOrEmpty(options.SessionId))
                 {
                     _sessionId = options.SessionId;
+                }
+
+                // Initialize background service if cleanup is enabled
+                if (options.EnableAutoCleanup)
+                {
+                    _backgroundService = new SessionBackgroundService(options);
+                    // Start the background service with the cancellation token
+                    _backgroundService.StartAsync(_shutdownTokenSource.Token).GetAwaiter().GetResult();
                 }
 
                 // Setup auto-commit timer if enabled
@@ -245,10 +262,11 @@ namespace ASCTableStorage.Sessions
         /// <summary>
         /// Initialize with specific session ID
         /// </summary>
+        /// <param name="accountName">Azure Table Storage Database name</param>
+        /// <param name="accountKey">Azure Table Storage Database key</param>
+        /// <param name="sessionId">The sessionID this instance will work on</param>
         public static void Initialize(string accountName, string accountKey, string sessionId)
-        {
-            Initialize(accountName, accountKey, options => options.SessionId = sessionId);
-        }
+            => Initialize(accountName, accountKey, options => options.SessionId = sessionId);
 
         /// <summary>
         /// Register all shutdown handlers for different scenarios
@@ -282,6 +300,7 @@ namespace ASCTableStorage.Sessions
         /// Register for graceful shutdown with a cancellation token (for ASP.NET Core apps)
         /// Call this from Program.cs with IHostApplicationLifetime.ApplicationStopping token
         /// </summary>
+        /// <param name="cancellationToken">The cancellation token that sparks or requests shutdown</param>
         public static void RegisterForGracefulShutdown(CancellationToken cancellationToken)
         {
             cancellationToken.Register(() =>
@@ -301,6 +320,7 @@ namespace ASCTableStorage.Sessions
         /// <summary>
         /// Auto-commit callback for timer
         /// </summary>
+        /// <param name="state">The state of the session</param>
         private static void AutoCommitCallback(object? state)
         {
             try
@@ -320,14 +340,15 @@ namespace ASCTableStorage.Sessions
         /// <summary>
         /// Handle process exit
         /// </summary>
-        private static void OnProcessExit(object? sender, EventArgs e)
-        {
-            CommitAndShutdown("Process exit");
-        }
+        /// <param name="sender">The sender of the process command</param>
+        /// <param name="e">Arguments to use if any. Ignored here</param>
+        private static void OnProcessExit(object? sender, EventArgs e) => CommitAndShutdown("Process exit");
 
         /// <summary>
         /// Handle unhandled exceptions
         /// </summary>
+        /// <param name="sender">The sender of the process command</param>
+        /// <param name="e">Arguments to use if any. Ignored here</param>
         private static void OnUnhandledException(object? sender, UnhandledExceptionEventArgs e)
         {
             CommitAndShutdown($"Unhandled exception (terminating: {e.IsTerminating})");
@@ -336,19 +357,19 @@ namespace ASCTableStorage.Sessions
         /// <summary>
         /// Handle assembly unloading
         /// </summary>
-        private static void OnAssemblyUnloading(AssemblyLoadContext context)
-        {
-            CommitAndShutdown("Assembly unloading");
-        }
+        /// <param name="context">Assembly context</param>
+        private static void OnAssemblyUnloading(AssemblyLoadContext context) => CommitAndShutdown("Assembly unloading");
+
 
         /// <summary>
         /// Handle console cancel key press (Ctrl+C)
         /// </summary>
+        /// <param name="sender">The sender of the process command</param>
+        /// <param name="e">Arguments to use if any. Ignored here</param>
         private static void OnConsoleCancelKeyPress(object? sender, ConsoleCancelEventArgs e)
         {
-            CommitAndShutdown("Console cancel");
-            // Allow the process to terminate
-            e.Cancel = false;
+            CommitAndShutdown("Console cancel");            
+            e.Cancel = false; // Allow the process to terminate
         }
 
         /// <summary>
@@ -358,7 +379,7 @@ namespace ASCTableStorage.Sessions
         {
             try
             {
-                System.Diagnostics.Debug.WriteLine($"SessionManager shutdown initiated: {reason}");
+                Debug.WriteLine($"SessionManager shutdown initiated: {reason}");
 
                 lock (_lock)
                 {
@@ -374,7 +395,7 @@ namespace ASCTableStorage.Sessions
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"Error during shutdown commit: {ex}");
+                Debug.WriteLine($"Error during shutdown commit: {ex}");
             }
         }
 
@@ -388,6 +409,15 @@ namespace ASCTableStorage.Sessions
                 try
                 {
                     _shutdownTokenSource?.Cancel();
+
+                    // Stop background service if running
+                    if (_backgroundService != null)
+                    {
+                        _backgroundService.StopAsync(CancellationToken.None).GetAwaiter().GetResult();
+                        _backgroundService.Dispose();
+                        _backgroundService = null;
+                    }
+
                     _shutdownTokenSource?.Dispose();
                     _shutdownTokenSource = null;
 
@@ -421,7 +451,7 @@ namespace ASCTableStorage.Sessions
                     }
                 }
             }
-        }
+        } // end ShutDown()
 
         /// <summary>
         /// Async shutdown
@@ -431,6 +461,11 @@ namespace ASCTableStorage.Sessions
             try
             {
                 _shutdownTokenSource?.Cancel();
+
+                if (_backgroundService != null)
+                {
+                    await _backgroundService.StopAsync(CancellationToken.None);
+                }
 
                 if (_currentSession != null && !_currentSession.DataHasBeenCommitted)
                 {
@@ -479,7 +514,15 @@ namespace ASCTableStorage.Sessions
             }
 
             // For services/console apps, use machine + process
-            return $"{Environment.MachineName}_{System.Diagnostics.Process.GetCurrentProcess().Id}";
+            return $"{Environment.MachineName}_{Process.GetCurrentProcess().Id}";
+        }
+
+        /// <summary>
+        /// Get session statistics from the background service
+        /// </summary>
+        public static SessionStatistics? GetStatistics()
+        {
+            return _backgroundService?.Statistics;
         }
 
     } // end class SessionManager
@@ -532,7 +575,7 @@ namespace ASCTableStorage.Sessions
         /// Gets the number of items in the session
         /// </summary>
         int Count { get; }
-    }
+    } //end interface iSession
 
     #endregion Session Interface
 
@@ -551,7 +594,6 @@ namespace ASCTableStorage.Sessions
         private readonly SessionBackgroundService _backgroundService;
         private readonly Timer _batchTimer;
         private readonly SemaphoreSlim _flushSemaphore;
-        private DateTime _lastActivity;
         private bool _disposed;
 
         /// <summary>
@@ -576,7 +618,6 @@ namespace ASCTableStorage.Sessions
             _pendingWrites = new ConcurrentDictionary<string, AppSessionData>();
             _sessionData = new ConcurrentDictionary<string, AppSessionData>();
             _flushSemaphore = new SemaphoreSlim(1, 1);
-            _lastActivity = DateTime.UtcNow;
 
             // Setup batch timer
             _batchTimer = new Timer(
@@ -597,8 +638,6 @@ namespace ASCTableStorage.Sessions
         {
             get
             {
-                UpdateActivity();
-
                 // Check pending writes first (most recent data)
                 if (_pendingWrites.TryGetValue(key, out var pendingData))
                     return pendingData;
@@ -619,8 +658,6 @@ namespace ASCTableStorage.Sessions
             {
                 if (string.IsNullOrEmpty(key))
                     throw new ArgumentNullException(nameof(key));
-
-                UpdateActivity();
 
                 if (value == null)
                 {
@@ -693,19 +730,15 @@ namespace ASCTableStorage.Sessions
         /// <summary>
         /// Check if key exists
         /// </summary>
-        public bool ContainsKey(string key)
-        {
-            UpdateActivity();
-            return _pendingWrites.ContainsKey(key) || _sessionData.ContainsKey(key);
-        }
+        public bool ContainsKey(string key) 
+            => _pendingWrites.ContainsKey(key) || _sessionData.ContainsKey(key);
+       
 
         /// <summary>
         /// Remove a key from session
         /// </summary>
         public async Task<bool> RemoveAsync(string key)
         {
-            UpdateActivity();
-
             // Remove from collections
             _pendingWrites.TryRemove(key, out _);
             _sessionData.TryRemove(key, out var existing);
@@ -732,8 +765,6 @@ namespace ASCTableStorage.Sessions
         /// </summary>
         public async Task ClearAsync()
         {
-            UpdateActivity();
-
             // Clear pending writes
             _pendingWrites.Clear();
 
@@ -796,27 +827,6 @@ namespace ASCTableStorage.Sessions
         }
 
         /// <summary>
-        /// Update last activity timestamp
-        /// </summary>
-        private void UpdateActivity()
-        {
-            _lastActivity = DateTime.UtcNow;
-
-            if (_options.TrackActivity)
-            {
-                _backgroundService.Statistics.LastActivity = _lastActivity;
-            }
-        }
-
-        /// <summary>
-        /// Check if session is expired
-        /// </summary>
-        internal bool IsExpired()
-        {
-            return DateTime.UtcNow - _lastActivity > _options.SessionTimeout;
-        }
-
-        /// <summary>
         /// Dispose resources
         /// </summary>
         public void Dispose()
@@ -852,10 +862,12 @@ namespace ASCTableStorage.Sessions
         private readonly SessionOptions _options;
         private readonly DataAccess<AppSessionData> _dataAccess;
         private readonly ConcurrentDictionary<string, OptimizedSession> _activeSessions;
-        private readonly Timer? _cleanupTimer;
-        private readonly Timer? _activityTimer;
+        private Timer? _cleanupTimer;
         private CancellationTokenSource? _cancellationTokenSource;
         private bool _disposed;
+        private bool _isStarted = false;
+        private readonly object _startLock = new object();
+
         /// <summary>
         /// The statistics for the session manager
         /// </summary>
@@ -870,25 +882,6 @@ namespace ASCTableStorage.Sessions
             _options = options;
             _dataAccess = new DataAccess<AppSessionData>(options.AccountName!, options.AccountKey!);
             _activeSessions = new ConcurrentDictionary<string, OptimizedSession>();
-
-            // Setup cleanup timer
-            if (_options.EnableAutoCleanup)
-            {
-                _cleanupTimer = new Timer(
-                    async _ => await RunCleanupAsync(),
-                    null,
-                    _options.CleanupInterval,
-                    _options.CleanupInterval
-                );
-            }
-
-            // Setup activity monitoring timer
-            _activityTimer = new Timer(
-                _ => CheckSessionActivity(),
-                null,
-                TimeSpan.FromMinutes(1),
-                TimeSpan.FromMinutes(1)
-            );
         }
 
         /// <summary>
@@ -897,10 +890,31 @@ namespace ASCTableStorage.Sessions
         /// <param name="cancellationToken">The cancellation token</param>
         public Task StartAsync(CancellationToken cancellationToken)
         {
-            _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            Statistics.StartTime = DateTime.UtcNow;
+           lock (_startLock)
+            {
+                if (_isStarted)
+                    return Task.CompletedTask;
+
+                _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                Statistics.StartTime = DateTime.UtcNow;
+
+                // Setup cleanup timer with delayed start to prevent race conditions
+                if (_options.EnableAutoCleanup)
+                {
+                    _cleanupTimer = new Timer(
+                        async _ => await RunCleanupAsync(),
+                        null,
+                        _options.CleanupStartDelay,  // Delay first run
+                        _options.CleanupInterval
+                    );
+                }
+
+                _isStarted = true;
+            }
+            
             return Task.CompletedTask;
         }
+
         /// <summary>
         /// Sets the cancellation token for the background service
         /// </summary>
@@ -937,25 +951,49 @@ namespace ASCTableStorage.Sessions
         /// </summary>
         private async Task RunCleanupAsync()
         {
+            // Prevent concurrent cleanup runs
+            if (_cancellationTokenSource?.IsCancellationRequested == true)
+                return;
+
             try
             {
                 var cutoffTime = DateTime.UtcNow.Subtract(_options.StaleDataCleanupAge);
 
-                // Find old sessions
-                var oldSessions = await _dataAccess.GetCollectionAsync(
-                    s => s.Timestamp < cutoffTime
-                );
+                // Get all session data from the table
+                var allSessionData = await _dataAccess.GetAllTableDataAsync();
 
-                if (oldSessions.Any())
+                // Group by SessionID to identify complete sessions
+                var sessionGroups = allSessionData.GroupBy(s => s.SessionID);
+
+                var sessionsToDelete = new List<string>();
+                var rowsToDelete = new List<AppSessionData>();
+
+                foreach (var sessionGroup in sessionGroups)
                 {
-                    // Batch delete old sessions
+                    // Check if ANY part of this session is still fresh
+                    var hasFreshData = sessionGroup.Any(s => s.Timestamp >= cutoffTime);
+
+                    if (!hasFreshData)
+                    {
+                        // All data in this session is stale, mark entire session for deletion
+                        sessionsToDelete.Add(sessionGroup.Key!);
+                        rowsToDelete.AddRange(sessionGroup);
+                    }
+                    // If any part is fresh, keep the entire session (do nothing)
+                }
+
+                // Batch delete old sessions
+                if (rowsToDelete.Any())
+                {
                     var result = await _dataAccess.BatchUpdateListAsync(
-                        oldSessions,
+                        rowsToDelete,
                         TableOperationType.Delete
                     );
 
-                    Statistics.SessionsDeleted += result.SuccessfulItems;
+                    Statistics.SessionsDeleted += sessionsToDelete.Count;
                     Statistics.LastCleanup = DateTime.UtcNow;
+
+                    Debug.WriteLine($"Cleaned up {sessionsToDelete.Count} complete sessions ({result.SuccessfulItems} rows)");
                 }
 
                 // Also check for stale sessions that should be submitted to CRM
@@ -965,7 +1003,7 @@ namespace ASCTableStorage.Sessions
             {
                 Debug.WriteLine($"Session cleanup failed: {ex.Message}");
             }
-        }
+        } // end RunCleanupAsync()
 
         /// <summary>
         /// Process stale sessions (for CRM submission etc.)
@@ -979,8 +1017,11 @@ namespace ASCTableStorage.Sessions
                 var q = new TableQuery<AppSessionData>().Where(filter);
 
                 var coll = await _dataAccess.GetCollectionAsync(q);
+
+                // Convert to UTC for comparison
+                var utcNow = DateTime.UtcNow;
                 var staleSessions = coll
-                    .Where(s => s.Timestamp.IsTimeBetween(DateTime.Now, 5, 60))
+                    .Where(s => s.Timestamp.IsTimeBetween(utcNow, 5, 60))
                     .GroupBy(s => s.SessionID)
                     .Select(g => g.Key)
                     .ToList();
@@ -988,29 +1029,17 @@ namespace ASCTableStorage.Sessions
                 Statistics.StaleSessions = staleSessions.Count;
 
                 // Could trigger events or callbacks here for stale session processing
+                if (staleSessions.Count > 0)
+                {
+                    Debug.WriteLine($"Found {staleSessions.Count} stale sessions for CRM processing");
+                }
             }
-            catch { }
-        }
-
-        /// <summary>
-        /// Check for expired sessions
-        /// </summary>
-        private void CheckSessionActivity()
-        {
-            var expiredSessions = _activeSessions.Values
-                .Where(s => s.IsExpired())
-                .ToList();
-
-            foreach (var session in expiredSessions)
+            catch (Exception ex)
             {
-                // Force flush and remove
-                session.FlushAsync().GetAwaiter().GetResult();
-                _activeSessions.TryRemove(session.SessionId, out _);
-                Statistics.ExpiredSessions++;
+                Debug.WriteLine($"ProcessStaleSessions failed: {ex.Message}");
             }
-
-            Statistics.ActiveSessions = _activeSessions.Count;
         }
+
         /// <summary>
         /// Properly dispose of resources
         /// </summary>
@@ -1021,7 +1050,6 @@ namespace ASCTableStorage.Sessions
 
             _disposed = true;
             _cleanupTimer?.Dispose();
-            _activityTimer?.Dispose();
             _cancellationTokenSource?.Dispose();
         }
     } // end class SessionBackgroundService
@@ -1097,7 +1125,7 @@ namespace ASCTableStorage.Sessions
         /// The total uptime of the session manager
         /// </summary>
         public TimeSpan Uptime => DateTime.UtcNow - StartTime;
-    }
+    } // end class SessionStatistics
 
     #endregion Statistics
 
@@ -1111,8 +1139,11 @@ namespace ASCTableStorage.Sessions
         /// <summary>
         /// Add Azure Table sessions to services (ASP.NET Core)
         /// </summary>
-        public static IServiceCollection AddAzureTableSessions(this IServiceCollection services,
-            string accountName, string accountKey, Action<SessionOptions>? configure = null)
+        /// <param name="services">The managed service collection</param>
+        /// <param name="accountName">Name of the database in Azure Tables</param>
+        /// <param name="accountKey">Key credential of the database</param>
+        /// <param name="configure">Session Options</param>
+        public static IServiceCollection AddAzureTableSessions(this IServiceCollection services, string accountName, string accountKey, Action<SessionOptions>? configure = null)
         {
             var options = new SessionOptions
             {
@@ -1135,8 +1166,10 @@ namespace ASCTableStorage.Sessions
         /// <summary>
         /// Add Azure Table sessions with configuration
         /// </summary>
-        public static IServiceCollection AddAzureTableSessions(this IServiceCollection services,
-            Action<SessionOptions> configure)
+        /// <param name="services">The managed service collection</param>
+        /// <param name="configure">Session Options</param>
+        /// <exception cref="ArgumentException"></exception>
+        public static IServiceCollection AddAzureTableSessions(this IServiceCollection services, Action<SessionOptions> configure)
         {
             var options = new SessionOptions();
             configure(options);
@@ -1152,14 +1185,16 @@ namespace ASCTableStorage.Sessions
         /// <summary>
         /// Add Azure Table sessions to host builder
         /// </summary>
-        public static IHostBuilder AddAzureTableSessions(this IHostBuilder builder,
-            string accountName, string accountKey, Action<SessionOptions>? configure = null)
-        {
-            return builder.ConfigureServices((context, services) =>
+        /// <param name="builder">Builder object from application satup</param>
+        /// <param name="accountName">Name of the database in Azure Tables</param>
+        /// <param name="accountKey">Key credential of the database</param>
+        /// <param name="configure">Session Options</param>
+        public static IHostBuilder AddAzureTableSessions(this IHostBuilder builder, string accountName, string accountKey, Action<SessionOptions>? configure = null)        
+            => builder.ConfigureServices((context, services) =>
             {
                 services.AddAzureTableSessions(accountName, accountKey, configure);
             });
-        }
+
     } // end class SessionExtensions
 
     #endregion Extension Methods
