@@ -670,6 +670,7 @@ namespace ASCTableStorage.Logging
         private readonly CircuitBreaker _circuitBreaker;
         private Task? _processTask;
         private CancellationTokenSource? _cancellationTokenSource;
+        private readonly object _bufferLock = new();
 
         /// <summary>
         /// The current logging statistics
@@ -722,7 +723,7 @@ namespace ASCTableStorage.Logging
             _processTask = ProcessLogsAsync(_cancellationTokenSource.Token);
 
             // Initialize cleanup timer
-            InitializeCleanupTimer();  // ADD THIS LINE
+            InitializeCleanupTimer();
             return Task.CompletedTask;
         }
 
@@ -736,18 +737,28 @@ namespace ASCTableStorage.Logging
             _flushTimer?.Change(Timeout.Infinite, 0);
             _queue.Writer.TryComplete();
 
-            // Give time to flush
             try
             {
+                // Flush any remaining logs in buffer
                 await FlushAsync();
-                await (_processTask ?? Task.CompletedTask).ConfigureAwait(false);
+
+                // Wait for processing to finish with timeout
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                cts.CancelAfter(TimeSpan.FromSeconds(10)); // Allow up to 10 seconds for graceful shutdown
+
+                if (_processTask != null)
+                {
+                    await Task.WhenAny(_processTask, Task.Delay(Timeout.Infinite, cts.Token));
+                }
             }
             catch
             {
                 // Best effort
             }
-
-            _cancellationTokenSource?.Cancel();
+            finally
+            {
+                _cancellationTokenSource?.Cancel();
+            }
         }
         /// <summary>
         /// Attempts to enqueue a log entry for processing
@@ -760,6 +771,9 @@ namespace ASCTableStorage.Logging
                 Interlocked.Increment(ref Statistics.TotalLogsQueued);
                 return true;
             }
+
+            // Optionally log dropped messages for debugging
+            Interlocked.Increment(ref Statistics.TotalLogsDropped);
             return false;
         }
         /// <summary>
@@ -770,10 +784,18 @@ namespace ASCTableStorage.Logging
             await _flushSemaphore.WaitAsync();
             try
             {
-                if (_buffer.Count > 0)
+                List<ApplicationLogEntry> toWrite;
+
+                // Safely extract items from buffer
+                lock (_bufferLock)
                 {
-                    await WriteBatchAsync(_buffer.ToList());
+                    toWrite = _buffer.ToList();
                     _buffer.Clear();
+                }
+
+                if (toWrite.Any())
+                {
+                    await WriteBatchAsync(toWrite);
                 }
                 Statistics.LastFlush = DateTime.UtcNow;
             }
@@ -790,7 +812,10 @@ namespace ASCTableStorage.Logging
         {
             await foreach (var entry in _queue.Reader.ReadAllAsync(cancellationToken))
             {
-                _buffer.Add(entry);
+                lock (_bufferLock)
+                {
+                    _buffer.Add(entry);
+                }
 
                 if (_buffer.Count >= _options.BatchSize)
                 {
@@ -846,7 +871,7 @@ namespace ASCTableStorage.Logging
                         }
                     }
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
                     _circuitBreaker.RecordFailure();
                     Interlocked.Add(ref Statistics.TotalLogsFailed, batch.Count);
@@ -855,6 +880,9 @@ namespace ASCTableStorage.Logging
                     {
                         batch.ForEach(FallbackLogger.Log);
                     }
+
+                    // Log exception details
+                    System.Diagnostics.Debug.WriteLine($"Error writing batch: {ex.Message}");
                 }
             }
         } // end WriteBatchAsync
@@ -1401,6 +1429,10 @@ namespace ASCTableStorage.Logging
         /// The total number of logs that failed to write
         /// </summary>
         public long TotalLogsFailed;
+        /// <summary>
+        /// Represents the total number of logs dropped due to a full queue
+        /// </summary>
+        public long TotalLogsDropped;
         /// <summary>
         /// The timestamp of the last successful flush
         /// </summary>
@@ -2163,5 +2195,43 @@ namespace ASCTableStorage.Logging
             };
         }
     } // end class ErrorLoggingServiceBridge
+
+    /// <summary>
+    /// Provides centralized access to a shared ILoggerFactory across assemblies.
+    /// Enables consistent logging without requiring dependency injection in every project.
+    /// </summary>
+    public static class RemoteLogger
+    {
+        /// <summary>
+        /// The shared logger factory instance used to create loggers.
+        /// Must be initialized once during application startup.
+        /// </summary>
+        public static ILoggerFactory Logger { get; set; } = default!;
+
+        /// <summary>
+        /// Creates a logger for the specified generic type.
+        /// Useful for type-scoped logging in shared or referenced assemblies.
+        /// </summary>
+        /// <typeparam name="T">The type whose name will be used as the logger category.</typeparam>
+        public static ILogger<T> CreateLogger<T>() => Logger.CreateLogger<T>();
+
+        /// <summary>
+        /// Creates a logger for the specified category name.
+        /// Allows custom categorization of logs across components.
+        /// </summary>
+        /// <param name="category">The category name for the logger.</param>
+        public static ILogger CreateLogger(string category) => Logger.CreateLogger(category);
+
+        /// <summary>
+        /// Initializes the shared logger factory.
+        /// Should be called once during application startup, typically in Program.cs.
+        /// </summary>
+        /// <param name="factory">The ILoggerFactory instance to share across assemblies.</param>
+        public static void Initialize(ILoggerFactory factory)
+        {
+            Logger = factory ?? throw new ArgumentNullException(nameof(factory));
+        }
+    }
+
     #endregion Client Side Setup
 }
