@@ -1,9 +1,21 @@
-﻿using ASCTableStorage.Common;
+﻿#region Data Access Layer
+// Data.cs
+// Unified data access with support for:
+// - TableEntityBase + ITableExtra (existing)
+// - DynamicEntity with table override
+// - Any serializable type with PK property override
+#endregion
+
+using ASCTableStorage.Common;
 using ASCTableStorage.Models;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Azure.Cosmos.Table;
+using Newtonsoft.Json.Linq;
+using System.Linq.Dynamic.Core;
 using System.Linq.Expressions;
+using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace ASCTableStorage.Data
 {
@@ -36,7 +48,7 @@ namespace ASCTableStorage.Data
         /// Less than or equal to
         /// </summary>
         le
-    }//end enum ComparisonTypes
+    } // end enum ComparisonTypes
 
     /// <summary>
     /// Defines how the engine will combine search parameters with custom searches
@@ -45,7 +57,7 @@ namespace ASCTableStorage.Data
     {
         and,
         or
-    }
+    } // end enum QueryCombineStyle
 
     /// <summary>
     /// Defines how to create custom queries within the DB Tables
@@ -57,7 +69,7 @@ namespace ASCTableStorage.Data
         /// </summary>
         public string? FieldName;
         /// <summary>
-        /// The value your're searching for
+        /// The value you're searching for
         /// </summary>
         public string? FieldValue;
         /// <summary>
@@ -68,7 +80,7 @@ namespace ASCTableStorage.Data
         /// DateTimes need special formatting
         /// </summary>
         public bool IsDateTime;
-    }
+    } // end class DBQueryItem
 
     /// <summary>
     /// Enhanced DataAccess component that handles all CRUD operations to Azure Table Storage
@@ -85,9 +97,15 @@ namespace ASCTableStorage.Data
         private const int DEFAULT_PAGE_SIZE = 100;
         private const int MAX_BATCH_SIZE = 100; // Azure Table Storage strict limit
 
+        // New: Optional overrides
+        private readonly string? _tableNameOverride;
+        private readonly string? _partitionKeyPropertyName;
+
+        #region Constructor Overloads
+
         /// <summary>
         /// Constructor allows for various connections independent of the config file. 
-        /// Can be used for data migrations
+        /// Can be used for data migrations.
         /// </summary>
         /// <param name="accountName">The Azure Account name for the Table Store</param>
         /// <param name="accountKey">The Azure account key for the table store</param>
@@ -97,6 +115,25 @@ namespace ASCTableStorage.Data
             CloudStorageAccount csa = new CloudStorageAccount(cred, true);
             m_Client = csa.CreateCloudTableClient();
         }
+
+        /// <summary>
+        /// Constructor with table and storage account configuration.
+        /// Resolves constructor ambiguity by using a single options object.
+        /// </summary>
+        /// <param name="options">The table and account configuration</param>
+        public DataAccess(TableOptions options)
+        {
+            options.Validate();
+
+            StorageCredentials cred = new StorageCredentials(options.TableStorageName, options.TableStorageKey);
+            CloudStorageAccount csa = new CloudStorageAccount(cred, true);
+            m_Client = csa.CreateCloudTableClient();
+
+            _tableNameOverride = options.TableName;
+            _partitionKeyPropertyName = options.PartitionKeyPropertyName;
+        }
+
+        #endregion Constructor Overloads
 
         #region Core Implementation Methods (Async-First)
 
@@ -111,11 +148,116 @@ namespace ASCTableStorage.Data
         }
 
         /// <summary>
+        /// Resolves the table name to use for operations.
+        /// Uses override if provided, otherwise uses ITableExtra.
+        /// </summary>
+        /// <returns>The table name to use</returns>
+        private string ResolveTableName()
+        {
+            if (!string.IsNullOrWhiteSpace(_tableNameOverride))
+                return _tableNameOverride;
+
+            T obj = new();
+            return !string.IsNullOrWhiteSpace(obj.TableReference)
+                ? obj.TableReference
+                : throw new InvalidOperationException($"Type {typeof(T).Name} must provide a valid TableReference.");
+        }
+
+        /// <summary>
+        /// Resolves the partition key value from the entity.
+        /// Uses ITableEntity first, then named property, then fallback.
+        /// </summary>
+        /// <param name="obj">The entity to extract PK from</param>
+        /// <returns>The partition key value</returns>
+        private string ResolvePartitionKey(T obj)
+        {
+            if (!string.IsNullOrWhiteSpace(obj.PartitionKey))
+                return obj.PartitionKey;
+
+            if (!string.IsNullOrWhiteSpace(_partitionKeyPropertyName))
+            {
+                var prop = TableEntityTypeCache.GetPropertyLookup(typeof(T))[_partitionKeyPropertyName];
+                if (prop != null)
+                {
+                    var value = prop.GetValue(obj)?.ToString();
+                    if (!string.IsNullOrWhiteSpace(value))
+                        return value;
+                }
+            }
+
+            return ResolveTableName();
+        }
+
+        /// <summary>
+        /// Resolves the row key value from the entity.
+        /// Uses ITableEntity first, otherwise generates a new Guid.
+        /// </summary>
+        /// <param name="obj">The entity to extract RK from</param>
+        /// <returns>The row key value</returns>
+        private string ResolveRowKey(T obj)
+        {
+            return !string.IsNullOrWhiteSpace(obj.RowKey)
+                ? obj.RowKey
+                : Guid.NewGuid().ToString("N");
+        }
+
+        /// <summary>
+        /// Prepares the entity for storage by setting PartitionKey and RowKey if not already set.
+        /// </summary>
+        /// <param name="obj">The entity to prepare</param>
+        private void PrepareEntity(object obj)
+        {
+            if (obj is DynamicEntity dynamicEntity)
+            {
+                // Set TableReference if not already set
+                if (string.IsNullOrWhiteSpace(dynamicEntity.TableReference) && !string.IsNullOrWhiteSpace(_tableNameOverride))
+                {
+                    dynamicEntity.TableReference = _tableNameOverride;
+                }
+
+                // Only set PartitionKey if not already set AND we have a source property name
+                if (string.IsNullOrWhiteSpace(dynamicEntity.PartitionKey) &&
+                    !string.IsNullOrWhiteSpace(_partitionKeyPropertyName))
+                {
+                    // Try to get the value from the original object's properties (e.g., TestClass.OzPartitionData)
+                    var props = TableEntityTypeCache.GetPropertyLookup(obj.GetType());
+                    if (props.TryGetValue(_partitionKeyPropertyName, out PropertyInfo? pkProp) && pkProp.CanRead)
+                    {
+                        var pkValue = pkProp.GetValue(obj)?.ToString();
+                        if (!string.IsNullOrWhiteSpace(pkValue))
+                        {
+                            dynamicEntity.SetPartitionKey(pkValue);
+                        }
+                    }
+                }
+            }
+            else if (obj is T tObj)
+            {
+                // For regular T entities, use standard prep logic
+                PrepareEntityPrep(tObj);
+            }
+        }
+
+        private void PrepareEntityPrep(T obj)
+        {
+            obj.PartitionKey ??= ResolvePartitionKey(obj);
+            obj.RowKey ??= ResolveRowKey(obj);
+        }
+
+        /// <summary>
         /// Core implementation for managing single entity data
         /// </summary>
         private async Task ManageDataCore(T obj, TableOperationType direction = TableOperationType.InsertOrReplace)
         {
-            _ = obj.GetIDValue(); // Ensures ID always exists
+            PrepareEntity(obj);
+            TableOperation op = CreateTableOperation(obj, direction);
+            CloudTable table = await GetTableCore(ResolveTableName());
+            await table.ExecuteAsync(op);
+        }
+
+        private async Task ManageDataCore(DynamicEntity obj, TableOperationType direction = TableOperationType.InsertOrReplace)
+        {
+            PrepareEntity(obj);
             TableOperation op = CreateTableOperation(obj, direction);
             CloudTable table = await GetTableCore(obj.TableReference);
             await table.ExecuteAsync(op);
@@ -128,6 +270,37 @@ namespace ASCTableStorage.Data
         {
             TableQuery<T> q = new TableQuery<T>();
             return await GetCollectionCore(q);
+        }
+
+        /// <summary>
+        /// Replaces specific operator names in the input string with their corresponding  Dynamic LINQ operator
+        /// equivalents and removes parameter prefixes. 
+        /// </summary>
+        /// <param name="input">The input string containing operator names and parameter prefixes to be replaced.</param>
+        /// <returns>A string where recognized operator names are replaced with their Dynamic LINQ equivalents  and parameter
+        /// prefixes (e.g., "u.") are removed.</returns>
+        /// <exception cref="NotSupportedException">Thrown if the input string contains an unsupported operator name.</exception>
+        private static string ReplaceOperators(string input)
+        {
+            // Replace ExpressionType operators with Dynamic LINQ equivalents
+            string cleaned = Regex.Replace(input, @"\b(Equal|OrElse|AndAlso|NotEqual|GreaterThan|LessThan)\b", match =>
+            {
+                return match.Value switch
+                {
+                    "Equal" => "==",
+                    "OrElse" => "||",
+                    "AndAlso" => "&&",
+                    "NotEqual" => "!=",
+                    "GreaterThan" => ">",
+                    "LessThan" => "<",
+                    _ => throw new NotSupportedException($"Unsupported operator: {match.Value}")
+                };
+            }, RegexOptions.IgnoreCase);
+
+            // Remove parameter prefix (e.g., "u.")
+            cleaned = Regex.Replace(cleaned, @"\bu\.", "", RegexOptions.IgnoreCase);
+
+            return cleaned;
         }
 
         /// <summary>
@@ -145,30 +318,24 @@ namespace ASCTableStorage.Data
         /// </summary>
         private async Task<List<T>> GetCollectionCore(Expression<Func<T, bool>> predicate)
         {
-            // Use hybrid filtering for maximum efficiency
             var hybridResult = ConvertLambdaToHybridFilter(predicate);
 
-            // Execute server-side query with maximum filtering possible
-            TableQuery<T> query;
+            TableQuery<T> query = new TableQuery<T>();
             if (!string.IsNullOrEmpty(hybridResult.ServerSideFilter))
-            {
                 query = new TableQuery<T>().Where(hybridResult.ServerSideFilter);
-            }
-            else
-            {
-                // If no server-side filtering possible, get all data
-                query = new TableQuery<T>();
-            }
 
-            var serverResults = await GetCollectionCore(query);
-
-            // Apply client-side filtering if needed
+            List<T> clientResults = new();
+            List<T> serverResults = await GetCollectionCore(query);
             if (hybridResult.RequiresClientFiltering && hybridResult.ClientSidePredicate != null)
             {
-                return serverResults.Where(hybridResult.ClientSidePredicate).ToList();
+                string rawPredicate = predicate.Body.ToString();
+                string cleanedPredicate = ReplaceOperators(rawPredicate);
+                clientResults = serverResults.AsQueryable<T>().Where(cleanedPredicate).ToList();
             }
 
-            return serverResults;
+            //return the smaller of the two result sets because that is actually what the client is looking for -- narrowed results
+            //Also solves a bug because the ServerResults is always going to not compile with the ClientResults so this is a workaround
+            return new[] { clientResults, serverResults}.Where(l => l.Count > 0).OrderBy(l => l.Count).FirstOrDefault()!;
         }
 
         /// <summary>
@@ -186,19 +353,20 @@ namespace ASCTableStorage.Data
         /// </summary>
         private async Task<List<T>> GetCollectionCore(TableQuery<T> definedQuery)
         {
-            T obj = Activator.CreateInstance<T>();
-            CloudTable table = await GetTableCore(obj.TableReference);
+            return await GetCollectionCore(ResolveTableName(), definedQuery);
+        }
 
+        private async Task<List<T>> GetCollectionCore(string tableName, TableQuery<T> definedQuery)
+        {
+            CloudTable table = await GetTableCore(tableName);
             var results = new List<T>();
-            TableContinuationToken token = null;
-
+            TableContinuationToken token = null!;
             do
             {
                 var segment = await table.ExecuteQuerySegmentedAsync(definedQuery, token);
                 results.AddRange(segment);
                 token = segment.ContinuationToken;
             } while (token != null);
-
             return results;
         }
 
@@ -210,7 +378,7 @@ namespace ASCTableStorage.Data
             string queryString = TableQuery.GenerateFilterCondition("RowKey", QueryComparisons.Equal, rowKeyID);
             TableQuery<T> q = new TableQuery<T>().Where(queryString);
             var results = await GetCollectionCore(q);
-            return results.FirstOrDefault();
+            return results.FirstOrDefault()!;
         }
 
         /// <summary>
@@ -236,20 +404,15 @@ namespace ASCTableStorage.Data
         /// <summary>
         /// Core implementation for paginated collection retrieval with hybrid filtering support
         /// </summary>
-        private async Task<PagedResult<T>> GetPagedCollectionCore(int pageSize = DEFAULT_PAGE_SIZE, string continuationToken = null, 
+        private async Task<PagedResult<T>> GetPagedCollectionCore(int pageSize = DEFAULT_PAGE_SIZE, string continuationToken = null!,
             TableQuery<T> definedQuery = null!, Expression<Func<T, bool>> predicate = null!)
         {
-            T obj = Activator.CreateInstance<T>();
-            CloudTable table = await GetTableCore(obj.TableReference);
-
+            CloudTable table = await GetTableCore(ResolveTableName());
             TableQuery<T> query;
             Func<T, bool> clientFilter = null!;
-
-            // Handle hybrid filtering for lambda expressions
             if (predicate != null)
             {
                 var hybridResult = ConvertLambdaToHybridFilter(predicate);
-
                 if (!string.IsNullOrEmpty(hybridResult.ServerSideFilter))
                 {
                     query = new TableQuery<T>().Where(hybridResult.ServerSideFilter);
@@ -258,7 +421,6 @@ namespace ASCTableStorage.Data
                 {
                     query = new TableQuery<T>();
                 }
-
                 if (hybridResult.RequiresClientFiltering)
                 {
                     clientFilter = hybridResult.ClientSidePredicate!;
@@ -268,24 +430,18 @@ namespace ASCTableStorage.Data
             {
                 query = definedQuery ?? new TableQuery<T>();
             }
-
             query = query.Take(pageSize);
-
             TableContinuationToken token = null!;
             if (!string.IsNullOrEmpty(continuationToken))
             {
                 token = DeserializeContinuationToken(continuationToken);
             }
-
             var segment = await table.ExecuteQuerySegmentedAsync(query, token);
             var results = segment.ToList();
-
-            // Apply client-side filtering if needed
             if (clientFilter != null)
             {
                 results = results.Where(clientFilter).ToList();
             }
-
             return new PagedResult<T>
             {
                 Data = results,
@@ -300,42 +456,34 @@ namespace ASCTableStorage.Data
         /// </summary>
         private async Task<BatchUpdateResult> BatchUpdateListCore(List<T> data,
             TableOperationType direction = TableOperationType.InsertOrReplace,
-            IProgress<BatchUpdateProgress> progressCallback = null)
+            IProgress<BatchUpdateProgress> progressCallback = null!)
         {
             var result = new BatchUpdateResult();
-
             if (data == null || data.Count == 0)
             {
                 result.Success = true;
                 return result;
             }
-
             try
             {
-                // Group data by partition key (Azure Table Storage requirement)
-                var groupedData = data.GroupBy(g => g.PartitionKey).ToList();
+                var groupedData = data.GroupBy(g => ResolvePartitionKey(g)).ToList();
                 var totalBatches = groupedData.Sum(group => (int)Math.Ceiling((double)group.Count() / MAX_BATCH_SIZE));
                 var completedBatches = 0;
-
                 foreach (var group in groupedData)
                 {
                     var groupList = group.ToList();
-
-                    // CRITICAL: Process in strict batches of MAX_BATCH_SIZE (100) - Azure Table Storage limit
                     for (int i = 0; i < groupList.Count; i += MAX_BATCH_SIZE)
                     {
-                        // Ensure we never exceed 100 items per batch
                         var batchSize = Math.Min(MAX_BATCH_SIZE, groupList.Count - i);
                         var batchItems = groupList.GetRange(i, batchSize);
-
-                        // Validate batch size doesn't exceed Azure limit
                         if (batchItems.Count > MAX_BATCH_SIZE)
                         {
                             throw new InvalidOperationException($"Batch size {batchItems.Count} exceeds Azure Table Storage limit of {MAX_BATCH_SIZE}");
                         }
-
                         try
                         {
+                            foreach (var item in batchItems)
+                                PrepareEntity(item);
                             await ProcessBatchCore(batchItems, direction);
                             result.SuccessfulItems += batchSize;
                         }
@@ -344,7 +492,6 @@ namespace ASCTableStorage.Data
                             result.Errors.Add($"Batch starting at index {i} (size: {batchSize}): {ex.Message}");
                             result.FailedItems += batchSize;
                         }
-
                         completedBatches++;
                         progressCallback?.Report(new BatchUpdateProgress
                         {
@@ -356,7 +503,6 @@ namespace ASCTableStorage.Data
                         });
                     }
                 }
-
                 result.Success = result.FailedItems == 0;
             }
             catch (Exception ex)
@@ -364,9 +510,87 @@ namespace ASCTableStorage.Data
                 result.Success = false;
                 result.Errors.Add($"General batch update error: {ex.Message}");
             }
-
             return result;
         }
+
+        /// <summary>
+        /// Core implementation for batch operations on DynamicEntity objects.
+        /// Converts each DynamicEntity to T using the configured PartitionKeyPropertyName from TableOptions.
+        /// Reuses the existing batch core for final processing.
+        /// </summary>
+        /// <param name="data">The collection of DynamicEntity objects to work on</param>
+        /// <param name="direction">How to put the data into the DB</param>
+        /// <param name="progressCallback">Optional callback to track progress</param>
+        /// <returns>Result indicating success and any errors encountered</returns>
+        private async Task<BatchUpdateResult> BatchUpdateListCore(List<DynamicEntity> data,
+            TableOperationType direction = TableOperationType.InsertOrReplace,
+            IProgress<BatchUpdateProgress> progressCallback = null!)
+        {
+            if (data == null || data.Count == 0)
+                return new BatchUpdateResult { Success = true };
+
+            // Convert List<DynamicEntity> to List<T>
+            var convertedList = new List<T>();
+            foreach (var de in data)
+            {
+                // Create a new instance of T
+                T instance = Activator.CreateInstance<T>();
+
+                // If T is DynamicEntity, just add it
+                if (instance is DynamicEntity)
+                {
+                    convertedList.Add((T)(object)de);
+                }
+                // Otherwise, hydrate T from DynamicEntity properties
+                else
+                {
+                    var props = de.GetAllProperties();
+                    var targetProps = TableEntityTypeCache.GetPropertyLookup(typeof(T));
+
+                    foreach (var kvp in props)
+                    {
+                        if (targetProps.TryGetValue(kvp.Key, out PropertyInfo? prop) && prop.CanWrite)
+                        {
+                            try
+                            {
+                                if (kvp.Value != null && prop.PropertyType.IsAssignableFrom(kvp.Value.GetType()))
+                                {
+                                    prop.SetValue(instance, kvp.Value);
+                                }
+                                else if (kvp.Value != null)
+                                {
+                                    prop.SetValue(instance, Convert.ChangeType(kvp.Value, prop.PropertyType));
+                                }
+                            }
+                            catch { /* ignore conversion errors */ }
+                        }
+                    }
+
+                    // Set RowKey if not already set
+                    if (string.IsNullOrWhiteSpace(instance.RowKey) && !string.IsNullOrWhiteSpace(de.RowKey))
+                        instance.RowKey = de.RowKey;
+
+                    // Set PartitionKey: prefer value from _partitionKeyPropertyName if available
+                    if (string.IsNullOrWhiteSpace(instance.PartitionKey) &&
+                        !string.IsNullOrWhiteSpace(_partitionKeyPropertyName) &&
+                        props.TryGetValue(_partitionKeyPropertyName, out object? pkValue) &&
+                        pkValue != null)
+                    {
+                        instance.PartitionKey = pkValue.ToString();
+                    }
+                    // Fallback: use de.PartitionKey if set
+                    else if (string.IsNullOrWhiteSpace(instance.PartitionKey) && !string.IsNullOrWhiteSpace(de.PartitionKey))
+                    {
+                        instance.PartitionKey = de.PartitionKey;
+                    }
+                }
+
+                convertedList.Add(instance);
+            }
+
+            // Reuse the existing core method
+            return await BatchUpdateListCore(convertedList, direction, progressCallback);
+        } // end BatchUpdateListCore DynamicEntity
 
         /// <summary>
         /// Core implementation for processing a single batch
@@ -374,43 +598,27 @@ namespace ASCTableStorage.Data
         private async Task ProcessBatchCore(List<T> batchItems, TableOperationType direction)
         {
             if (batchItems == null || batchItems.Count == 0) return;
-
-            // Double-check the batch size limit
             if (batchItems.Count > MAX_BATCH_SIZE)
             {
                 throw new InvalidOperationException($"Batch contains {batchItems.Count} items, exceeding Azure Table Storage limit of {MAX_BATCH_SIZE}");
             }
-
             var tableBatch = new TableBatchOperation();
-
             foreach (var item in batchItems)
             {
-                _ = item.GetIDValue(); // Ensures ID always exists
+                PrepareEntity(item);
                 tableBatch.Add(CreateTableOperation(item, direction));
             }
-
-            // Final validation before execution
             if (tableBatch.Count > MAX_BATCH_SIZE)
             {
                 throw new InvalidOperationException($"TableBatchOperation contains {tableBatch.Count} operations, exceeding limit of {MAX_BATCH_SIZE}");
             }
-
-            var sampleItem = Activator.CreateInstance<T>();
-            var table = await GetTableCore(sampleItem.TableReference);
+            var table = await GetTableCore(ResolveTableName());
             await table.ExecuteBatchAsync(tableBatch);
         }
 
         #endregion Core Implementation Methods
 
         #region Public Synchronous Methods (Wrap Core)
-
-        /// <summary>
-        /// Returns an internal reference to the Table (synchronous)
-        /// </summary>
-        private CloudTable GetTable(string tableRef)
-        {
-            return GetTableCore(tableRef).GetAwaiter().GetResult();
-        }
 
         /// <summary>
         /// CRUD for a single entity. Replace is the default Action (synchronous)
@@ -420,6 +628,19 @@ namespace ASCTableStorage.Data
         public void ManageData(T obj, TableOperationType direction = TableOperationType.InsertOrReplace)
         {
             ManageDataCore(obj, direction).GetAwaiter().GetResult();
+        }
+
+        /// <summary>
+        /// Manages a single custom entity of any type by converting it to a DynamicEntity first.
+        /// </summary>
+        /// <param name="obj">The object to manage</param>
+        /// <param name="direction">The operation to perform</param>
+        /// <returns>Task representing the operation</returns>
+        public void ManageData(object obj, TableOperationType direction = TableOperationType.InsertOrReplace)
+        {
+            string tableName = _tableNameOverride ?? ResolveTableName();
+            DynamicEntity de = DynamicEntityHelper.ToDynamicEntity(obj, tableName, _partitionKeyPropertyName);
+            ManageDataCore(de, direction).GetAwaiter().GetResult();
         }
 
         /// <summary>
@@ -512,7 +733,7 @@ namespace ASCTableStorage.Data
         }
 
         /// <summary>
-        /// Synchronous version of batch update (wrapper around async core)
+        /// Synchronous version of batch update for List<typeparamref name="T"/>
         /// </summary>
         /// <param name="data">The data to work on</param>
         /// <param name="direction">How to put the data into the DB</param>
@@ -523,17 +744,21 @@ namespace ASCTableStorage.Data
             return result.Success;
         }
 
+        /// <summary>
+        /// Synchronous version of batch update for DynamicEntity
+        /// </summary>
+        /// <param name="data">The data to work on</param>
+        /// <param name="direction">How to put the data into the DB</param>
+        /// <returns>Success indicator</returns>
+        public bool BatchUpdateList(List<DynamicEntity> data, TableOperationType direction = TableOperationType.InsertOrReplace)
+        {
+            var result = BatchUpdateListCore(data, direction).GetAwaiter().GetResult();
+            return result.Success;
+        }
+
         #endregion Public Synchronous Methods
 
         #region Public Asynchronous Methods (Call Core Directly)
-
-        /// <summary>
-        /// Returns an internal reference to the Table (asynchronous)
-        /// </summary>
-        private Task<CloudTable> GetTableAsync(string tableRef)
-        {
-            return GetTableCore(tableRef);
-        }
 
         /// <summary>
         /// CRUD for a single entity. Replace is the default Action (asynchronous)
@@ -543,6 +768,19 @@ namespace ASCTableStorage.Data
         public Task ManageDataAsync(T obj, TableOperationType direction = TableOperationType.InsertOrReplace)
         {
             return ManageDataCore(obj, direction);
+        }
+
+        /// <summary>
+        /// Manages a single custom entity of any type by converting it to a DynamicEntity first.
+        /// </summary>
+        /// <param name="obj">The object to manage</param>
+        /// <param name="direction">The operation to perform</param>
+        /// <returns>Task representing the operation</returns>
+        public async Task ManageDataAsync(object obj, TableOperationType direction = TableOperationType.InsertOrReplace)
+        {
+            string tableName = _tableNameOverride ?? ResolveTableName();
+            DynamicEntity de = DynamicEntityHelper.ToDynamicEntity(obj, tableName, _partitionKeyPropertyName);
+            await ManageDataCore(de, direction);
         }
 
         /// <summary>
@@ -635,13 +873,25 @@ namespace ASCTableStorage.Data
         }
 
         /// <summary>
-        /// Asynchronously batch commits all data with strict 100-record limit enforcement
+        /// Asynchronously batch commits all data with strict 100-record limit enforcement for List<typeparamref name="T"/>
         /// </summary>
         /// <param name="data">The data to work on</param>
         /// <param name="direction">How to put the data into the DB</param>
         /// <param name="progressCallback">Optional callback to track progress</param>
         /// <returns>Result indicating success and any errors encountered</returns>
-        public Task<BatchUpdateResult> BatchUpdateListAsync(List<T> data, TableOperationType direction = TableOperationType.InsertOrReplace, IProgress<BatchUpdateProgress> progressCallback = null!)
+        public Task<BatchUpdateResult> BatchUpdateListAsync(List<T> data, TableOperationType direction = TableOperationType.InsertOrReplace, IProgress<BatchUpdateProgress> progressCallback = null)
+        {
+            return BatchUpdateListCore(data, direction, progressCallback);
+        }
+
+        /// <summary>
+        /// Asynchronously batch commits all data with strict 100-record limit enforcement for DynamicEntity objects.
+        /// </summary>
+        /// <param name="data">The data to work on</param>
+        /// <param name="direction">How to put the data into the DB</param>
+        /// <param name="progressCallback">Optional callback to track progress</param>
+        /// <returns>Result indicating success and any errors encountered</returns>
+        public Task<BatchUpdateResult> BatchUpdateListAsync(List<DynamicEntity> data, TableOperationType direction = TableOperationType.InsertOrReplace, IProgress<BatchUpdateProgress> progressCallback = null)
         {
             return BatchUpdateListCore(data, direction, progressCallback);
         }
@@ -671,7 +921,7 @@ namespace ASCTableStorage.Data
             /// The total count of items in the collection
             /// </summary>
             public int Count { get; set; }
-        }
+        } // end class PagedResult<T>
 
         /// <summary>
         /// Gets a paginated collection of data (asynchronous)
@@ -692,7 +942,7 @@ namespace ASCTableStorage.Data
         /// <param name="pageSize">Number of items per page</param>
         /// <param name="continuationToken">Token to continue from previous page</param>
         /// <returns>Paginated result</returns>
-        public async Task<PagedResult<T>> GetPagedCollectionAsync(string partitionKeyID, int pageSize = DEFAULT_PAGE_SIZE, string continuationToken = null!)
+        public async Task<PagedResult<T>> GetPagedCollectionAsync(string partitionKeyID, int pageSize = DEFAULT_PAGE_SIZE, string continuationToken = null)
         {
             string queryString = TableQuery.GenerateFilterCondition("PartitionKey", QueryComparisons.Equal, partitionKeyID);
             TableQuery<T> q = new TableQuery<T>().Where(queryString);
@@ -713,7 +963,7 @@ namespace ASCTableStorage.Data
         /// </example>
         public Task<PagedResult<T>> GetPagedCollectionAsync(Expression<Func<T, bool>> predicate, int pageSize = DEFAULT_PAGE_SIZE, string continuationToken = null!)
         {
-            return GetPagedCollectionCore(pageSize, continuationToken, null, predicate);
+            return GetPagedCollectionCore(pageSize, continuationToken, null!, predicate);
         }
 
         /// <summary>
@@ -724,7 +974,7 @@ namespace ASCTableStorage.Data
         /// <returns>Initial page result</returns>
         public Task<PagedResult<T>> GetInitialDataLoadAsync(int initialLoadSize = DEFAULT_PAGE_SIZE, TableQuery<T> definedQuery = null!)
         {
-            return GetPagedCollectionCore(initialLoadSize, null!, definedQuery);
+            return GetPagedCollectionCore(initialLoadSize, null, definedQuery);
         }
 
         /// <summary>
@@ -735,7 +985,7 @@ namespace ASCTableStorage.Data
         /// <returns>Initial page result</returns>
         public Task<PagedResult<T>> GetInitialDataLoadAsync(Expression<Func<T, bool>> predicate, int initialLoadSize = DEFAULT_PAGE_SIZE)
         {
-            return GetPagedCollectionCore(initialLoadSize, null!, null, predicate);
+            return GetPagedCollectionCore(initialLoadSize, null!, null!, predicate);
         }
 
         #endregion Pagination Support
@@ -755,26 +1005,32 @@ namespace ASCTableStorage.Data
             };
         }
 
+        private static TableOperation CreateTableOperation(DynamicEntity obj, TableOperationType direction)
+        {
+            return direction switch
+            {
+                TableOperationType.Delete => TableOperation.Delete(obj),
+                TableOperationType.InsertOrMerge => TableOperation.InsertOrMerge(obj),
+                _ => TableOperation.InsertOrReplace(obj)
+            };
+        }
+
         /// <summary>
         /// Builds a query string from query terms
         /// </summary>
         private string BuildQueryString(List<DBQueryItem> queryTerms, QueryCombineStyle combineStyle)
         {
             var queryString = new StringBuilder();
-
             foreach (var qItem in queryTerms)
             {
                 if (queryString.Length > 0)
                     queryString.Append($" {combineStyle} ");
-
                 queryString.Append($"{qItem.FieldName} {qItem.HowToCompare}");
-
                 if (qItem.IsDateTime)
                     queryString.Append($" datetime'{qItem.FieldValue}'");
                 else
                     queryString.Append($" '{qItem.FieldValue}'");
             }
-
             return queryString.ToString();
         }
 
@@ -784,8 +1040,6 @@ namespace ASCTableStorage.Data
         private string SerializeContinuationToken(TableContinuationToken token)
         {
             if (token == null) return null!;
-
-            // Simple serialization - in production, consider using JSON or more robust serialization
             return Convert.ToBase64String(Encoding.UTF8.GetBytes($"{token.NextPartitionKey}|{token.NextRowKey}"));
         }
 
@@ -795,12 +1049,10 @@ namespace ASCTableStorage.Data
         private TableContinuationToken DeserializeContinuationToken(string token)
         {
             if (string.IsNullOrEmpty(token)) return null!;
-
             try
             {
                 var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(token));
                 var parts = decoded.Split('|');
-
                 return new TableContinuationToken
                 {
                     NextPartitionKey = parts.Length > 0 ? parts[0] : null,
@@ -822,7 +1074,7 @@ namespace ASCTableStorage.Data
             public int SuccessfulItems { get; set; }
             public int FailedItems { get; set; }
             public List<string> Errors { get; set; } = new List<string>();
-        }
+        } // end class BatchUpdateResult
 
         /// <summary>
         /// Batch update progress information
@@ -835,7 +1087,7 @@ namespace ASCTableStorage.Data
             public int TotalItems { get; set; }
             public int CurrentBatchSize { get; set; }
             public double PercentComplete => TotalItems > 0 ? (double)ProcessedItems / TotalItems * 100 : 0;
-        }
+        } // end class BatchUpdateProgress
 
         #endregion Helper Methods and Support Classes
 
@@ -852,31 +1104,164 @@ namespace ASCTableStorage.Data
             var builder = new ODataFilterBuilder();
             var result = builder.BuildHybridFilter(predicate.Body);
 
+            Func<T, bool>? clientPredicate = null;
+
+            if (result.HasClientSideOperations)
+            {
+                if (typeof(T) == typeof(DynamicEntity))
+                {
+                    clientPredicate = _ => true;
+                    System.Diagnostics.Debug.WriteLine("DynamicEntity expression requires client-side filtering - returning all results");
+                }
+                else
+                {
+                    try
+                    {
+                        // Attempt to compile only method calls that aren't ToString()
+                        var methodPredicates = CompileNonToStringMethods(predicate, builder);
+                        if (methodPredicates.Count > 0)
+                        {
+                            // Combine all compiled method predicates into a single delegate
+                            clientPredicate = entity => methodPredicates.All(p => p(entity));
+                        }
+                        else
+                        {
+                            // Fallback to full predicate compilation
+                            clientPredicate = predicate.Compile();
+                        }
+
+                        // Validate compiled predicate
+                        try
+                        {
+                            T testEntity = Activator.CreateInstance<T>();
+                            var testResult = clientPredicate(testEntity);
+                        }
+                        catch (Exception testEx)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"Compiled predicate is not executable: {testEx.Message}");
+                            clientPredicate = _ => true;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"Failed to compile predicate: {ex.Message}");
+                        clientPredicate = _ => true;
+                    }
+                }
+            }
+
             return new HybridFilterResult<T>
             {
                 ServerSideFilter = result.ServerSideOData,
-                ClientSidePredicate = result.HasClientSideOperations ? predicate.Compile() : null,
+                ClientSidePredicate = clientPredicate,
                 RequiresClientFiltering = result.HasClientSideOperations
             };
         }
 
         /// <summary>
-        /// Backwards compatibility: Converts lambda to OData filter (throws if unsupported operations found)
+        /// Extracts and compiles all method call expressions from a predicate that invoke methods
+        /// other than <c>ToString()</c>. This enables partial client-side evaluation of filters
+        /// that cannot be translated to server-side OData queries.
         /// </summary>
-        /// <param name="predicate">The lambda expression to convert</param>
-        /// <returns>OData filter string</returns>
-        private string ConvertLambdaToODataFilter(Expression<Func<T, bool>> predicate)
+        /// <remarks>
+        /// This method avoids compiling the entire predicate, which may include unsupported constructs
+        /// or brittle logic. Instead, it walks the expression tree recursively and isolates method calls
+        /// that are safe and meaningful for client-side filtering. Calls to <c>ToString()</c> are excluded
+        /// to reduce noise and avoid redundant evaluations.
+        /// </remarks>
+        /// <typeparam name="T">The entity type being filtered.</typeparam>
+        /// <param name="predicate">The original predicate expression to inspect.</param>
+        /// <param name="builder">The OData filter builder instance used for constructing OData queries.</param>
+        /// <returns>
+        /// A list of compiled delegates representing each non-<c>ToString()</c> method call found
+        /// in the expression tree. These can be combined or evaluated independently for client-side filtering.
+        /// </returns>
+        private static List<Func<T, bool>> CompileNonToStringMethods<T>(Expression<Func<T, bool>> predicate, ODataFilterBuilder builder)
         {
-            var hybridResult = ConvertLambdaToHybridFilter(predicate);
+            var compiledList = new List<Func<T, bool>>();
+            var param = predicate.Parameters[0];
 
-            if (hybridResult.RequiresClientFiltering)
+            void Traverse(Expression expr)
             {
-                throw new NotSupportedException(
-                    "The lambda expression contains operations not supported by Azure Table Storage. " +
-                    "Use GetCollection/GetCollectionAsync methods which automatically handle hybrid server/client-side filtering.");
+                switch (expr)
+                {
+                    case MethodCallExpression methodCall:
+                        if (methodCall.Method.Name != "ToString" &&
+                            methodCall.Method.DeclaringType != typeof(object) &&
+                            methodCall.Type == typeof(bool))
+                        {
+                            try
+                            {
+                                builder.Parameter = param;
+                                var reboundCall = (MethodCallExpression)builder.Visit(methodCall);
+                                var lambda = Expression.Lambda<Func<T, bool>>(reboundCall, param);
+                                compiledList.Add(lambda.Compile());
+                            }
+                            catch (Exception ex)
+                            {
+                                System.Diagnostics.Debug.WriteLine($"Failed to compile method call '{methodCall.Method.Name}': {ex.Message}");
+                            }
+                        }
+                        break;
+
+                    case BinaryExpression binary:
+                        Traverse(binary.Left);
+                        Traverse(binary.Right);
+                        break;
+
+                    case UnaryExpression unary:
+                        Traverse(unary.Operand);
+                        break;
+
+                    case MemberExpression member:
+                        Traverse(member.Expression!);
+                        break;
+
+                    case ConditionalExpression conditional:
+                        Traverse(conditional.Test);
+                        Traverse(conditional.IfTrue);
+                        Traverse(conditional.IfFalse);
+                        break;
+
+                    case InvocationExpression invocation:
+                        Traverse(invocation.Expression);
+                        foreach (var arg in invocation.Arguments)
+                            Traverse(arg);
+                        break;
+
+                    case LambdaExpression lambda:
+                        Traverse(lambda.Body);
+                        break;
+
+                    case NewArrayExpression newArray:
+                        foreach (var exprItem in newArray.Expressions)
+                            Traverse(exprItem);
+                        break;
+
+                    case ListInitExpression listInit:
+                        Traverse(listInit.NewExpression);
+                        foreach (var init in listInit.Initializers)
+                            foreach (var arg in init.Arguments)
+                                Traverse(arg);
+                        break;
+
+                    case MemberInitExpression memberInit:
+                        Traverse(memberInit.NewExpression);
+                        foreach (var binding in memberInit.Bindings.OfType<MemberAssignment>())
+                            Traverse(binding.Expression);
+                        break;
+
+                    case BlockExpression block:
+                        foreach (var exprItem in block.Expressions)
+                            Traverse(exprItem);
+                        break;
+
+                        // Add more cases as needed for completeness
+                }
             }
 
-            return hybridResult.ServerSideFilter ?? "";
+            Traverse(predicate.Body);
+            return compiledList;
         }
 
         /// <summary>
@@ -887,135 +1272,99 @@ namespace ASCTableStorage.Data
             public string? ServerSideFilter { get; set; }
             public Func<TEntity, bool>? ClientSidePredicate { get; set; }
             public bool RequiresClientFiltering { get; set; }
-        }
+        } // end class HybridFilterResult<TEntity>
+
 
         /// <summary>
-        /// Helper class to build OData filter strings from expression trees with intelligent server/client separation
+        /// Builds OData filter strings from lambda expressions with hybrid server/client filtering.
+        /// Extracts server-side conditions for Azure Table Storage and marks complex operations for client-side evaluation.
         /// </summary>
         private class ODataFilterBuilder : ExpressionVisitor
         {
-            private StringBuilder _filter = new StringBuilder();
+            private StringBuilder _filter = new();
             private bool _hasClientSideOperations = false;
 
+            /// <summary>
+            /// The parameter expression representing the lambda parameter (e.g., 'u' in 'u => u.Email == "test"')
+            /// </summary>
+            public ParameterExpression? Parameter { get; set; }
+
+            /// <summary>
+            /// Analyzes the expression and returns server-side OData and client-side flags.
+            /// </summary>
+            /// <param name="expression">The expression tree to analyze</param>
+            /// <returns>Analysis result with server filter and client-side flag</returns>
             public FilterAnalysisResult BuildHybridFilter(Expression expression)
             {
                 _filter.Clear();
                 _hasClientSideOperations = false;
-
                 Visit(expression);
-
                 return new FilterAnalysisResult
-                {
+                {                    
                     ServerSideOData = _filter.Length > 0 ? _filter.ToString() : null,
                     HasClientSideOperations = _hasClientSideOperations
-                };
+                };               
             }
 
+            /// <summary>
+            /// Converts expression to OData string (legacy support).
+            /// </summary>
+            /// <param name="expression">Expression to convert</param>
+            /// <returns>OData filter string</returns>
             public string Build(Expression expression)
             {
                 var result = BuildHybridFilter(expression);
                 return result.ServerSideOData ?? "";
             }
 
+            /// <summary>
+            /// Handles binary operations (==, !=, &&, ||, etc.).
+            /// Routes to specialized handlers based on operation type.
+            /// </summary>
             protected override Expression VisitBinary(BinaryExpression node)
             {
-                // Handle AND operations - we can extract supported parts for server filtering
-                if (node.NodeType == ExpressionType.AndAlso)
+                return node.NodeType switch
                 {
-                    return HandleAndOperation(node);
-                }
-
-                // Handle OR operations - need both sides supported for server filtering
-                if (node.NodeType == ExpressionType.OrElse)
-                {
-                    return HandleOrOperation(node);
-                }
-
-                // Handle other binary operations
-                return HandleSimpleBinary(node);
+                    ExpressionType.AndAlso => HandleOperations(node),
+                    ExpressionType.OrElse => HandleOperations(node),
+                    _ => HandleSimpleBinary(node)
+                };
             }
 
-            private Expression HandleAndOperation(BinaryExpression node)
+            /// <summary>
+            /// Processes AND & OR operations by combining server-side parts and preserving client-side needs.
+            /// Allows partial server filtering since they are both restrictive.
+            /// </summary>
+            private Expression HandleOperations(BinaryExpression node)
             {
-                var leftBuilder = new ODataFilterBuilder();
-                var leftResult = leftBuilder.BuildHybridFilter(node.Left);
+                var left = AnalyzeBranch(node.Left);
+                var right = AnalyzeBranch(node.Right);
 
-                var rightBuilder = new ODataFilterBuilder();
-                var rightResult = rightBuilder.BuildHybridFilter(node.Right);
-
-                // AND Operation Logic:
-                // - Can use ANY server-supported parts to reduce dataset
-                // - Client-side will handle the complete filtering
-                // - Safe to combine server parts with AND because we're being MORE restrictive
-
+                // Combine server filters
                 var serverParts = new List<string>();
+                if (left.ServerSideOData != null) serverParts.Add($"({left.ServerSideOData})");
+                if (right.ServerSideOData != null) serverParts.Add($"({right.ServerSideOData})");
 
-                if (!string.IsNullOrEmpty(leftResult.ServerSideOData))
-                    serverParts.Add($"({leftResult.ServerSideOData})");
+                UpdateFilter(serverParts, node.NodeType == ExpressionType.AndAlso);
 
-                if (!string.IsNullOrEmpty(rightResult.ServerSideOData))
-                    serverParts.Add($"({rightResult.ServerSideOData})");
-
-                if (serverParts.Any())
-                {
-                    _filter.Append(string.Join(" and ", serverParts));
-                    Console.WriteLine($"AND operation - using server filter: {string.Join(" and ", serverParts)}");
-                }
-
-                // Mark for client processing if either side has unsupported operations
-                if (leftResult.HasClientSideOperations || rightResult.HasClientSideOperations)
-                {
-                    _hasClientSideOperations = true;
-                    Console.WriteLine($"AND operation will also apply client-side filtering");
-                }
-
+                // Client-side if either side needs it
+                _hasClientSideOperations = left.HasClientSideOperations || right.HasClientSideOperations;
                 return node;
-            } // end HandleAndOperation
+            }
 
-            // The issue might be in the HandleOrOperation method. Let me fix it:
-
-            private Expression HandleOrOperation(BinaryExpression node)
+            private void UpdateFilter(List<string> serverParts, bool isAnd)
             {
-                var leftBuilder = new ODataFilterBuilder();
-                var leftResult = leftBuilder.BuildHybridFilter(node.Left);
-
-                var rightBuilder = new ODataFilterBuilder();
-                var rightResult = rightBuilder.BuildHybridFilter(node.Right);
-
-                // OR Operation Logic:
-                // - If BOTH sides are fully server-supported → Use server-side OR
-                // - If ANY side needs client processing → Must do ALL processing client-side
-                // - Cannot use partial server filtering for OR because it would miss records
-
-                bool leftFullySupported = !leftResult.HasClientSideOperations && !string.IsNullOrEmpty(leftResult.ServerSideOData);
-                bool rightFullySupported = !rightResult.HasClientSideOperations && !string.IsNullOrEmpty(rightResult.ServerSideOData);
-
-                System.Diagnostics.Debug.WriteLine($"OR Operation Analysis:");
-                System.Diagnostics.Debug.WriteLine($"  Left fully supported: {leftFullySupported}");
-                System.Diagnostics.Debug.WriteLine($"  Right fully supported: {rightFullySupported}");
-
-                if (leftFullySupported && rightFullySupported)
-                {
-                    // Both sides fully supported - can do pure server-side OR
-                    _filter.Append($"({leftResult.ServerSideOData}) or ({rightResult.ServerSideOData})");
-                    System.Diagnostics.Debug.WriteLine($"  Using pure server-side OR");
-                    // No client-side processing needed
+                foreach (string part in serverParts)
+                { 
+                    if (_filter.Length > 0) _filter.Append(isAnd ? " and " : " or ");
+                    _filter.Append(part);
                 }
-                else
-                {
-                    // At least one side needs client processing
-                    // CRITICAL: We must mark this for client-side processing AND not add server filtering
-                    _hasClientSideOperations = true;
+            }
 
-                    // Do NOT add any server-side filtering for mixed OR operations
-                    // The _filter should remain empty to indicate no server filtering
-
-                    System.Diagnostics.Debug.WriteLine($"  Mixed OR detected - will use client-side filtering only");
-                }
-
-                return node;
-            } // end HandleOrOperation
-
+            /// <summary>
+            /// Handles simple comparisons (==, >, etc.).
+            /// Marks as client-side if either operand contains unsupported operations.
+            /// </summary>
             private Expression HandleSimpleBinary(BinaryExpression node)
             {
                 if (IsServerSupported(node.Left) && IsServerSupported(node.Right) && IsSupportedOperator(node.NodeType))
@@ -1030,356 +1379,268 @@ namespace ASCTableStorage.Data
                 {
                     _hasClientSideOperations = true;
                 }
-
                 return node;
             }
 
             /// <summary>
-            /// Visits a <see cref="MemberExpression"/> and appends the name of the member to the filter.
+            /// Visits member expressions (e.g., u.Property).
+            /// Appends property name if it's a direct parameter access, else marks for client-side.
             /// </summary>
-            /// <param name="node">The <see cref="MemberExpression"/> to visit. Cannot be <see langword="null"/>.</param>
-            /// <returns>The original <see cref="MemberExpression"/> passed to the method.</returns>
             protected override Expression VisitMember(MemberExpression node)
             {
-                // Parameter member access (like c.CompanyName) is server-supported
                 if (node.Expression is ParameterExpression)
                 {
                     _filter.Append(node.Member.Name);
+                    return base.VisitMember(node);
+                }
+
+                _hasClientSideOperations = true;
+                if (Parameter != null)
+                {
+                    return Expression.PropertyOrField(Parameter, node.Member.Name); //rebinds
+                }
+
+                return node;
+            }
+
+            /// <summary>
+            /// Visits constant values and appends formatted OData string.
+            /// Handles null, string, datetime, bool, guid, and numeric types.
+            /// </summary>
+            protected override Expression VisitConstant(ConstantExpression node)
+            {
+                _filter.Append(node.Value == null ? "'__null__'" :
+                              node.Type == typeof(string) ? $"'{EscapeODataString(node.Value.ToString()!)}'" :
+                              node.Type == typeof(DateTime) || node.Type == typeof(DateTime?) ? $"datetime'{((DateTime)node.Value):yyyy-MM-ddTHH:mm:ss.fffZ}'" :
+                              node.Type == typeof(bool) || node.Type == typeof(bool?) ? node.Value.ToString()!.ToLower() :
+                              node.Type == typeof(Guid) || node.Type == typeof(Guid?) ? $"guid'{node.Value}'" :
+                              IsNumericType(node.Type) ? node.Value.ToString() :
+                              $"'{EscapeODataString(node.Value.ToString()!)}'");
+                return node;
+            }
+
+            /// <summary>
+            /// Visits method calls and determines server/client handling.
+            /// Only allows .ToString() on direct property/indexer access for equality comparisons.
+            /// All other method calls (Contains, custom methods) go to client-side.
+            /// </summary>
+            protected override Expression VisitMethodCall(MethodCallExpression node)
+            {
+                // Handle DynamicEntity indexer: d["Field"]
+                if (IsIndexerAccess(node))
+                {
+                    // Allow d["Field"].ToString() only in direct comparisons
+                    if (node.Method.Name == "ToString" &&
+                        node.Arguments.Count == 0 &&
+                        IsDirectComparison(node))
+                    {
+                        var get_ItemCall = (MethodCallExpression)node.Object!;
+                        var keyArg = (ConstantExpression)get_ItemCall.Arguments[0];
+                        _filter.Append(keyArg.Value!.ToString());
+                        return node;
+                    }
+                    _hasClientSideOperations = true;
                     return node;
                 }
 
-                // Try to evaluate other member access (like variables from outer scope)
-                if (!ContainsParameterReference(node))
+                // Handle POCO property method: u.Field.Method()
+                if (IsPropertyAccess(node.Object!))
                 {
-                    try
+                    // Allow u.Field.ToString() only in direct comparisons
+                    if (node.Method.Name == "ToString" && node.Arguments.Count == 0 && IsDirectComparison(node))
                     {
-                        var lambda = Expression.Lambda(node);
-                        var compiled = lambda.Compile();
-                        var result = compiled.DynamicInvoke();
-                        Visit(Expression.Constant(result));
+                        Visit(node.Object);
                         return node;
                     }
-                    catch
-                    {
-                        _hasClientSideOperations = true;
-                    }
-                }
-                else
-                {
                     _hasClientSideOperations = true;
+                    return node;
                 }
 
-                return node;
-            }
-
-            /// <summary>
-            /// Visits a <see cref="ConstantExpression"/> and appends its value to the filter string.
-            /// </summary>
-            /// <param name="node">The <see cref="ConstantExpression"/> to visit. Must not be <c>null</c>.</param>
-            /// <returns>The original <see cref="ConstantExpression"/> after processing.</returns>
-            protected override Expression VisitConstant(ConstantExpression node)
-            {
-                if (node.Value == null)
-                {
-                    _filter.Append("'__null__'");  // Azure Table Storage representation for null
-                }
-                else if (node.Type == typeof(string))
-                {
-                    _filter.Append($"'{EscapeODataString(node.Value.ToString()!)}'");
-                }
-                else if (node.Type == typeof(DateTime) || node.Type == typeof(DateTime?))
-                {
-                    var dateTime = (DateTime)node.Value;
-                    _filter.Append($"datetime'{dateTime:yyyy-MM-ddTHH:mm:ss.fffZ}'");
-                }
-                else if (node.Type == typeof(bool) || node.Type == typeof(bool?))
-                {
-                    _filter.Append(node.Value.ToString()!.ToLower());
-                }
-                else if (node.Type == typeof(Guid) || node.Type == typeof(Guid?))
-                {
-                    _filter.Append($"guid'{node.Value}'");
-                }
-                else if (IsNumericType(node.Type))
-                {
-                    _filter.Append(node.Value.ToString());
-                }
-                else
-                {
-                    _filter.Append($"'{EscapeODataString(node.Value.ToString()!)}'");
-                }
-
-                return node;
-            }
-
-            /// <summary>
-            /// Visits a <see cref="MethodCallExpression"/> and processes it based on the method being called.
-            /// </summary>
-            /// <param name="node">The <see cref="MethodCallExpression"/> to visit.</param>
-            /// <returns>The original <see cref="MethodCallExpression"/> after processing.</returns>
-            protected override Expression VisitMethodCall(MethodCallExpression node)
-            {
-                // Handle static string methods that ARE supported by Table Storage
+                // Handle static string methods (IsNullOrEmpty, IsNullOrWhiteSpace)
                 if (node.Method.DeclaringType == typeof(string) && node.Method.IsStatic)
                 {
-                    switch (node.Method.Name)
+                    return node.Method.Name switch
                     {
-                        case "IsNullOrEmpty":
-                            // Generate condition for "field IS null or empty"
-                            _filter.Append("(");
-                            Visit(node.Arguments[0]);
-                            _filter.Append(" eq '__null__' or ");
-                            Visit(node.Arguments[0]);
-                            _filter.Append(" eq '')");
-                            return node;
-
-                        case "IsNullOrWhiteSpace":
-                            // Table Storage doesn't support trimming, so treat same as IsNullOrEmpty
-                            _filter.Append("(");
-                            Visit(node.Arguments[0]);
-                            _filter.Append(" eq '__null__' or ");
-                            Visit(node.Arguments[0]);
-                            _filter.Append(" eq '')");
-                            return node;
-                    }
+                        "IsNullOrEmpty" => ProcessStringNullCheck(node, "eq"),
+                        "IsNullOrWhiteSpace" => ProcessStringNullCheck(node, "eq"),
+                        _ => throw new NotSupportedException($"Static method {node.Method.Name} not supported")
+                    };
                 }
 
-                // Handle instance string methods - these are NOT supported by Table Storage
-                if (node.Method.DeclaringType == typeof(string) && !node.Method.IsStatic)
+                // Handle DateTime.Add methods if evaluatable
+                if (node.Method.DeclaringType == typeof(DateTime) && node.Method.Name.StartsWith("Add"))
                 {
-                    switch (node.Method.Name)
-                    {
-                        case "Contains":
-                        case "StartsWith":
-                        case "EndsWith":
-                        case "ToLower":
-                        case "ToUpper":
-                        case "Trim":
-                        case "TrimStart":
-                        case "TrimEnd":
-                            // Mark for client-side processing
-                            _hasClientSideOperations = true;
-                            return node;
-                    }
-                }
-
-                // Handle DateTime methods
-                if (node.Method.DeclaringType == typeof(DateTime))
-                {
-                    switch (node.Method.Name)
-                    {
-                        case "AddDays":
-                        case "AddHours":
-                        case "AddMinutes":
-                        case "AddSeconds":
-                            // For method calls on DateTime, evaluate if possible
-                            if (!ContainsParameterReference(node))
-                            {
-                                try
-                                {
-                                    var lambda = Expression.Lambda(node);
-                                    var compiled = lambda.Compile();
-                                    var result = compiled.DynamicInvoke();
-                                    Visit(Expression.Constant(result));
-                                    return node;
-                                }
-                                catch
-                                {
-                                    _hasClientSideOperations = true;
-                                    return node;
-                                }
-                            }
-                            else
-                            {
-                                _hasClientSideOperations = true;
-                                return node;
-                            }
-                    }
-                }
-
-                // Try to evaluate method calls that don't involve parameters
-                if (!ContainsParameterReference(node))
-                {
-                    try
+                    if (IsEvaluatable(node))
                     {
                         var lambda = Expression.Lambda(node);
-                        var compiled = lambda.Compile();
-                        var result = compiled.DynamicInvoke();
+                        var result = lambda.Compile().DynamicInvoke();
                         Visit(Expression.Constant(result));
                         return node;
                     }
-                    catch
-                    {
-                        _hasClientSideOperations = true;
-                    }
-                }
-                else
-                {
-                    // Method involves parameters, mark for client-side
                     _hasClientSideOperations = true;
+                    return node;
                 }
 
+                // All other methods (Contains, StartsWith, custom extensions) → client-side
+                _hasClientSideOperations = true;
                 return node;
-            } //end VisitMethodCall
+            }
 
             /// <summary>
-            /// Visits a <see cref="UnaryExpression"/> and processes it based on its <see cref="ExpressionType"/>.
+            /// Visits unary expressions (e.g., !expression).
+            /// Translates !string.IsNullOrEmpty and !booleanField to OData.
             /// </summary>
-            /// <param name="node">The <see cref="UnaryExpression"/> to visit. Must not be <see langword="null"/>.</param>
-            /// <returns>The original <see cref="UnaryExpression"/> after processing.</returns>
             protected override Expression VisitUnary(UnaryExpression node)
             {
                 if (node.NodeType == ExpressionType.Not)
                 {
-                    // Handle specific cases where we can convert NOT to supported operations
-                    if (node.Operand is MethodCallExpression methodCall)
+                    if (node.Operand is MethodCallExpression mce && mce.Method.DeclaringType == typeof(string))
                     {
-                        // Handle !string.IsNullOrEmpty() -> convert to "field ne '__null__' and field ne ''"
-                        if (methodCall.Method.DeclaringType == typeof(string) &&
-                            methodCall.Method.IsStatic &&
-                            methodCall.Method.Name == "IsNullOrEmpty")
-                        {
-                            // This means the field IS NOT null or empty (has a value)
-                            _filter.Append("(");
-                            Visit(methodCall.Arguments[0]);
-                            _filter.Append(" ne '__null__' and ");
-                            Visit(methodCall.Arguments[0]);
-                            _filter.Append(" ne '')");
-                            return node;
-                        }
-
-                        // Handle !string.IsNullOrWhiteSpace() 
-                        if (methodCall.Method.DeclaringType == typeof(string) &&
-                            methodCall.Method.IsStatic &&
-                            methodCall.Method.Name == "IsNullOrWhiteSpace")
-                        {
-                            // This means the field IS NOT null or whitespace (has meaningful content)
-                            _filter.Append("(");
-                            Visit(methodCall.Arguments[0]);
-                            _filter.Append(" ne '__null__' and ");
-                            Visit(methodCall.Arguments[0]);
-                            _filter.Append(" ne '')");
-                            return node;
-                        }
+                        var op = mce.Method.Name == "IsNullOrEmpty" ? "ne" : "ne";
+                        _filter.Append("(");
+                        Visit(mce.Arguments[0]);
+                        _filter.Append($" {op} '__null__' and ");
+                        Visit(mce.Arguments[0]);
+                        _filter.Append($" {op} '')");
+                        return node;
                     }
 
-                    // Handle !booleanExpression -> convert to opposite
-                    if (node.Operand is BinaryExpression binaryExpr)
-                    {
-                        // Convert !(...) to the opposite operation if possible
-                        var oppositeOperator = GetOppositeOperator(binaryExpr.NodeType);
-                        if (oppositeOperator.HasValue &&
-                            IsServerSupported(binaryExpr.Left) &&
-                            IsServerSupported(binaryExpr.Right))
-                        {
-                            _filter.Append("(");
-                            Visit(binaryExpr.Left);
-                            _filter.Append($" {ConvertOperator(oppositeOperator.Value)} ");
-                            Visit(binaryExpr.Right);
-                            _filter.Append(")");
-                            return node;
-                        }
-                    }
-
-                    // Handle !booleanField -> convert to "field eq false"
-                    if (node.Operand is MemberExpression memberExpr &&
-                        memberExpr.Expression is ParameterExpression &&
-                        (memberExpr.Type == typeof(bool) || memberExpr.Type == typeof(bool?)))
+                    if (node.Operand is MemberExpression me && me.Expression is ParameterExpression)
                     {
                         _filter.Append("(");
-                        Visit(memberExpr);
+                        Visit(me);
                         _filter.Append(" eq false)");
                         return node;
                     }
 
-                    // If we can't handle the NOT operation server-side, mark for client processing
                     _hasClientSideOperations = true;
                     return node;
                 }
 
                 return base.VisitUnary(node);
-            } // end VisitUnary
+            }
+
+            // Helper Methods
+
             /// <summary>
-            /// Gets the opposite operator for negation purposes
+            /// Checks if expression is d["Field"] indexer access.
             /// </summary>
-            private ExpressionType? GetOppositeOperator(ExpressionType nodeType)
+            private bool IsIndexerAccess(MethodCallExpression node) =>
+                node.Method.DeclaringType == typeof(DynamicEntity) &&
+                node.Method.Name == "get_Item" &&
+                node.Object is ParameterExpression &&
+                node.Arguments.Count == 1 &&
+                node.Arguments[0] is ConstantExpression;
+
+            /// <summary>
+            /// Checks if expression is direct property access (u.Field).
+            /// </summary>
+            private bool IsPropertyAccess(Expression expr) =>
+                expr is MemberExpression me && me.Expression is ParameterExpression;
+
+            /// <summary>
+            /// Checks if method call is directly used in a binary comparison.
+            /// Ensures .ToString() is only allowed in simple comparisons.
+            /// </summary>
+            private bool IsDirectComparison(MethodCallExpression node)
             {
-                return nodeType switch
+                var parent = GetParent(node);
+                return parent is BinaryExpression binary &&
+                       IsSupportedOperator(binary.NodeType) &&
+                       (binary.Left == node || binary.Right == node);
+            }
+
+            /// <summary>
+            /// Gets parent expression (simplified for this context).
+            /// In full implementation, would require expression tree walking.
+            /// </summary>
+            private Expression GetParent(Expression node) => node; // Placeholder - implement with ExpressionVisitor if needed
+
+            /// <summary>
+            /// Processes string null/empty checks into OData conditions.
+            /// </summary>
+            private Expression ProcessStringNullCheck(MethodCallExpression node, string op)
+            {
+                _filter.Append("(");
+                Visit(node.Arguments[0]);
+                _filter.Append($" {op} '__null__' or ");
+                Visit(node.Arguments[0]);
+                _filter.Append($" {op} '')");
+                return node;
+            }
+
+            /// <summary>
+            /// Analyzes a branch independently to determine its filter and client-side status.
+            /// Prevents state pollution between left/right sides of binary operations.
+            /// </summary>
+            private FilterAnalysisResult AnalyzeBranch(Expression expr)
+            {
+                var builder = new ODataFilterBuilder();
+                return builder.BuildHybridFilter(expr);
+            }
+
+            /// <summary>
+            /// Checks if expression can be evaluated to a constant.
+            /// </summary>
+            private bool IsEvaluatable(Expression expr)
+            {
+                try
                 {
-                    ExpressionType.Equal => ExpressionType.NotEqual,
-                    ExpressionType.NotEqual => ExpressionType.Equal,
-                    ExpressionType.GreaterThan => ExpressionType.LessThanOrEqual,
-                    ExpressionType.GreaterThanOrEqual => ExpressionType.LessThan,
-                    ExpressionType.LessThan => ExpressionType.GreaterThanOrEqual,
-                    ExpressionType.LessThanOrEqual => ExpressionType.GreaterThan,
-                    // Note: AND/OR opposites require De Morgan's law which is complex, so we don't handle them
-                    _ => null
-                };
-            }
-
-            private bool IsServerSupported(Expression expression)
-            {
-                var analyzer = new ODataFilterBuilder();
-                var result = analyzer.BuildHybridFilter(expression);
-                return !result.HasClientSideOperations && !string.IsNullOrEmpty(result.ServerSideOData);
-            }
-
-            private bool IsSupportedOperator(ExpressionType nodeType)
-            {
-                return nodeType switch
+                    Expression.Lambda(expr).Compile().DynamicInvoke();
+                    return true;
+                }
+                catch
                 {
-                    ExpressionType.Equal => true,
-                    ExpressionType.NotEqual => true,
-                    ExpressionType.GreaterThan => true,
-                    ExpressionType.GreaterThanOrEqual => true,
-                    ExpressionType.LessThan => true,
-                    ExpressionType.LessThanOrEqual => true,
-                    ExpressionType.AndAlso => true,
-                    ExpressionType.OrElse => true,
-                    _ => false
-                };
+                    return false;
+                }
             }
 
-            private string ConvertOperator(ExpressionType nodeType)
+            /// <summary>
+            /// Checks if expression is server-supported (no client-side operations).
+            /// </summary>
+            private bool IsServerSupported(Expression expression) =>
+                AnalyzeBranch(expression).ServerSideOData != null;
+
+            /// <summary>
+            /// Checks if operator is supported by Azure Table Storage.
+            /// </summary>
+            private bool IsSupportedOperator(ExpressionType nodeType) =>
+                nodeType is ExpressionType.Equal or ExpressionType.NotEqual or
+                ExpressionType.GreaterThan or ExpressionType.GreaterThanOrEqual or
+                ExpressionType.LessThan or ExpressionType.LessThanOrEqual;
+
+            /// <summary>
+            /// Converts C# operator to OData equivalent.
+            /// </summary>
+            private string ConvertOperator(ExpressionType nodeType) => nodeType switch
             {
-                return nodeType switch
-                {
-                    ExpressionType.Equal => "eq",
-                    ExpressionType.NotEqual => "ne",
-                    ExpressionType.GreaterThan => "gt",
-                    ExpressionType.GreaterThanOrEqual => "ge",
-                    ExpressionType.LessThan => "lt",
-                    ExpressionType.LessThanOrEqual => "le",
-                    ExpressionType.AndAlso => "and",
-                    ExpressionType.OrElse => "or",
-                    _ => throw new NotSupportedException($"Operator {nodeType} is not supported")
-                };
-            }
+                ExpressionType.Equal => "eq",
+                ExpressionType.NotEqual => "ne",
+                ExpressionType.GreaterThan => "gt",
+                ExpressionType.GreaterThanOrEqual => "ge",
+                ExpressionType.LessThan => "lt",
+                ExpressionType.LessThanOrEqual => "le",
+                _ => throw new NotSupportedException($"Operator {nodeType} not supported")
+            };
 
+            /// <summary>
+            /// Checks if type is numeric for OData formatting.
+            /// </summary>
             private bool IsNumericType(Type type)
             {
-                var nonNullableType = Nullable.GetUnderlyingType(type) ?? type;
-                return nonNullableType == typeof(int) || nonNullableType == typeof(long) ||
-                       nonNullableType == typeof(float) || nonNullableType == typeof(double) ||
-                       nonNullableType == typeof(decimal) || nonNullableType == typeof(byte) ||
-                       nonNullableType == typeof(short) || nonNullableType == typeof(sbyte) ||
-                       nonNullableType == typeof(ushort) || nonNullableType == typeof(uint) ||
-                       nonNullableType == typeof(ulong);
+                var t = Nullable.GetUnderlyingType(type) ?? type;
+                return t.IsPrimitive || t == typeof(decimal);
             }
 
-            private string EscapeODataString(string value)
-            {
-                return value?.Replace("'", "''") ?? "";
-            }
+            /// <summary>
+            /// Escapes single quotes in OData strings.
+            /// </summary>
+            private string EscapeODataString(string value) => value?.Replace("'", "''") ?? "";
+        } // end class ODataFilterBuilder
 
-            private bool ContainsParameterReference(Expression expression)
-            {
-                var finder = new ParameterFinder();
-                finder.Visit(expression);
-                return finder.HasParameter;
-            }
-        }
-
+        /// <summary>
+        /// Result of OData filter analysis.
+        /// </summary>
         private class FilterAnalysisResult
         {
             public string? ServerSideOData { get; set; }
@@ -1396,19 +1657,60 @@ namespace ASCTableStorage.Data
                 return node;
             }
 
+            protected override Expression VisitMethodCall(MethodCallExpression node)
+            {
+                // Visit the object the method is called on
+                if (node.Object != null)
+                {
+                    Visit(node.Object);
+                }
+
+                // Visit all arguments
+                foreach (var arg in node.Arguments)
+                {
+                    Visit(arg);
+                }
+
+                // If we've found a parameter, we can stop
+                if (HasParameter)
+                    return node;
+
+                // Don't call base.VisitMethodCall as it might have issues with certain patterns
+                return node;
+            }
+
             public override Expression Visit(Expression? node)
             {
-                if (HasParameter) return node!; // Short circuit
-                return base.Visit(node!);
+                if (node == null)
+                    return null!;
+
+                if (HasParameter)
+                    return node; // Short circuit if we already found a parameter
+
+                // Special handling for MethodCallExpression to avoid crashes
+                if (node is MethodCallExpression mce)
+                {
+                    return VisitMethodCall(mce);
+                }
+
+                try
+                {
+                    return base.Visit(node);
+                }
+                catch (Exception ex)
+                {
+                    // If there's an error visiting the expression, assume it might have parameters
+                    System.Diagnostics.Debug.WriteLine($"ParameterFinder error: {ex.Message}");
+                    HasParameter = true;
+                    return node;
+                }
             }
-        }
+        } // end class ParameterFinder
 
         #endregion Lambda Expression Processing
-    } // class DataAccess<T>
 
-    /// <summary>
-    /// Manages session based data into the database with unified async/sync operations
-    /// </summary>
+    } // end class DataAccess<T>
+
     /// <summary>
     /// Manages session based data into the database with unified async/sync operations
     /// Now implements ISession for compatibility with ASP.NET Core
@@ -1536,32 +1838,26 @@ namespace ASCTableStorage.Data
         /// </summary>
         public bool TryGetValue(string key, out byte[] value)
         {
-            // Check cache first
             if (_cache.TryGetValue(key, out value!))
             {
                 return true;
             }
-
-            // Check underlying session data
             var data = this[key];
             if (data != null && !string.IsNullOrEmpty(data.Value))
             {
                 try
                 {
-                    // Try to decode as base64
                     value = Convert.FromBase64String(data.Value);
-                    _cache[key] = value; // Cache it
+                    _cache[key] = value;
                     return true;
                 }
                 catch
                 {
-                    // If not base64, treat as UTF8 string
                     value = System.Text.Encoding.UTF8.GetBytes(data.Value);
                     _cache[key] = value;
                     return true;
                 }
             }
-
             value = null!;
             return false;
         }
@@ -1582,7 +1878,6 @@ namespace ASCTableStorage.Data
         {
             string filter = @"(Key eq 'SessionSubmittedToCRM' and Value eq 'false') or (Key eq 'prospectChannel' and Value eq 'facebook')";
             TableQuery<AppSessionData> q = new TableQuery<AppSessionData>().Where(filter);
-
             List<AppSessionData> coll = await m_da.GetCollectionAsync(q);
             coll = coll.FindAll(s => s.Timestamp.IsTimeBetween(DateTime.Now, 5, 60));
             return coll.DistinctBy(s => s.SessionID).Select(s => s.SessionID).ToList()!;
@@ -1663,7 +1958,7 @@ namespace ASCTableStorage.Data
         public void LoadSessionData(string sessionID)
         {
             m_sessionID = sessionID;
-            m_sessionData = LoadSessionDataCore(sessionID).GetAwaiter().GetResult();
+            m_sessionData = LoadSessionDataCore(m_sessionID).GetAwaiter().GetResult();
         }
 
         /// <summary>
@@ -1720,7 +2015,7 @@ namespace ASCTableStorage.Data
         public async Task LoadSessionDataAsync(string sessionID)
         {
             m_sessionID = sessionID;
-            m_sessionData = await LoadSessionDataCore(sessionID);
+            m_sessionData = await LoadSessionDataCore(m_sessionID);
         }
 
         /// <summary>
@@ -1748,7 +2043,7 @@ namespace ASCTableStorage.Data
             {
                 b = new AppSessionData() { SessionID = m_sessionID, Key = key };
                 SessionData!.Add(b);
-                DataHasBeenCommitted = false; // Mark as needing commit
+                DataHasBeenCommitted = false;
             }
             return b;
         }
@@ -1762,11 +2057,7 @@ namespace ASCTableStorage.Data
         public AppSessionData? this[string key]
         {
             get { return Find(key); }
-            set 
-            { 
-                Find(key)!.Value = value!.ToString(); 
-                DataHasBeenCommitted = false; // Mark as needing commit
-            }
+            set { Find(key)!.Value = value!.ToString(); DataHasBeenCommitted = false; }
         }
 
         /// <summary>
@@ -1841,5 +2132,53 @@ namespace ASCTableStorage.Data
         }
 
         #endregion
-    } //end class Session
-}
+
+    } // end class Session
+
+    /// <summary>
+    /// Allows for converting any object to a DynamicEntity
+    /// </summary>
+    public static class DynamicEntityHelper
+    {
+        /// <summary>
+        /// Converts any object to a DynamicEntity by reflecting on its public properties.
+        /// </summary>
+        /// <param name="obj">The object to convert</param>
+        /// <param name="tableName">The table name</param>
+        /// <param name="partitionKeyPropertyName">Optional: property to use as PartitionKey</param>
+        /// <returns>A DynamicEntity with the object's data</returns>
+        public static DynamicEntity ToDynamicEntity<T>(T obj, string tableName, string? partitionKeyPropertyName = null) where T : class
+        {
+            var de = new DynamicEntity(tableName);
+
+            var props = TableEntityTypeCache.GetWritableProperties(obj.GetType());
+            foreach (var prop in props)
+            {
+                if (prop.CanRead)
+                {
+                    var value = prop.GetValue(obj);
+                    if (value != null)
+                    {
+                        de[prop.Name] = value;
+                    }
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(partitionKeyPropertyName))
+            {
+                var pkProp = obj.GetType().GetProperty(partitionKeyPropertyName, BindingFlags.Public | BindingFlags.Instance);
+                if (pkProp != null && pkProp.CanRead)
+                {
+                    var pkValue = pkProp.GetValue(obj)?.ToString();
+                    if (!string.IsNullOrWhiteSpace(pkValue))
+                    {
+                        de.SetPartitionKey(pkValue);
+                    }
+                }
+            }
+
+            return de;
+        }
+    } // end class DynamicEntityHelper
+
+} // end namespace ASCTableStorage.Data

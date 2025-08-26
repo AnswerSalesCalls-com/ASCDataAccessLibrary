@@ -586,7 +586,7 @@ namespace ASCTableStorage.Models
         /// <summary>
         /// Maintains an inner list of the available properties and their assigned values
         /// </summary>
-        public IDictionary<string, object> DynamicProperties => _properties;
+        IDictionary<string, object> IDynamicProperties.DynamicProperties => _properties;
 
         #endregion IDynamicProperties Implementation
 
@@ -604,14 +604,18 @@ namespace ASCTableStorage.Models
             if (value == null)
             {
                 _properties.TryRemove(name, out _);
+                return;
             }
-            else
-            {
-                _properties[name] = value;
 
-                // Re-evaluate keys if they're still using defaults
-                ReevaluateKeysIfNeeded(name, value);
-            }
+            _properties[name] = value is string or bool or char
+                or byte or sbyte or short or ushort or int or uint
+                or long or ulong or float or double or decimal
+                or DateTime or DateTimeOffset or Guid
+                    ? value
+                    : JsonConvert.SerializeObject(value);
+
+            // Optional: re-evaluate keys if needed
+            ReevaluateKeysIfNeeded(name, _properties[name]);
         }
 
         /// <summary>
@@ -667,22 +671,38 @@ namespace ASCTableStorage.Models
         /// </summary>
         /// <typeparam name="T">The datatype of the property</typeparam>
         /// <param name="name">The name of the property</param>
-        public T GetProperty<T>(string name)
+        public T? GetProperty<T>(string name)
         {
-            if (_properties.TryGetValue(name, out var value))
+            if (string.IsNullOrWhiteSpace(name))
+                return default;
+
+            if (!_properties.TryGetValue(name, out var value))
+                return default;
+
+            // 1. Exact match?
+            if (value is T tValue)
+                return tValue;
+
+            // 2. Is it null?
+            if (value == null)
+                return default;
+
+            // 3. If T is a string, return .ToString() (except for objects)
+            if (typeof(T) == typeof(string))
+                return (T)(object)value.ToString()!;
+
+            // 4. Assume it's a JSON string and deserialize
+            try
             {
-                if (value is T typedValue)
-                    return typedValue;
-                try
-                {
-                    return (T)Convert.ChangeType(value, typeof(T));
-                }
-                catch
-                {
-                    return default!;
-                }
+                string json = value as string
+                    ?? JsonConvert.SerializeObject(value); // Boxed primitives, etc.
+
+                return JsonConvert.DeserializeObject<T>(json);
             }
-            return default!;
+            catch
+            {
+                return default;
+            }
         }
 
         /// <summary>
@@ -809,6 +829,7 @@ namespace ASCTableStorage.Models
             return _writablePropertiesCache.GetOrAdd(type, t =>
                 t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
                  .Where(p => p.CanWrite)
+                 .Where(p => p.GetIndexParameters().Length == 0) // ✅ Skip indexers
                  .ToArray());
         }
 
@@ -875,14 +896,21 @@ namespace ASCTableStorage.Models
             var processedProps = new HashSet<string>();
 
             // Find string overflow fields
-            var overflowFields = props.Where(p => p.Value.PropertyType == EdmType.String && p.Key.Contains(fieldExtendedName)).ToList();
+            var overflowFields = props
+                .Where(p => p.Value.PropertyType == EdmType.String && p.Key.Contains(fieldExtendedName))
+                .ToList();
+
             if (overflowFields.Any())
             {
-                // Process chunked fields
-                List<string> origFieldNames = overflowFields.Select(p => p.Key.Substring(0, p.Key.IndexOf(fieldExtendedName))).Distinct().ToList();
+                List<string> origFieldNames = overflowFields
+                    .Select(p => p.Key.Substring(0, p.Key.IndexOf(fieldExtendedName)))
+                    .Distinct()
+                    .ToList();
+
                 foreach (string origField in origFieldNames)
                 {
-                    overflowFields.Insert(0, new KeyValuePair<string, EntityProperty>(origField, props[origField]));
+                    if (props.TryGetValue(origField, out var baseProp))
+                        overflowFields.Insert(0, new KeyValuePair<string, EntityProperty>(origField, baseProp));
                     processedProps.Add(origField);
                 }
 
@@ -911,12 +939,16 @@ namespace ASCTableStorage.Models
                     }
                 }
 
-                // Use cached property lookup instead of repeated LINQ searches
                 foreach (var data in propData)
                 {
                     if (propertyLookup.TryGetValue(data.Key, out var prop))
                     {
-                        prop.SetValue(this, data.Value);
+                        try
+                        {
+                            object? val = ConvertValue(data.Value, prop.PropertyType);
+                            prop.SetValue(this, val);
+                        }
+                        catch { }
                     }
                     else if (this is IDynamicProperties dynamic)
                     {
@@ -929,7 +961,9 @@ namespace ASCTableStorage.Models
             var systemProps = new HashSet<string> { "PartitionKey", "RowKey", "Timestamp", "ETag", "odata.etag" };
 
             // Process all other fields
-            var nonOverflowFields = props.Where(p => !processedProps.Contains(p.Key) && !systemProps.Contains(p.Key) && !p.Key.StartsWith("odata."));
+            var nonOverflowFields = props
+                .Where(p => !processedProps.Contains(p.Key) && !systemProps.Contains(p.Key) && !p.Key.StartsWith("odata."));
+
             foreach (var f in nonOverflowFields)
             {
                 processedProps.Add(f.Key);
@@ -938,22 +972,60 @@ namespace ASCTableStorage.Models
                 {
                     try
                     {
-                        // Use cached type check for DateTime
-                        if (TableEntityTypeCache.IsDateTimeType(prop.PropertyType))
-                            prop.SetValue(this, Convert.ToDateTime(f.Value.PropertyAsObject));
-                        else if (prop.PropertyType.IsEnum)
-                            prop.SetValue(this, Enum.Parse(prop.PropertyType, f.Value.ToString()));
-                        else
-                            prop.SetValue(this, Convert.ChangeType(f.Value.PropertyAsObject, prop.PropertyType));
+                        object? val = ConvertValue(f.Value, prop.PropertyType);
+                        prop.SetValue(this, val);
                     }
-                    catch (Exception) { }
+                    catch { }
                 }
                 else if (this is IDynamicProperties dynamic)
                 {
                     dynamic.DynamicProperties[f.Key] = ConvertFromEntityProperty(f.Value)!;
                 }
             }
-        } //end ReadEntity
+        } // end ReadEntity
+
+        /// <summary>
+        /// Converts a value to the target type, with special handling for DateTime, Enum, and JSON-deserializable objects
+        /// </summary>
+        private object? ConvertValue(object? value, Type targetType)
+        {
+            if (value == null) return null;
+
+            // Handle DateTime
+            if (TableEntityTypeCache.IsDateTimeType(targetType))
+                return Convert.ToDateTime(value);
+
+            // Handle Enum
+            if (targetType.IsEnum)
+                return Enum.Parse(targetType, value.ToString()!);
+
+            // Handle nullable
+            Type underlyingType = Nullable.GetUnderlyingType(targetType) ?? targetType;
+
+            // If it's a string and target is not string, try JSON deserialization
+            if (value is string stringValue && targetType != typeof(string))
+            {
+                try
+                {
+                    // If it looks like JSON, try to deserialize
+                    if (stringValue.StartsWith("{") || stringValue.StartsWith("["))
+                    {
+                        return JsonConvert.DeserializeObject(stringValue, underlyingType);
+                    }
+                }
+                catch { /* ignore */ }
+            }
+
+            // Try direct conversion
+            try
+            {
+                return Convert.ChangeType(value, underlyingType);
+            }
+            catch
+            {
+                return value;
+            }
+        } // end ConvertValue()
 
         /// <summary>
         /// Serialize the data to the database chunking any large data blocks into separated DB fields
@@ -963,35 +1035,52 @@ namespace ASCTableStorage.Models
         {
             Dictionary<string, EntityProperty> ret = new();
 
-            // Get cached properties once instead of using reflection each time
+            // Get cached properties once
             var properties = TableEntityTypeCache.GetWritableProperties(this.GetType());
 
             foreach (PropertyInfo pI in properties)
             {
+                object? value = null;
+                try
+                {
+                    value = pI.GetValue(this);
+                }
+                catch
+                {
+                    continue; // Skip properties that throw on read
+                }
+
+                if (value == null)
+                    continue;
+
+                // Handle string with chunking
                 if (pI.PropertyType == typeof(string))
                 {
-                    var currValue = (string)pI.GetValue(this)!;
-                    if (!string.IsNullOrEmpty(currValue) && currValue.Length > maxFieldSize)
+                    string strValue = (string)value;
+                    if (strValue.Length > maxFieldSize)
                     {
-                        // Chunk large strings
-                        int cursor = 0;
-                        int howManyChunks = (int)Math.Ceiling((double)currValue.Length / maxFieldSize);
-                        for (int i = 0; i < howManyChunks; i++)
-                        {
-                            int charsToGrab = Math.Min(maxFieldSize, (currValue.Length - cursor));
-                            string fieldName = (i == 0) ? pI.Name : pI.Name + fieldExtendedName + i.ToString();
-                            ret.Add(fieldName, new EntityProperty(currValue.Substring(cursor, charsToGrab)));
-                            cursor += charsToGrab;
-                        }
+                        ChunkString(pI.Name, strValue, ret);
                     }
                     else
                     {
-                        ret.Add(pI.Name, new EntityProperty(currValue));
+                        ret.Add(pI.Name, new EntityProperty(strValue));
                     }
                 }
                 else
                 {
-                    ret.Add(pI.Name, EntityProperty.CreateEntityPropertyFromObject(pI.GetValue(this)));
+                    // Serialize ANY complex type to JSON
+                    EntityProperty? entityProp = TrySerializeComplexType(value);
+                    if (entityProp != null)
+                    {
+                        if (entityProp.PropertyType == EdmType.String && entityProp.StringValue?.Length > maxFieldSize)
+                        {
+                            ChunkString(pI.Name, entityProp.StringValue, ret);
+                        }
+                        else
+                        {
+                            ret.Add(pI.Name, entityProp);
+                        }
+                    }
                 }
             }
 
@@ -1003,23 +1092,14 @@ namespace ASCTableStorage.Models
                     if (ret.ContainsKey(prop.Key))
                         continue;
 
-                    // Handle string chunking for dynamic properties
-                    if (prop.Value is string strValue && !string.IsNullOrEmpty(strValue) && strValue.Length > maxFieldSize)
+                    EntityProperty? entityProp = TrySerializeComplexType(prop.Value);
+                    if (entityProp != null)
                     {
-                        int cursor = 0;
-                        int howManyChunks = (int)Math.Ceiling((double)strValue.Length / maxFieldSize);
-                        for (int i = 0; i < howManyChunks; i++)
+                        if (entityProp.PropertyType == EdmType.String && entityProp.StringValue?.Length > maxFieldSize)
                         {
-                            int charsToGrab = Math.Min(maxFieldSize, (strValue.Length - cursor));
-                            string fieldName = (i == 0) ? prop.Key : prop.Key + fieldExtendedName + i.ToString();
-                            ret.Add(fieldName, new EntityProperty(strValue.Substring(cursor, charsToGrab)));
-                            cursor += charsToGrab;
+                            ChunkString(prop.Key, entityProp.StringValue, ret);
                         }
-                    }
-                    else
-                    {
-                        var entityProp = ConvertToEntityProperty(prop.Value);
-                        if (entityProp != null)
+                        else
                         {
                             ret.Add(prop.Key, entityProp);
                         }
@@ -1029,6 +1109,25 @@ namespace ASCTableStorage.Models
 
             return ret;
         } // end WriteEntity
+
+        /// <summary>
+        /// Chunks a large string into multiple fields with extension suffix
+        /// </summary>
+        /// <param name="baseName">The base field name</param>
+        /// <param name="value">The large string value</param>
+        /// <param name="result">The result dictionary to populate</param>
+        private void ChunkString(string baseName, string value, Dictionary<string, EntityProperty> result)
+        {
+            int cursor = 0;
+            int howManyChunks = (int)Math.Ceiling((double)value.Length / maxFieldSize);
+            for (int i = 0; i < howManyChunks; i++)
+            {
+                int charsToGrab = Math.Min(maxFieldSize, (value.Length - cursor));
+                string fieldName = (i == 0) ? baseName : baseName + fieldExtendedName + i.ToString();
+                result.Add(fieldName, new EntityProperty(value.Substring(cursor, charsToGrab)));
+                cursor += charsToGrab;
+            }
+        }
 
         private static EntityProperty? ConvertToEntityProperty(object? value) =>
             value switch
@@ -1045,7 +1144,7 @@ namespace ASCTableStorage.Models
                 byte[] bytes => new EntityProperty(bytes),
                 float f => new EntityProperty((double)f),
                 decimal dec => new EntityProperty(Convert.ToDouble(dec)),
-                _ => new EntityProperty(value.ToString())
+                _ => TrySerializeComplexType(value)
             };
 
         private static object? ConvertFromEntityProperty(EntityProperty? prop) =>
@@ -1061,7 +1160,96 @@ namespace ASCTableStorage.Models
                 EdmType.Int64 => prop.Int64Value,
                 _ => prop.PropertyAsObject
             };
+
+        /// <summary>
+        /// Attempts to serialize complex types (IDictionary, IEnumerable, custom objects) to JSON
+        /// </summary>
+        private static EntityProperty TrySerializeComplexType(object value)
+        {
+            Type type = value.GetType();
+
+            // Let Azure handle known types
+            if (IsSupportedByAzure(type))
+                return EntityProperty.CreateEntityPropertyFromObject(value);
+
+            // Serialize everything else to JSON
+            try
+            {
+                string json = JsonConvert.SerializeObject(value);
+                return new EntityProperty(json);
+            }
+            catch
+            {
+                // Fallback to ToString() if serialization fails
+                return new EntityProperty(value.ToString() ?? string.Empty);
+            }
+        }
+
+        /// <summary>
+        /// Checks if a type is natively supported by Azure Table Storage
+        /// </summary>
+        private static bool IsSupportedByAzure(Type type)
+        {
+            return type == typeof(string) ||
+                   type == typeof(int) || type == typeof(int?) ||
+                   type == typeof(long) || type == typeof(long?) ||
+                   type == typeof(bool) || type == typeof(bool?) ||
+                   type == typeof(double) || type == typeof(double?) ||
+                   type == typeof(float) || type == typeof(float?) ||
+                   type == typeof(decimal) || type == typeof(decimal?) ||
+                   type == typeof(DateTime) || type == typeof(DateTime?) ||
+                   type == typeof(DateTimeOffset) || type == typeof(DateTimeOffset?) ||
+                   type == typeof(Guid) || type == typeof(Guid?) ||
+                   type == typeof(byte[]) ||
+                   (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Nullable<>));
+        }
     }//End Class TableEntityBase
+
+    /// <summary>
+    /// Represents configuration options for table operations in DataAccess.
+    /// Allows overriding table name and key property names for types that don't implement ITableEntity semantics.
+    /// </summary>
+    public class TableOptions
+    {
+        /// <summary>
+        /// Gets or sets the name of the table to use.
+        /// If not provided, the type T must implement ITableExtra and provide TableReference.
+        /// </summary>
+        public string? TableName { get; set; }
+
+        /// <summary>
+        /// Gets or sets the name of the property on T to use as PartitionKey.
+        /// If not provided, PartitionKey is used from ITableEntity or derived from context.
+        /// </summary>
+        public string? PartitionKeyPropertyName { get; set; }
+
+        /// <summary>
+        /// Gets or sets the Azure Storage account name.
+        /// Required unless using a shared CloudTableClient.
+        /// </summary>
+        public string? TableStorageName { get; set; }
+
+        /// <summary>
+        /// Gets or sets the Azure Storage account key.
+        /// Required unless using a shared CloudTableClient.
+        /// </summary>
+        public string? TableStorageKey { get; set; }
+
+        /// <summary>
+        /// Validates that the required options are set.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">Thrown if TableStorageName or TableStorageKey are missing.</exception>
+        public void Validate()
+        {
+            if (string.IsNullOrWhiteSpace(TableStorageName))
+                throw new InvalidOperationException($"{nameof(TableStorageName)} is required.");
+            if (string.IsNullOrWhiteSpace(TableStorageKey))
+                throw new InvalidOperationException($"{nameof(TableStorageKey)} is required.");
+            if (string.IsNullOrWhiteSpace(TableName))
+                throw new InvalidOperationException($"{nameof(TableName)} is required.");
+
+        }
+    } // End Class TableOptions
 
     /// <summary>
     /// Represents a row of data for the Session Table
