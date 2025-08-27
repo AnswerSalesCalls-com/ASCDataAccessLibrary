@@ -32,7 +32,6 @@
       </PackageReleaseNotes>
       <PackageLicenseFile>mit_license.md</PackageLicenseFile>
       <PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
-      <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
    </PropertyGroup>
 
    <ItemGroup>
@@ -52,7 +51,6 @@
       <PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.0" />
       <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" />
       <PackageReference Include="System.Configuration.ConfigurationManager" Version="9.0.0" />
-      <PackageReference Include="System.Linq.Dynamic.Core" Version="1.6.7" />
    </ItemGroup>
 
    <ItemGroup>

@@ -1,17 +1,7 @@
-﻿#region Data Access Layer
-// Data.cs
-// Unified data access with support for:
-// - TableEntityBase + ITableExtra (existing)
-// - DynamicEntity with table override
-// - Any serializable type with PK property override
-#endregion
-
-using ASCTableStorage.Common;
+﻿using ASCTableStorage.Common;
 using ASCTableStorage.Models;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Azure.Cosmos.Table;
-using Newtonsoft.Json.Linq;
-using System.Linq.Dynamic.Core;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Text;
@@ -328,9 +318,7 @@ namespace ASCTableStorage.Data
             List<T> serverResults = await GetCollectionCore(query);
             if (hybridResult.RequiresClientFiltering && hybridResult.ClientSidePredicate != null)
             {
-                string rawPredicate = predicate.Body.ToString();
-                string cleanedPredicate = ReplaceOperators(rawPredicate);
-                clientResults = serverResults.AsQueryable<T>().Where(cleanedPredicate).ToList();
+                clientResults = serverResults.Where(hybridResult.ClientSidePredicate).ToList();
             }
 
             //return the smaller of the two result sets because that is actually what the client is looking for -- narrowed results
@@ -639,7 +627,7 @@ namespace ASCTableStorage.Data
         public void ManageData(object obj, TableOperationType direction = TableOperationType.InsertOrReplace)
         {
             string tableName = _tableNameOverride ?? ResolveTableName();
-            DynamicEntity de = DynamicEntityHelper.ToDynamicEntity(obj, tableName, _partitionKeyPropertyName);
+            DynamicEntity de = DynamicEntity.CreateFromObject(obj, tableName, _partitionKeyPropertyName);
             ManageDataCore(de, direction).GetAwaiter().GetResult();
         }
 
@@ -779,7 +767,7 @@ namespace ASCTableStorage.Data
         public async Task ManageDataAsync(object obj, TableOperationType direction = TableOperationType.InsertOrReplace)
         {
             string tableName = _tableNameOverride ?? ResolveTableName();
-            DynamicEntity de = DynamicEntityHelper.ToDynamicEntity(obj, tableName, _partitionKeyPropertyName);
+            DynamicEntity de = DynamicEntity.CreateFromObject(obj, tableName, _partitionKeyPropertyName);
             await ManageDataCore(de, direction);
         }
 
@@ -1276,8 +1264,9 @@ namespace ASCTableStorage.Data
 
 
         /// <summary>
-        /// Builds OData filter strings from lambda expressions with hybrid server/client filtering.
-        /// Extracts server-side conditions for Azure Table Storage and marks complex operations for client-side evaluation.
+        /// Expression visitor that converts a LINQ expression tree into an OData $filter string,
+        /// while detecting parts that must be evaluated client-side.
+        /// Supports closure-captured variables (e.g., local variables in lambdas).
         /// </summary>
         private class ODataFilterBuilder : ExpressionVisitor
         {
@@ -1285,32 +1274,39 @@ namespace ASCTableStorage.Data
             private bool _hasClientSideOperations = false;
 
             /// <summary>
-            /// The parameter expression representing the lambda parameter (e.g., 'u' in 'u => u.Email == "test"')
+            /// The parameter expression representing the lambda parameter (e.g., 'd' in 'd => d.Name == "test"').
+            /// Must be set before calling BuildHybridFilter if rebinding is needed.
             /// </summary>
             public ParameterExpression? Parameter { get; set; }
 
             /// <summary>
-            /// Analyzes the expression and returns server-side OData and client-side flags.
+            /// Analyzes the expression and returns a server-side OData filter string and a flag indicating
+            /// whether any part of the expression requires client-side evaluation.
             /// </summary>
-            /// <param name="expression">The expression tree to analyze</param>
-            /// <returns>Analysis result with server filter and client-side flag</returns>
+            /// <param name="expression">The expression tree to analyze (e.g., d => d.Name == "John").</param>
+            /// <returns>Result containing OData filter string and client-side flag.</returns>
             public FilterAnalysisResult BuildHybridFilter(Expression expression)
             {
                 _filter.Clear();
                 _hasClientSideOperations = false;
-                Visit(expression);
+
+                // Normalize the expression: replace closure references with constants
+                var normalized = NormalizeClosureExpressions(expression);
+                Visit(normalized);
+
                 return new FilterAnalysisResult
-                {                    
+                {
                     ServerSideOData = _filter.Length > 0 ? _filter.ToString() : null,
                     HasClientSideOperations = _hasClientSideOperations
-                };               
+                };
             }
 
             /// <summary>
-            /// Converts expression to OData string (legacy support).
+            /// Converts an expression directly into an OData filter string (legacy support).
+            /// Returns empty string if no server-side part exists.
             /// </summary>
-            /// <param name="expression">Expression to convert</param>
-            /// <returns>OData filter string</returns>
+            /// <param name="expression">The expression to convert.</param>
+            /// <returns>OData $filter string, or empty if fully client-side.</returns>
             public string Build(Expression expression)
             {
                 var result = BuildHybridFilter(expression);
@@ -1319,55 +1315,53 @@ namespace ASCTableStorage.Data
 
             /// <summary>
             /// Handles binary operations (==, !=, &&, ||, etc.).
-            /// Routes to specialized handlers based on operation type.
+            /// Splits AND/OR into hybrid-aware branches to allow partial server-side filtering.
             /// </summary>
             protected override Expression VisitBinary(BinaryExpression node)
             {
                 return node.NodeType switch
                 {
-                    ExpressionType.AndAlso => HandleOperations(node),
-                    ExpressionType.OrElse => HandleOperations(node),
+                    ExpressionType.AndAlso => HandleLogicalAndOr(node),
+                    ExpressionType.OrElse => HandleLogicalAndOr(node),
                     _ => HandleSimpleBinary(node)
                 };
             }
 
             /// <summary>
-            /// Processes AND & OR operations by combining server-side parts and preserving client-side needs.
-            /// Allows partial server filtering since they are both restrictive.
+            /// Processes logical AND/OR by analyzing each branch independently.
+            /// Allows combining server-side filters while preserving client-side requirements.
             /// </summary>
-            private Expression HandleOperations(BinaryExpression node)
+            private Expression HandleLogicalAndOr(BinaryExpression node)
             {
-                var left = AnalyzeBranch(node.Left);
-                var right = AnalyzeBranch(node.Right);
+                var leftResult = AnalyzeBranch(node.Left);
+                var rightResult = AnalyzeBranch(node.Right);
 
-                // Combine server filters
                 var serverParts = new List<string>();
-                if (left.ServerSideOData != null) serverParts.Add($"({left.ServerSideOData})");
-                if (right.ServerSideOData != null) serverParts.Add($"({right.ServerSideOData})");
+                if (!string.IsNullOrEmpty(leftResult.ServerSideOData))
+                    serverParts.Add($"({leftResult.ServerSideOData})");
+                if (!string.IsNullOrEmpty(rightResult.ServerSideOData))
+                    serverParts.Add($"({rightResult.ServerSideOData})");
 
-                UpdateFilter(serverParts, node.NodeType == ExpressionType.AndAlso);
+                // Append server-side parts with correct operator
+                foreach (var part in serverParts)
+                {
+                    if (_filter.Length > 0) _filter.Append(node.NodeType == ExpressionType.AndAlso ? " and " : " or ");
+                    _filter.Append(part);
+                }
 
-                // Client-side if either side needs it
-                _hasClientSideOperations = left.HasClientSideOperations || right.HasClientSideOperations;
+                // If either side needs client-side eval, mark entire expression as client-side
+                _hasClientSideOperations = leftResult.HasClientSideOperations || rightResult.HasClientSideOperations;
+
                 return node;
             }
 
-            private void UpdateFilter(List<string> serverParts, bool isAnd)
-            {
-                foreach (string part in serverParts)
-                { 
-                    if (_filter.Length > 0) _filter.Append(isAnd ? " and " : " or ");
-                    _filter.Append(part);
-                }
-            }
-
             /// <summary>
-            /// Handles simple comparisons (==, >, etc.).
-            /// Marks as client-side if either operand contains unsupported operations.
+            /// Handles simple binary operations (==, !=, <, >, etc.).
+            /// Only emits OData if both sides are server-compatible.
             /// </summary>
             private Expression HandleSimpleBinary(BinaryExpression node)
             {
-                if (IsServerSupported(node.Left) && IsServerSupported(node.Right) && IsSupportedOperator(node.NodeType))
+                if (IsSupportedOperator(node.NodeType) && IsServerSupported(node.Left) && IsServerSupported(node.Right))
                 {
                     _filter.Append("(");
                     Visit(node.Left);
@@ -1383,59 +1377,91 @@ namespace ASCTableStorage.Data
             }
 
             /// <summary>
-            /// Visits member expressions (e.g., u.Property).
-            /// Appends property name if it's a direct parameter access, else marks for client-side.
+            /// Visits member expressions (e.g., d.Property or closure.Value).
+            /// Resolves closure-captured values into constants.
+            /// Rebinds known members to the target parameter if possible.
             /// </summary>
             protected override Expression VisitMember(MemberExpression node)
             {
-                if (node.Expression is ParameterExpression)
+                // Case 1: Direct access to parameter (e.g., d.BaseUrl)
+                if (node.Expression == Parameter || (node.Expression is ParameterExpression))
                 {
                     _filter.Append(node.Member.Name);
-                    return base.VisitMember(node);
+                    return node;
                 }
 
-                _hasClientSideOperations = true;
-                if (Parameter != null)
+                // Case 2: Access to closure field (e.g., value(...).userPartitionKey)
+                if (node.Expression is ConstantExpression constExpr && constExpr.Value != null)
                 {
-                    return Expression.PropertyOrField(Parameter, node.Member.Name); //rebinds
+                    var field = node.Member as FieldInfo;
+                    if (field != null)
+                    {
+                        var value = field.GetValue(constExpr.Value);
+                        var constant = Expression.Constant(value, node.Type);
+                        Visit(constant); // Will call VisitConstant
+                        return constant;
+                    }
                 }
 
+                // Case 3: Any other member access (e.g., d.Nested.Prop) not directly supported
+                _hasClientSideOperations = true;
                 return node;
             }
 
             /// <summary>
-            /// Visits constant values and appends formatted OData string.
-            /// Handles null, string, datetime, bool, guid, and numeric types.
+            /// Visits constant values and appends them in OData-safe format.
+            /// Handles strings, nulls, dates, booleans, GUIDs, and numbers.
             /// </summary>
             protected override Expression VisitConstant(ConstantExpression node)
             {
-                _filter.Append(node.Value == null ? "'__null__'" :
-                              node.Type == typeof(string) ? $"'{EscapeODataString(node.Value.ToString()!)}'" :
-                              node.Type == typeof(DateTime) || node.Type == typeof(DateTime?) ? $"datetime'{((DateTime)node.Value):yyyy-MM-ddTHH:mm:ss.fffZ}'" :
-                              node.Type == typeof(bool) || node.Type == typeof(bool?) ? node.Value.ToString()!.ToLower() :
-                              node.Type == typeof(Guid) || node.Type == typeof(Guid?) ? $"guid'{node.Value}'" :
-                              IsNumericType(node.Type) ? node.Value.ToString() :
-                              $"'{EscapeODataString(node.Value.ToString()!)}'");
+                if (node.Value == null)
+                {
+                    _filter.Append("'__null__'");
+                }
+                else if (node.Type == typeof(string))
+                {
+                    _filter.Append($"'{EscapeODataString(node.Value.ToString()!)}'");
+                }
+                else if (node.Type == typeof(DateTime) || node.Type == typeof(DateTime?))
+                {
+                    var dt = (DateTime)node.Value;
+                    _filter.Append($"datetime'{dt:yyyy-MM-ddTHH:mm:ss.fffZ}'");
+                }
+                else if (node.Type == typeof(bool) || node.Type == typeof(bool?))
+                {
+                    _filter.Append(node.Value.ToString()!.ToLower());
+                }
+                else if (node.Type == typeof(Guid) || node.Type == typeof(Guid?))
+                {
+                    _filter.Append($"guid'{node.Value}'");
+                }
+                else if (IsNumericType(node.Type))
+                {
+                    _filter.Append(node.Value.ToString());
+                }
+                else
+                {
+                    // Fallback for other types (e.g., enums)
+                    _filter.Append($"'{EscapeODataString(node.Value.ToString()!)}'");
+                }
+
                 return node;
             }
 
             /// <summary>
-            /// Visits method calls and determines server/client handling.
-            /// Only allows .ToString() on direct property/indexer access for equality comparisons.
-            /// All other method calls (Contains, custom methods) go to client-side.
+            /// Visits method calls and determines whether they can be translated to OData.
+            /// Only allows .ToString() on direct property/indexer access in equality checks.
+            /// All other methods (Contains, StartsWith, etc.) go client-side.
             /// </summary>
             protected override Expression VisitMethodCall(MethodCallExpression node)
             {
                 // Handle DynamicEntity indexer: d["Field"]
                 if (IsIndexerAccess(node))
                 {
-                    // Allow d["Field"].ToString() only in direct comparisons
-                    if (node.Method.Name == "ToString" &&
-                        node.Arguments.Count == 0 &&
-                        IsDirectComparison(node))
+                    if (node.Method.Name == "ToString" && node.Arguments.Count == 0 && IsDirectComparison(node))
                     {
-                        var get_ItemCall = (MethodCallExpression)node.Object!;
-                        var keyArg = (ConstantExpression)get_ItemCall.Arguments[0];
+                        var indexer = (MethodCallExpression)node.Object!;
+                        var keyArg = (ConstantExpression)indexer.Arguments[0];
                         _filter.Append(keyArg.Value!.ToString());
                         return node;
                     }
@@ -1443,10 +1469,9 @@ namespace ASCTableStorage.Data
                     return node;
                 }
 
-                // Handle POCO property method: u.Field.Method()
+                // Handle POCO property method: u.Field.ToString()
                 if (IsPropertyAccess(node.Object!))
                 {
-                    // Allow u.Field.ToString() only in direct comparisons
                     if (node.Method.Name == "ToString" && node.Arguments.Count == 0 && IsDirectComparison(node))
                     {
                         Visit(node.Object);
@@ -1456,39 +1481,38 @@ namespace ASCTableStorage.Data
                     return node;
                 }
 
-                // Handle static string methods (IsNullOrEmpty, IsNullOrWhiteSpace)
+                // Handle static string checks
                 if (node.Method.DeclaringType == typeof(string) && node.Method.IsStatic)
                 {
                     return node.Method.Name switch
                     {
                         "IsNullOrEmpty" => ProcessStringNullCheck(node, "eq"),
-                        "IsNullOrWhiteSpace" => ProcessStringNullCheck(node, "eq"),
-                        _ => throw new NotSupportedException($"Static method {node.Method.Name} not supported")
+                        "IsNullOrWhiteSpace" => ProcessStringNullCheck(node, "ne"),
+                        _ => throw new NotSupportedException($"Static method {node.Method.Name} not supported in OData.")
                     };
                 }
 
-                // Handle DateTime.Add methods if evaluatable
+                // Handle DateTime.Add* if evaluatable
                 if (node.Method.DeclaringType == typeof(DateTime) && node.Method.Name.StartsWith("Add"))
                 {
                     if (IsEvaluatable(node))
                     {
-                        var lambda = Expression.Lambda(node);
-                        var result = lambda.Compile().DynamicInvoke();
-                        Visit(Expression.Constant(result));
+                        var compiled = Expression.Lambda(node).Compile().DynamicInvoke();
+                        Visit(Expression.Constant(compiled, node.Type));
                         return node;
                     }
                     _hasClientSideOperations = true;
                     return node;
                 }
 
-                // All other methods (Contains, StartsWith, custom extensions) → client-side
+                // All other methods (Contains, custom, etc.) → client-side
                 _hasClientSideOperations = true;
                 return node;
             }
 
             /// <summary>
             /// Visits unary expressions (e.g., !expression).
-            /// Translates !string.IsNullOrEmpty and !booleanField to OData.
+            /// Translates !string.IsNullOrEmpty and !boolField to OData.
             /// </summary>
             protected override Expression VisitUnary(UnaryExpression node)
             {
@@ -1520,10 +1544,35 @@ namespace ASCTableStorage.Data
                 return base.VisitUnary(node);
             }
 
+            // ========================================
             // Helper Methods
+            // ========================================
 
             /// <summary>
-            /// Checks if expression is d["Field"] indexer access.
+            /// Normalizes an expression by replacing closure references (e.g., value(...).field) with constants.
+            /// This prevents malformed OData like "value(...).field" from appearing in the output.
+            /// </summary>
+            /// <param name="expression">The original expression tree.</param>
+            /// <returns>A new expression with closure values inlined as constants.</returns>
+            private Expression NormalizeClosureExpressions(Expression expression)
+            {
+                return new ClosureExpressionRewriter().Visit(expression);
+            }
+
+            /// <summary>
+            /// Analyzes a sub-expression independently to determine its server/client behavior.
+            /// Prevents state pollution between left/right sides of logical operations.
+            /// </summary>
+            /// <param name="expr">The expression branch to analyze.</param>
+            /// <returns>Filter analysis result for this branch.</returns>
+            private FilterAnalysisResult AnalyzeBranch(Expression expr)
+            {
+                var builder = new ODataFilterBuilder { Parameter = this.Parameter };
+                return builder.BuildHybridFilter(expr);
+            }
+
+            /// <summary>
+            /// Checks if a method call is accessing a DynamicEntity indexer (d["Field"]).
             /// </summary>
             private bool IsIndexerAccess(MethodCallExpression node) =>
                 node.Method.DeclaringType == typeof(DynamicEntity) &&
@@ -1533,14 +1582,14 @@ namespace ASCTableStorage.Data
                 node.Arguments[0] is ConstantExpression;
 
             /// <summary>
-            /// Checks if expression is direct property access (u.Field).
+            /// Checks if the expression is a direct property access (e.g., u.Field).
             /// </summary>
             private bool IsPropertyAccess(Expression expr) =>
-                expr is MemberExpression me && me.Expression is ParameterExpression;
+                expr is MemberExpression me && (me.Expression == Parameter || me.Expression is ParameterExpression);
 
             /// <summary>
-            /// Checks if method call is directly used in a binary comparison.
-            /// Ensures .ToString() is only allowed in simple comparisons.
+            /// Determines if a method call (e.g., .ToString()) is used directly in a comparison.
+            /// Prevents misuse like (x.ToString().Length > 0).
             /// </summary>
             private bool IsDirectComparison(MethodCallExpression node)
             {
@@ -1551,13 +1600,19 @@ namespace ASCTableStorage.Data
             }
 
             /// <summary>
-            /// Gets parent expression (simplified for this context).
-            /// In full implementation, would require expression tree walking.
+            /// Gets the parent expression of the given node in the expression tree.
+            /// Uses a visitor to walk the tree and find the first node that contains the target.
             /// </summary>
-            private Expression GetParent(Expression node) => node; // Placeholder - implement with ExpressionVisitor if needed
+            /// <param name="node">The node to find the parent of.</param>
+            /// <returns>The parent expression, or null if not found.</returns>
+            private Expression? GetParent(Expression node)
+            {
+                var parentFinder = new ParentFinderVisitor(node);
+                return parentFinder.Find();
+            }
 
             /// <summary>
-            /// Processes string null/empty checks into OData conditions.
+            /// Handles string null/empty checks and converts them to OData conditions.
             /// </summary>
             private Expression ProcessStringNullCheck(MethodCallExpression node, string op)
             {
@@ -1570,17 +1625,7 @@ namespace ASCTableStorage.Data
             }
 
             /// <summary>
-            /// Analyzes a branch independently to determine its filter and client-side status.
-            /// Prevents state pollution between left/right sides of binary operations.
-            /// </summary>
-            private FilterAnalysisResult AnalyzeBranch(Expression expr)
-            {
-                var builder = new ODataFilterBuilder();
-                return builder.BuildHybridFilter(expr);
-            }
-
-            /// <summary>
-            /// Checks if expression can be evaluated to a constant.
+            /// Checks if an expression can be compiled and evaluated immediately (e.g., DateTime.Now.AddDays(1)).
             /// </summary>
             private bool IsEvaluatable(Expression expr)
             {
@@ -1596,21 +1641,21 @@ namespace ASCTableStorage.Data
             }
 
             /// <summary>
-            /// Checks if expression is server-supported (no client-side operations).
+            /// Determines if the expression can be fully handled server-side (i.e., no client-side ops).
             /// </summary>
             private bool IsServerSupported(Expression expression) =>
                 AnalyzeBranch(expression).ServerSideOData != null;
 
             /// <summary>
-            /// Checks if operator is supported by Azure Table Storage.
+            /// Checks if the binary operator is supported in OData/Azure Table Storage.
             /// </summary>
             private bool IsSupportedOperator(ExpressionType nodeType) =>
                 nodeType is ExpressionType.Equal or ExpressionType.NotEqual or
-                ExpressionType.GreaterThan or ExpressionType.GreaterThanOrEqual or
-                ExpressionType.LessThan or ExpressionType.LessThanOrEqual;
+                           ExpressionType.GreaterThan or ExpressionType.GreaterThanOrEqual or
+                           ExpressionType.LessThan or ExpressionType.LessThanOrEqual;
 
             /// <summary>
-            /// Converts C# operator to OData equivalent.
+            /// Converts C# binary operator to OData equivalent string.
             /// </summary>
             private string ConvertOperator(ExpressionType nodeType) => nodeType switch
             {
@@ -1620,11 +1665,11 @@ namespace ASCTableStorage.Data
                 ExpressionType.GreaterThanOrEqual => "ge",
                 ExpressionType.LessThan => "lt",
                 ExpressionType.LessThanOrEqual => "le",
-                _ => throw new NotSupportedException($"Operator {nodeType} not supported")
+                _ => throw new NotSupportedException($"Operator {nodeType} not supported in OData.")
             };
 
             /// <summary>
-            /// Checks if type is numeric for OData formatting.
+            /// Checks if a type is numeric (int, double, decimal, etc.) for OData formatting.
             /// </summary>
             private bool IsNumericType(Type type)
             {
@@ -1633,10 +1678,153 @@ namespace ASCTableStorage.Data
             }
 
             /// <summary>
-            /// Escapes single quotes in OData strings.
+            /// Escapes single quotes in strings for OData (replace ' with '').
             /// </summary>
-            private string EscapeODataString(string value) => value?.Replace("'", "''") ?? "";
-        } // end class ODataFilterBuilder
+            /// <param name="value">Input string.</param>
+            /// <returns>Escaped string safe for OData.</returns>
+            private string EscapeODataString(string? value) => value?.Replace("'", "''") ?? "";
+        }
+
+        /// <summary>
+        /// Rewrites expression trees to replace closure-captured values (e.g., value(...).field) with constants.
+        /// This ensures expressions like `d => d.Url == localVar` become `d => d.Url == "https://..."`.
+        /// </summary>
+        private class ClosureExpressionRewriter : ExpressionVisitor
+        {
+            protected override Expression VisitMember(MemberExpression node)
+            {
+                if (node.Expression is ConstantExpression constExpr && constExpr.Value != null)
+                {
+                    var field = node.Member as FieldInfo;
+                    if (field != null)
+                    {
+                        var value = field.GetValue(constExpr.Value);
+                        return Expression.Constant(value, node.Type);
+                    }
+                }
+                return base.VisitMember(node);
+            }
+        }
+
+        /// <summary>
+        /// Helper visitor to find the parent of a given expression node in the tree.
+        /// </summary>
+        private class ParentFinderVisitor : ExpressionVisitor
+        {
+            private readonly Expression _target;
+            private Expression? _parent;
+
+            public ParentFinderVisitor(Expression target) => _target = target;
+
+            public Expression? Find()
+            {
+                Visit(_target);
+                return _parent;
+            }
+
+            protected override Expression VisitBinary(BinaryExpression node)
+            {
+                if (node.Left == _target || node.Right == _target)
+                {
+                    _parent = node;
+                    return node;
+                }
+                return base.VisitBinary(node);
+            }
+
+            protected override Expression VisitUnary(UnaryExpression node)
+            {
+                if (node.Operand == _target)
+                {
+                    _parent = node;
+                    return node;
+                }
+                return base.VisitUnary(node);
+            }
+
+            protected override Expression VisitMethodCall(MethodCallExpression node)
+            {
+                if (node.Object == _target || node.Arguments.Contains(_target))
+                {
+                    _parent = node;
+                    return node;
+                }
+                return base.VisitMethodCall(node);
+            }
+
+            protected override Expression VisitMember(MemberExpression node)
+            {
+                if (node.Expression == _target)
+                {
+                    _parent = node;
+                    return node;
+                }
+                return base.VisitMember(node);
+            }
+
+            protected override Expression VisitConstant(ConstantExpression node)
+            {
+                if (node == _target)
+                {
+                    _parent = null;
+                }
+                return base.VisitConstant(node);
+            }
+
+            protected override Expression VisitParameter(ParameterExpression node)
+            {
+                if (node == _target)
+                {
+                    _parent = null;
+                }
+                return base.VisitParameter(node);
+            }
+
+            protected override Expression VisitConditional(ConditionalExpression node)
+            {
+                if (node.Test == _target || node.IfTrue == _target || node.IfFalse == _target)
+                {
+                    _parent = node;
+                }
+                return base.VisitConditional(node);
+            }
+
+            protected override Expression VisitNew(NewExpression node)
+            {
+                if (node.Arguments.Contains(_target))
+                {
+                    _parent = node;
+                }
+                return base.VisitNew(node);
+            }
+
+            protected override Expression VisitNewArray(NewArrayExpression node)
+            {
+                if (node.Expressions.Contains(_target))
+                {
+                    _parent = node;
+                }
+                return base.VisitNewArray(node);
+            }
+
+            protected override Expression VisitInvocation(InvocationExpression node)
+            {
+                if (node.Expression == _target || node.Arguments.Contains(_target))
+                {
+                    _parent = node;
+                }
+                return base.VisitInvocation(node);
+            }
+
+            protected override Expression VisitIndex(IndexExpression node)
+            {
+                if (node.Object == _target || node.Arguments.Contains(_target))
+                {
+                    _parent = node;
+                }
+                return base.VisitIndex(node);
+            }
+        } // end class ParentFinderVisitor
 
         /// <summary>
         /// Result of OData filter analysis.
@@ -2134,51 +2322,5 @@ namespace ASCTableStorage.Data
         #endregion
 
     } // end class Session
-
-    /// <summary>
-    /// Allows for converting any object to a DynamicEntity
-    /// </summary>
-    public static class DynamicEntityHelper
-    {
-        /// <summary>
-        /// Converts any object to a DynamicEntity by reflecting on its public properties.
-        /// </summary>
-        /// <param name="obj">The object to convert</param>
-        /// <param name="tableName">The table name</param>
-        /// <param name="partitionKeyPropertyName">Optional: property to use as PartitionKey</param>
-        /// <returns>A DynamicEntity with the object's data</returns>
-        public static DynamicEntity ToDynamicEntity<T>(T obj, string tableName, string? partitionKeyPropertyName = null) where T : class
-        {
-            var de = new DynamicEntity(tableName);
-
-            var props = TableEntityTypeCache.GetWritableProperties(obj.GetType());
-            foreach (var prop in props)
-            {
-                if (prop.CanRead)
-                {
-                    var value = prop.GetValue(obj);
-                    if (value != null)
-                    {
-                        de[prop.Name] = value;
-                    }
-                }
-            }
-
-            if (!string.IsNullOrWhiteSpace(partitionKeyPropertyName))
-            {
-                var pkProp = obj.GetType().GetProperty(partitionKeyPropertyName, BindingFlags.Public | BindingFlags.Instance);
-                if (pkProp != null && pkProp.CanRead)
-                {
-                    var pkValue = pkProp.GetValue(obj)?.ToString();
-                    if (!string.IsNullOrWhiteSpace(pkValue))
-                    {
-                        de.SetPartitionKey(pkValue);
-                    }
-                }
-            }
-
-            return de;
-        }
-    } // end class DynamicEntityHelper
 
 } // end namespace ASCTableStorage.Data

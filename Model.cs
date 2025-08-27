@@ -4,7 +4,6 @@ using Newtonsoft.Json;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.IO;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -757,9 +756,12 @@ namespace ASCTableStorage.Models
         #region Static Factory Methods with Custom Patterns
 
         /// <summary>
-        /// Creates a DynamicEntity with custom pattern configuration
+        /// Creates a DynamicEntity from the information within a Dictionary with optional custom pattern configuration
         /// </summary>
-        public static DynamicEntity CreateWithPatterns(string tableName, Dictionary<string, object>? properties, KeyPatternConfig patternConfig)
+        /// <param name="tableName">The name of the table to assign to manage the objects of this type in the Data Store</param>
+        /// <param name="properties">The properties to initialize the DynamicEntity with</param>
+        /// <param name="patternConfig">Optional: custom pattern configuration</param>
+        public static DynamicEntity CreateFromDictionary(string tableName, Dictionary<string, object>? properties, KeyPatternConfig patternConfig)
         {
             return new DynamicEntity(tableName, properties, patternConfig);
         }
@@ -767,6 +769,7 @@ namespace ASCTableStorage.Models
         /// <summary>
         /// Creates a pattern configuration from a JSON configuration
         /// </summary>
+        /// <param name="jsonConfig">The JSON configuration string</param>
         public static KeyPatternConfig LoadPatternConfig(string jsonConfig)
         {
             return JsonConvert.DeserializeObject<KeyPatternConfig>(jsonConfig) ?? new KeyPatternConfig();
@@ -775,10 +778,53 @@ namespace ASCTableStorage.Models
         /// <summary>
         /// Creates a DynamicEntity from JSON with pattern-based key detection
         /// </summary>
+        /// <param name="tableName">The name of the table to assign to manage the objects of this type in the Data Store</param>
+        /// <param name="json">The JSON string containing the entity data</param>
+        /// <param name="patternConfig">Optional: custom pattern configuration</param>
         public static DynamicEntity CreateFromJson(string tableName, string json, KeyPatternConfig? patternConfig = null)
         {
             var properties = JsonConvert.DeserializeObject<Dictionary<string, object>>(json) ?? new Dictionary<string, object>();
             return new DynamicEntity(tableName, properties, patternConfig);
+        }
+
+        /// <summary>
+        /// Converts any object to a DynamicEntity by reflecting on its public properties.
+        /// </summary>
+        /// <param name="obj">The object to convert</param>
+        /// <param name="tableName">The table name</param>
+        /// <param name="partitionKeyPropertyName">Optional: property to use as PartitionKey</param>
+        /// <returns>A DynamicEntity with the object's data</returns>
+        public static DynamicEntity CreateFromObject<T>(T obj, string tableName, string? partitionKeyPropertyName = null) where T : class
+        {
+            var de = new DynamicEntity(tableName);
+
+            PropertyInfo[] props = TableEntityTypeCache.GetWritableProperties(obj.GetType());
+            foreach (var prop in props)
+            {
+                if (prop.CanRead)
+                {
+                    var value = prop.GetValue(obj);
+                    if (value != null)
+                    {
+                        de[prop.Name] = value;
+                    }
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(partitionKeyPropertyName))
+            {
+                PropertyInfo pkProp = props.FirstOrDefault(p => p.Name == partitionKeyPropertyName)!;
+                if (pkProp != null && pkProp.CanRead)
+                {
+                    var pkValue = pkProp.GetValue(obj)?.ToString();
+                    if (!string.IsNullOrWhiteSpace(pkValue))
+                    {
+                        de.SetPartitionKey(pkValue);
+                    }
+                }
+            }
+
+            return de;
         }
 
         #endregion Static Factory Methods
