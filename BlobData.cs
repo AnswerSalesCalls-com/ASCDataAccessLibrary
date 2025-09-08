@@ -3,8 +3,8 @@ using Azure;
 using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
-using System.IO;
 using System.Linq.Expressions;
+using System.Text;
 
 namespace ASCTableStorage.Blobs
 {
@@ -194,6 +194,48 @@ namespace ASCTableStorage.Blobs
         }
 
         /// <summary>
+        /// Allows for Blob Data to be created from a string input.
+        /// Returns the link to the newly created file in Blob Storage
+        /// </summary>
+        /// <param name="blobName">Name of the blob file to store</param>
+        /// <param name="data">The string data to store</param>
+        /// <param name="format">
+        /// The data format. ex:text/html : text/javascript : text/css : text/x-csharp : text/plain
+        /// </param>
+        /// <param name="tags">The searchable tags to store</param>
+        /// <param name="metaTags">The extra internal meta data about the file</param>
+        public async Task<string> UploadStringDataAsync(string blobName, string data, string format, Dictionary<string, string> tags = null!, Dictionary<string, string> metaTags = null!)
+        {
+            string url = string.Empty;
+            try
+            {
+                // Convert string to stream
+                using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(data)))
+                {
+                    // Upload the stream to blob storage
+                    Uri blobUri = await this.UploadStreamAsync(
+                        stream: stream,                         // The stream containing your string data
+                        fileName: blobName,                     // The name the blob will have
+                        contentType: format,                    // Optional: specify content type (can infer from extension)
+                        enforceFileTypeRestriction: false,       // Optional: enforce file type rules
+                        maxFileSizeBytes: null,                 // Optional: use default or specify
+                        indexTags: tags,                        // Optional: add tags for searching
+                        metadata: metaTags                      // Optional: add metadata
+                    );
+
+                    url = blobUri.ToString();
+                    // The 'blobUri' now points to your newly created blob containing the string content.
+                } // The 'using' statement ensures the stream is disposed after upload
+            }
+            catch (Exception ex)
+            {
+                url = ex.Message;
+            }
+
+            return url;
+        }
+
+        /// <summary>
         /// Uploads a stream to Azure Blob Storage with size validation and optional index tags
         /// </summary>
         /// <param name="stream">The stream to upload</param>
@@ -346,24 +388,25 @@ namespace ASCTableStorage.Blobs
         /// Searches blobs by tag query string
         /// </summary>
         /// <param name="tagQuery">OData-style tag query (container filter will be added automatically)</param>
+        /// <param name="loadContent">
+        /// True if you also want to have the data within the blog loaded.
+        /// This is a performance hit but it's TRUE by default because its the assumption you want the data
+        /// </param>
         /// <returns>List of matching blob data</returns>
         /// <example>
         /// var query = "brand = 'volvo' AND type = 'pdf'";
         /// var blobs = await azureBlobs.SearchBlobsByTagsAsync(query);
         /// </example>
-        public async Task<List<BlobData>> SearchBlobsByTagsAsync(string? tagQuery = null)
+        public async Task<List<BlobData>> SearchBlobsByTagsAsync(string tagQuery, bool loadContent = true)
         {
             var results = new List<BlobData>();
-
             // Build the complete query
             string fullQuery = BuildTagQuery(tagQuery);
-
             if (string.IsNullOrEmpty(fullQuery))
             {
                 // If no query, list all blobs in the container
                 return await ListBlobsAsync();
             }
-
             try
             {
                 await foreach (var taggedBlobItem in m_client.FindBlobsByTagsAsync(fullQuery))
@@ -371,15 +414,12 @@ namespace ASCTableStorage.Blobs
                     // Only process blobs from our container
                     if (taggedBlobItem.BlobContainerName != m_containerName)
                         continue;
-
                     // Get detailed blob information
                     var blobClient = m_containerClient.GetBlobClient(taggedBlobItem.BlobName);
-
                     try
                     {
                         var properties = await blobClient.GetPropertiesAsync();
                         var tags = await blobClient.GetTagsAsync();
-
                         var blobData = new BlobData
                         {
                             Name = taggedBlobItem.BlobName,
@@ -393,6 +433,13 @@ namespace ASCTableStorage.Blobs
                             Metadata = properties.Value.Metadata?.ToDictionary(kvp => kvp.Key, kvp => kvp.Value) ?? new Dictionary<string, string>()
                         };
 
+                        if (loadContent)
+                        {
+                            // Download content for this blob
+                            using var memoryStream = new MemoryStream();
+                            await blobClient.DownloadToAsync(memoryStream);
+                            blobData.Data = memoryStream.ToArray();
+                        }
                         results.Add(blobData);
                     }
                     catch (RequestFailedException)
@@ -406,7 +453,6 @@ namespace ASCTableStorage.Blobs
             {
                 throw new InvalidOperationException($"Error searching blobs by tags: {ex.Message}", ex);
             }
-
             return results;
         }
 
@@ -414,37 +460,35 @@ namespace ASCTableStorage.Blobs
         /// Lists all blobs in the container with optional filtering
         /// </summary>
         /// <param name="prefix">Optional prefix filter</param>
+        /// <param name="loadContent">
+        /// True if you also want to have the data within the blog loaded.
+        /// This is a performance hit so it's FALSE by default because its the 
+        /// assumption you DON'T want the data for the Whole Container
+        /// </param>
         /// <returns>A list of blob items with metadata and tags</returns>
-        public async Task<List<BlobData>> ListBlobsAsync(string? prefix = null)
+        public async Task<List<BlobData>> ListBlobsAsync(string? prefix = null, bool loadContent = false)
         {
             var results = new List<BlobData>();
-
             // Create blob listing options
             BlobTraits traits = BlobTraits.Metadata | BlobTraits.Tags;
             BlobStates states = BlobStates.None;
-
             // List blobs
             AsyncPageable<BlobItem> blobs = m_containerClient.GetBlobsAsync(traits, states, prefix);
-
             await foreach (BlobItem bi in blobs)
             {
                 DateTime uploadDate = bi.Properties.CreatedOn?.DateTime ?? DateTime.UtcNow;
                 string originalFilename = bi.Name;
                 long fileSize = bi.Properties.ContentLength ?? 0;
-
                 // Extract metadata if available
                 if (bi.Metadata != null)
                 {
                     if (bi.Metadata.TryGetValue("UploadedOn", out string? uploadedOn))
                         DateTime.TryParse(uploadedOn, out uploadDate);
-
                     if (bi.Metadata.TryGetValue("OriginalFilename", out string? filename))
                         originalFilename = filename;
-
                     if (bi.Metadata.TryGetValue("FileSize", out string? size))
                         long.TryParse(size, out fileSize);
                 }
-
                 var blobData = new BlobData
                 {
                     Name = bi.Name,
@@ -458,9 +502,65 @@ namespace ASCTableStorage.Blobs
                     Metadata = bi.Metadata?.ToDictionary(kvp => kvp.Key, kvp => kvp.Value) ?? new Dictionary<string, string>()
                 };
 
+                if (loadContent)
+                {
+                    // Download content for this blob
+                    using var memoryStream = new MemoryStream();
+                    var blobClient = m_containerClient.GetBlobClient(bi.Name);
+                    await blobClient.DownloadToAsync(memoryStream);
+                    blobData.Data = memoryStream.ToArray();
+                }
                 results.Add(blobData);
             }
+            return results;
+        }
 
+        /// <summary>
+        /// Gets blob data with content loaded
+        /// </summary>
+        /// <param name="blobName">The blob name</param>
+        /// <returns>BlobData with content loaded, or null if not found</returns>
+        public async Task<BlobData?> GetBlobWithContentAsync(string blobName)
+        {
+            var blobClient = m_containerClient.GetBlobClient(blobName);
+            var properties = await blobClient.GetPropertiesAsync();
+
+            // Download the content
+            using var memoryStream = new MemoryStream();
+            await blobClient.DownloadToAsync(memoryStream);
+            var data = memoryStream.ToArray();
+
+            var blobData = new BlobData
+            {
+                Name = blobName,
+                OriginalFilename = properties.Value.Metadata.TryGetValue("OriginalFilename", out var origName) ? origName : blobName,
+                ContentType = properties.Value.ContentType,
+                Size = properties.Value.ContentLength,
+                UploadDate = properties.Value.Metadata.TryGetValue("UploadedOn", out var uploadDate) && DateTime.TryParse(uploadDate, out var parsedDate) ? parsedDate : properties.Value.CreatedOn.DateTime,
+                Url = blobClient.Uri,
+                ContainerName = m_containerName,
+                Tags = (await blobClient.GetTagsAsync()).Value.Tags?.ToDictionary(kvp => kvp.Key, kvp => kvp.Value) ?? new Dictionary<string, string>(),
+                Metadata = properties.Value.Metadata?.ToDictionary(kvp => kvp.Key, kvp => kvp.Value) ?? new Dictionary<string, string>(),
+                Data = data
+            };
+
+            return blobData;
+        }
+
+        /// <summary>
+        /// Gets multiple blob datas with content loaded
+        /// </summary>
+        /// <param name="blobNames">List of blob names</param>
+        /// <returns>List of BlobData objects with content loaded</returns>
+        public async Task<List<BlobData>> GetBlobsWithContentAsync(IEnumerable<string> blobNames)
+        {
+            var results = new List<BlobData>();
+            foreach (var blobName in blobNames)
+            {
+                var blobData = await GetBlobWithContentAsync(blobName);
+                if (blobData != null)
+                    results.Add(blobData);
+            }
             return results;
         }
 

@@ -1440,6 +1440,7 @@ namespace ASCTableStorage.Models
             { ".gz", "application/gzip" },
 
             // Web
+            { ".cshtml", "text/html" },
             { ".html", "text/html" },
             { ".htm", "text/html" },
             { ".css", "text/css" },
@@ -1459,6 +1460,51 @@ namespace ASCTableStorage.Models
             { ".go", "text/plain" },
             { ".sql", "text/plain" }
         };
+
+        /// <summary>
+        /// Raw byte data of the blob content (null if not loaded)
+        /// </summary>
+        public byte[]? Data { get; set; }
+
+        /// <summary>
+        /// Reads the blob data and returns it as an appropriate string format
+        /// For images, returns base64 encoded string
+        /// For text-based content, returns the actual text content
+        /// </summary>
+        /// <returns>String representation of the blob content</returns>
+        public string Read()
+        {
+            if (Data == null)
+                throw new InvalidOperationException("Blob data has not been loaded");
+
+            // Check if this is an image based on content type
+            if (IsImage())
+            {
+                // For images, return base64 encoded string
+                return Convert.ToBase64String(Data);
+            }
+
+            // For all other content types, decode as UTF-8 string
+            // This covers text/, application/json, application/xml, application/javascript, etc.
+            return Encoding.UTF8.GetString(Data);
+        }
+
+        /// <summary>
+        /// Returns a string representation of the blob data
+        /// </summary>
+        /// <returns>String containing the actual blob content</returns>
+        public override string ToString()
+        {
+            try
+            {
+                return Read();
+            }
+            catch
+            {
+                // Fallback to original behavior if reading fails
+                return $"{OriginalFilename ?? Name} ({GetFormattedSize()}) - {UploadDate:yyyy-MM-dd HH:mm:ss}";
+            }
+        }
 
         /// <summary>
         /// Gets a tag value by key, returns null if not found
@@ -1606,14 +1652,6 @@ namespace ASCTableStorage.Models
             return !string.IsNullOrEmpty(ContentType) && ContentType.StartsWith("audio/", StringComparison.OrdinalIgnoreCase);
         }
 
-        /// <summary>
-        /// Returns a string representation of the blob data
-        /// </summary>
-        /// <returns>String containing blob name, size, and upload date</returns>
-        public override string ToString()
-        {
-            return $"{OriginalFilename ?? Name} ({GetFormattedSize()}) - {UploadDate:yyyy-MM-dd HH:mm:ss}";
-        }
     } //end class BlobData
 
     /// <summary>
