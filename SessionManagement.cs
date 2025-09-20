@@ -1,11 +1,14 @@
 ﻿using ASCTableStorage.Common;
 using ASCTableStorage.Data;
+using ASCTableStorage.Logging;
 using ASCTableStorage.Models;
 using Microsoft.Azure.Cosmos.Table;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Reflection;
 using System.Runtime.Loader;
 
 namespace ASCTableStorage.Sessions
@@ -153,7 +156,6 @@ namespace ASCTableStorage.Sessions
 
     #region Static Session Manager
 
-
     /// <summary>
     /// Global session manager providing unified session access across all application types
     /// </summary>
@@ -170,6 +172,16 @@ namespace ASCTableStorage.Sessions
         private static SessionBackgroundService? _backgroundService;
         internal static bool _initialized = false;
 
+        private static readonly Lazy<ILogger> logger = new Lazy<ILogger>(() =>
+        {
+            // This code inside the lambda ONLY runs the first time _logger?.Value is accessed
+            if (RemoteLogger.Logger != null)
+                return RemoteLogger.Logger.CreateLogger("SessionManager");
+
+            return null!;
+        });
+        private static ILogger _logger = logger.Value;
+
         /// <summary>
         /// Gets the current session instance (implements ISession)
         /// </summary>
@@ -177,8 +189,12 @@ namespace ASCTableStorage.Sessions
         {
             get
             {
+                if (_logger == null)
+                    _logger = RemoteLogger.Logger.CreateLogger("SessionManager"); //instatiation timing issue
+
                 if (!_initialized)
                 {
+                    _logger?.LogError("SessionManager accessed before initialization. Call Initialize() first.");
                     throw new InvalidOperationException(
                         "SessionManager has not been initialized. Call Initialize() first.");
                 }
@@ -189,8 +205,10 @@ namespace ASCTableStorage.Sessions
                     {
                         if (_currentSession == null)
                         {
-                            var sessionId = _sessionId ?? _customIdProvider?.Invoke() ?? GetDefaultSessionId();
-                            _currentSession = new Session(_accountName!, _accountKey!, sessionId);
+                            string sessionId = _sessionId ?? _customIdProvider?.Invoke() ?? LocalSessionID!;
+                            if (_currentSession == null)
+                                _currentSession = new Session(_accountName!, _accountKey!, sessionId);
+                            _logger?.LogInformation("New session created successfully. Session ID: {SessionId}", sessionId);
                         }
                     }
                 }
@@ -207,10 +225,13 @@ namespace ASCTableStorage.Sessions
         /// <param name="configure">The options that determine configurations</param>
         public static void Initialize(string accountName, string accountKey, Action<SessionOptions>? configure = null)
         {
+            _logger?.LogInformation("Initializing SessionManager with account: {AccountName}", accountName);
+
             lock (_lock)
             {
                 if (_initialized)
                 {
+                    _logger?.LogWarning("SessionManager already initialized. Performing shutdown before re-initialization.");
                     Shutdown();
                 }
 
@@ -225,34 +246,46 @@ namespace ASCTableStorage.Sessions
                 };
                 configure?.Invoke(options);
 
+                _logger?.LogDebug("Session options configured. SessionIdStrategy: {Strategy}, CustomIdProvider: {HasCustomProvider}, SessionId: {ExplicitSessionId}",
+                    options.IdStrategy,
+                    options.CustomIdProvider != null,
+                    options.SessionId);
+
                 if (options.IdStrategy == SessionIdStrategy.Custom && options.CustomIdProvider != null)
                 {
                     _customIdProvider = options.CustomIdProvider;
+                    _logger?.LogInformation("Custom session ID provider configured");
                 }
                 else if (!string.IsNullOrEmpty(options.SessionId))
                 {
                     _sessionId = options.SessionId;
+                    _logger?.LogInformation("Explicit session ID configured: {SessionId}", options.SessionId);
                 }
 
                 // Initialize background service if cleanup is enabled
                 if (options.EnableAutoCleanup)
                 {
+                    _logger?.LogInformation("Initializing background cleanup service");
                     _backgroundService = new SessionBackgroundService(options);
                     // Start the background service with the cancellation token
                     _backgroundService.StartAsync(_shutdownTokenSource.Token).GetAwaiter().GetResult();
+                    _logger?.LogInformation("Background cleanup service started");
                 }
 
                 // Setup auto-commit timer if enabled
                 if (options.AutoCommitInterval > TimeSpan.Zero)
                 {
+                    _logger?.LogInformation("Setting up auto-commit timer with interval: {Interval}", options.AutoCommitInterval);
                     _autoCommitTimer = new Timer(
                         AutoCommitCallback,
                         null,
                         options.AutoCommitInterval,
                         options.AutoCommitInterval);
+                    _logger?.LogInformation("Auto-commit timer configured successfully");
                 }
 
                 _initialized = true;
+                _logger?.LogInformation("SessionManager initialization completed successfully");
 
                 // Register for multiple shutdown scenarios
                 RegisterShutdownHandlers();
@@ -266,34 +299,42 @@ namespace ASCTableStorage.Sessions
         /// <param name="accountKey">Azure Table Storage Database key</param>
         /// <param name="sessionId">The sessionID this instance will work on</param>
         public static void Initialize(string accountName, string accountKey, string sessionId)
-            => Initialize(accountName, accountKey, options => options.SessionId = sessionId);
+        {
+            _logger?.LogInformation("Initializing SessionManager with explicit session ID: {SessionId}", sessionId);
+            Initialize(accountName, accountKey, options => options.SessionId = sessionId);
+        }
 
         /// <summary>
         /// Register all shutdown handlers for different scenarios
         /// </summary>
         private static void RegisterShutdownHandlers()
         {
+            _logger?.LogInformation("Registering shutdown handlers");
+
             // 1. Normal app domain shutdown
             AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+            _logger?.LogDebug("ProcessExit handler registered");
 
             // 2. Unhandled exceptions
             AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
+            _logger?.LogDebug("UnhandledException handler registered");
 
             // 3. Assembly unload (for .NET Core)
             try
             {
                 AssemblyLoadContext.Default.Unloading += OnAssemblyUnloading;
+                _logger?.LogDebug("AssemblyUnloading handler registered");
             }
-            catch
+            catch (Exception ex)
             {
-                // Ignore if not on .NET Core
+                _logger?.LogWarning(ex, "Could not register AssemblyUnloading handler (likely not .NET Core)");
             }
 
             // 4. Console cancel (Ctrl+C)
             Console.CancelKeyPress += OnConsoleCancelKeyPress;
+            _logger?.LogDebug("ConsoleCancelKeyPress handler registered");
 
-            // 5. For ASP.NET Core apps - IHostApplicationLifetime would be better but we don't have DI here
-            // Users should call RegisterForGracefulShutdown with IHostApplicationLifetime token
+            _logger?.LogInformation("All shutdown handlers registered successfully");
         }
 
         /// <summary>
@@ -303,16 +344,18 @@ namespace ASCTableStorage.Sessions
         /// <param name="cancellationToken">The cancellation token that sparks or requests shutdown</param>
         public static void RegisterForGracefulShutdown(CancellationToken cancellationToken)
         {
+            _logger?.LogInformation("Registering for graceful shutdown");
+
             cancellationToken.Register(() =>
             {
                 try
                 {
-                    CommitAndShutdown("Application stopping");
+                    _logger?.LogInformation("Graceful shutdown initiated via cancellation token");
+                    CommitAndShutdown("Application stopping via cancellation token");
                 }
                 catch (Exception ex)
                 {
-                    // Log if possible but don't throw
-                    System.Diagnostics.Debug.WriteLine($"Error during graceful shutdown: {ex}");
+                    _logger?.LogError(ex, "Error during graceful shutdown registration callback");
                 }
             });
         }
@@ -323,17 +366,27 @@ namespace ASCTableStorage.Sessions
         /// <param name="state">The state of the session</param>
         private static void AutoCommitCallback(object? state)
         {
+            _logger?.LogDebug("Auto-commit timer callback triggered");
+
             try
             {
                 if (_currentSession != null)
                 {
+                    var sessionId = _currentSession.SessionID;
+                    _logger?.LogDebug("Executing auto-commit for session: {SessionId}", sessionId);
+
                     // Always commit when timer fires - don't trust DataHasBeenCommitted
                     _currentSession.CommitData();
+                    _logger?.LogInformation("Auto-commit executed successfully for session: {SessionId}", sessionId);
+                }
+                else
+                {
+                    _logger?.LogDebug("No current session to auto-commit");
                 }
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"Auto-commit failed: {ex}");
+                _logger?.LogError(ex, "Auto-commit failed for current session");
             }
         }
 
@@ -342,7 +395,11 @@ namespace ASCTableStorage.Sessions
         /// </summary>
         /// <param name="sender">The sender of the process command</param>
         /// <param name="e">Arguments to use if any. Ignored here</param>
-        private static void OnProcessExit(object? sender, EventArgs e) => CommitAndShutdown("Process exit");
+        private static void OnProcessExit(object? sender, EventArgs e)
+        {
+            _logger?.LogInformation("ProcessExit event received");
+            CommitAndShutdown("Process exit");
+        }
 
         /// <summary>
         /// Handle unhandled exceptions
@@ -351,6 +408,7 @@ namespace ASCTableStorage.Sessions
         /// <param name="e">Arguments to use if any. Ignored here</param>
         private static void OnUnhandledException(object? sender, UnhandledExceptionEventArgs e)
         {
+            _logger?.LogWarning("UnhandledException event received. IsTerminating: {IsTerminating}", e.IsTerminating);
             CommitAndShutdown($"Unhandled exception (terminating: {e.IsTerminating})");
         }
 
@@ -358,7 +416,11 @@ namespace ASCTableStorage.Sessions
         /// Handle assembly unloading
         /// </summary>
         /// <param name="context">Assembly context</param>
-        private static void OnAssemblyUnloading(AssemblyLoadContext context) => CommitAndShutdown("Assembly unloading");
+        private static void OnAssemblyUnloading(AssemblyLoadContext context)
+        {
+            _logger?.LogInformation("AssemblyUnloading event received");
+            CommitAndShutdown("Assembly unloading");
+        }
 
 
         /// <summary>
@@ -368,7 +430,8 @@ namespace ASCTableStorage.Sessions
         /// <param name="e">Arguments to use if any. Ignored here</param>
         private static void OnConsoleCancelKeyPress(object? sender, ConsoleCancelEventArgs e)
         {
-            CommitAndShutdown("Console cancel");            
+            _logger?.LogInformation("ConsoleCancelKeyPress event received. Cancel: {Cancel}", e.Cancel);
+            CommitAndShutdown("Console cancel");
             e.Cancel = false; // Allow the process to terminate
         }
 
@@ -377,17 +440,25 @@ namespace ASCTableStorage.Sessions
         /// </summary>
         private static void CommitAndShutdown(string reason)
         {
+            _logger?.LogInformation("CommitAndShutdown initiated. Reason: {Reason}", reason);
+
             try
             {
-                Debug.WriteLine($"SessionManager shutdown initiated: {reason}");
-
                 lock (_lock)
                 {
                     if (_currentSession != null)
                     {
+                        var sessionId = _currentSession.SessionID;
+                        _logger?.LogInformation("Committing session data before shutdown. Session ID: {SessionId}", sessionId);
+
                         // ALWAYS commit on shutdown, ignore DataHasBeenCommitted flag
                         // Use synchronous commit to ensure it completes
                         _currentSession.CommitData();
+                        _logger?.LogInformation("Session data committed successfully during shutdown. Session ID: {SessionId}", sessionId);
+                    }
+                    else
+                    {
+                        _logger?.LogDebug("No session to commit during shutdown");
                     }
                 }
 
@@ -395,7 +466,7 @@ namespace ASCTableStorage.Sessions
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error during shutdown commit: {ex}");
+                _logger?.LogError(ex, "Error during shutdown commit process. Reason: {Reason}", reason);
             }
         }
 
@@ -404,39 +475,67 @@ namespace ASCTableStorage.Sessions
         /// </summary>
         public static void Shutdown()
         {
+            _logger?.LogInformation("SessionManager shutdown initiated");
+
             lock (_lock)
             {
                 try
                 {
-                    _shutdownTokenSource?.Cancel();
+                    if (_shutdownTokenSource != null)
+                    {
+                        _logger?.LogDebug("Cancelling shutdown token source");
+                        _shutdownTokenSource.Cancel();
+                    }
 
                     // Stop background service if running
                     if (_backgroundService != null)
                     {
+                        _logger?.LogInformation("Stopping background service");
                         _backgroundService.StopAsync(CancellationToken.None).GetAwaiter().GetResult();
                         _backgroundService.Dispose();
                         _backgroundService = null;
+                        _logger?.LogInformation("Background service stopped and disposed");
                     }
 
-                    _shutdownTokenSource?.Dispose();
-                    _shutdownTokenSource = null;
+                    if (_shutdownTokenSource != null)
+                    {
+                        _logger?.LogDebug("Disposing shutdown token source");
+                        _shutdownTokenSource.Dispose();
+                        _shutdownTokenSource = null;
+                    }
 
-                    _autoCommitTimer?.Dispose();
-                    _autoCommitTimer = null;
+                    if (_autoCommitTimer != null)
+                    {
+                        _logger?.LogDebug("Disposing auto-commit timer");
+                        _autoCommitTimer.Dispose();
+                        _autoCommitTimer = null;
+                    }
 
                     if (_currentSession != null)
                     {
+                        var sessionId = _currentSession.SessionID;
+                        _logger?.LogInformation("Committing and disposing current session. Session ID: {SessionId}", sessionId);
+
                         // ALWAYS commit on shutdown
                         _currentSession.CommitData();
+                        _logger?.LogDebug("Session data committed during shutdown. Session ID: {SessionId}", sessionId);
+
                         _currentSession.Dispose();
+                        _logger?.LogInformation("Current session disposed. Session ID: {SessionId}", sessionId);
                         _currentSession = null;
+                    }
+                    else
+                    {
+                        _logger?.LogDebug("No current session to dispose during shutdown");
                     }
                 }
                 finally
                 {
                     _initialized = false;
+                    _logger?.LogDebug("SessionManager initialized flag set to false");
 
                     // Unregister handlers
+                    _logger?.LogDebug("Unregistering shutdown handlers");
                     AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
                     AppDomain.CurrentDomain.UnhandledException -= OnUnhandledException;
                     Console.CancelKeyPress -= OnConsoleCancelKeyPress;
@@ -444,11 +543,14 @@ namespace ASCTableStorage.Sessions
                     try
                     {
                         AssemblyLoadContext.Default.Unloading -= OnAssemblyUnloading;
+                        _logger?.LogDebug("AssemblyUnloading handler unregistered");
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        // Ignore
+                        _logger?.LogWarning(ex, "Could not unregister AssemblyUnloading handler");
                     }
+
+                    _logger?.LogInformation("SessionManager shutdown completed successfully");
                 }
             }
         } // end ShutDown()
@@ -458,19 +560,42 @@ namespace ASCTableStorage.Sessions
         /// </summary>
         public static async Task ShutdownAsync()
         {
+            _logger?.LogInformation("SessionManager async shutdown initiated");
+
             try
             {
-                _shutdownTokenSource?.Cancel();
+                if (_shutdownTokenSource != null)
+                {
+                    _logger?.LogDebug("Cancelling shutdown token source");
+                    _shutdownTokenSource.Cancel();
+                }
 
                 if (_backgroundService != null)
                 {
+                    _logger?.LogInformation("Stopping background service asynchronously");
                     await _backgroundService.StopAsync(CancellationToken.None);
+                    _logger?.LogInformation("Background service stopped asynchronously");
                 }
 
                 if (_currentSession != null && !_currentSession.DataHasBeenCommitted)
                 {
+                    var sessionId = _currentSession.SessionID;
+                    _logger?.LogInformation("Committing session data asynchronously during shutdown. Session ID: {SessionId}", sessionId);
                     await _currentSession.CommitDataAsync();
+                    _logger?.LogInformation("Session data committed asynchronously during shutdown. Session ID: {SessionId}", sessionId);
                 }
+                else if (_currentSession != null)
+                {
+                    _logger?.LogDebug("Session data already committed, skipping async commit during shutdown. Session ID: {SessionId}", _currentSession.SessionID);
+                }
+                else
+                {
+                    _logger?.LogDebug("No current session to commit during async shutdown");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error during async shutdown process");
             }
             finally
             {
@@ -483,10 +608,28 @@ namespace ASCTableStorage.Sessions
         /// </summary>
         public static bool CommitData()
         {
+            _logger?.LogDebug("CommitData called");
+
             if (_currentSession != null)
             {
-                return _currentSession.CommitData();
+                var sessionId = _currentSession.SessionID;
+                _logger?.LogInformation("Committing current session data. Session ID: {SessionId}", sessionId);
+
+                var result = _currentSession.CommitData();
+
+                if (result)
+                {
+                    _logger?.LogInformation("Session data committed successfully. Session ID: {SessionId}", sessionId);
+                }
+                else
+                {
+                    _logger?.LogWarning("Session data commit returned false. Session ID: {SessionId}", sessionId);
+                }
+
+                return result;
             }
+
+            _logger?.LogWarning("Attempted to commit data but no current session exists");
             return false;
         }
 
@@ -495,10 +638,28 @@ namespace ASCTableStorage.Sessions
         /// </summary>
         public static async Task<bool> CommitDataAsync()
         {
+            _logger?.LogDebug("CommitDataAsync called");
+
             if (_currentSession != null)
             {
-                return await _currentSession.CommitDataAsync();
+                var sessionId = _currentSession.SessionID;
+                _logger?.LogInformation("Committing current session data asynchronously. Session ID: {SessionId}", sessionId);
+
+                var result = await _currentSession.CommitDataAsync();
+
+                if (result)
+                {
+                    _logger?.LogInformation("Session data committed asynchronously successfully. Session ID: {SessionId}", sessionId);
+                }
+                else
+                {
+                    _logger?.LogWarning("Session data async commit returned false. Session ID: {SessionId}", sessionId);
+                }
+
+                return result;
             }
+
+            _logger?.LogWarning("Attempted to commit data asynchronously but no current session exists");
             return false;
         }
 
@@ -507,14 +668,33 @@ namespace ASCTableStorage.Sessions
         /// </summary>
         private static string GetDefaultSessionId()
         {
-            // For desktop apps, use username + machine
-            if (Environment.UserInteractive)
+            _logger?.LogDebug("Retrieving default session ID from environment or generating fallback");
+
+            var stored = Environment.GetEnvironmentVariable("SESSION_MANAGER_ID");
+            if (!string.IsNullOrWhiteSpace(stored))
             {
-                return $"{Environment.UserName}_{Environment.MachineName}".Replace("\\", "_");
+                _logger?.LogInformation("Retrieved stored session ID from environment: {SessionId}", stored);
+                return stored;
             }
 
-            // For services/console apps, use machine + process
-            return $"{Environment.MachineName}_{Process.GetCurrentProcess().Id}";
+            string sessionId;
+
+            if (Environment.UserInteractive)
+            {
+                sessionId = $"{Environment.UserName}_{Environment.MachineName}".Replace("\\", "_");
+                _logger?.LogInformation("Generated default session ID for desktop app. User: {User}, Machine: {Machine}, Session ID: {SessionId}",
+                    Environment.UserName, Environment.MachineName, sessionId);
+            }
+            else
+            {
+                sessionId = $"{Environment.MachineName}_{Process.GetCurrentProcess().Id}";
+                _logger?.LogInformation("Generated default session ID for service. Machine: {Machine}, Process ID: {ProcessId}, Session ID: {SessionId}",
+                    Environment.MachineName, Process.GetCurrentProcess().Id, sessionId);
+            }
+
+            // Store it for future retrieval
+            SetDefaultSessionID(sessionId);
+            return sessionId;
         }
 
         /// <summary>
@@ -522,8 +702,365 @@ namespace ASCTableStorage.Sessions
         /// </summary>
         public static SessionStatistics? GetStatistics()
         {
-            return _backgroundService?.Statistics;
+            _logger?.LogDebug("GetStatistics called");
+
+            if (_backgroundService != null)
+            {
+                _logger?.LogDebug("Returning statistics from background service");
+                return _backgroundService.Statistics;
+            }
+
+            _logger?.LogDebug("No background service available for statistics");
+            return null;
         }
+
+        /// <summary>
+        /// Gets or sets the local session ID using platform-appropriate storage mechanisms.
+        /// Automatically detects the application context and uses the appropriate storage method.
+        /// </summary>
+        /// <remarks>
+        /// Storage mechanisms by platform:
+        /// - Web Applications: HTTP Cookies
+        /// - Desktop Applications: Application Settings/Registry
+        /// - Mobile Applications: Platform-specific secure storage
+        /// - Console/Service Applications: Environment variables or temporary files
+        /// 
+        /// Note: This property requires platform-specific implementation and may need 
+        /// additional dependencies for full cross-platform support.
+        /// </remarks>
+        public static string? LocalSessionID
+        {
+            get
+            {
+                try
+                {
+                    _logger?.LogDebug("Getting LocalSessionID via LocalSessionID from platform-appropriate storage and setting up the apps Session data.");
+                    var platform = DetectAppPlatformAsync().GetAwaiter().GetResult();
+                    string? ret = platform switch
+                    {
+                        AppPlatform.Web => GetWebSessionID(),
+                        AppPlatform.Desktop => GetDesktopSessionID(),
+                        AppPlatform.Mobile => GetMobileSessionID(),
+                        _ => GetDefaultSessionId()
+                    };
+                    // Create a temporary session to check if the session exists and is valid
+                    if (!string.IsNullOrEmpty(ret))
+                    {
+                        var tempSession = new Session(_accountName!, _accountKey!, ret);
+
+                        // If we successfully created the session and it has data, use it
+                        if (tempSession.SessionData != null)
+                        {
+                            lock (_lock)
+                            {
+                                // Dispose of the current session if it exists
+                                _currentSession?.Dispose();
+
+                                // Set the current session to the retrieved session
+                                _currentSession = tempSession;
+                                _sessionId = ret;
+                            }
+                        }
+                    }
+                    return ret;
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Error retrieving LocalSessionID from storage");
+                    return null;
+                }
+            }
+            set
+            {
+                try
+                {
+                    _logger?.LogInformation("Setting LocalSessionID to: {SessionId}", value);
+                    var platform = DetectAppPlatformAsync().GetAwaiter().GetResult();
+
+                    switch (platform)
+                    {
+                        case AppPlatform.Web:
+                            SetWebSessionID(value);
+                            break;
+                        case AppPlatform.Desktop:
+                            SetDesktopSessionID(value);
+                            break;
+                        case AppPlatform.Mobile:
+                            SetMobileSessionID(value);
+                            break;
+                        default:
+                            SetDefaultSessionID(value);
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Error setting LocalSessionID to storage. Value: {SessionId}", value);
+                    throw new InvalidOperationException($"Failed to store LocalSessionID: {ex.Message}", ex);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Determine the platform being used by the app user
+        /// </summary>
+        public static async Task<AppPlatform> DetectAppPlatformAsync()
+        {
+            var checks = new Dictionary<Task<bool>, AppPlatform>
+            {
+                [Task.Run(() => IsWebApplication())] = AppPlatform.Web,
+                [Task.Run(() => IsDesktopApplication())] = AppPlatform.Desktop,
+                [Task.Run(() => IsMobileApplication())] = AppPlatform.Mobile
+            };
+
+            var completed = await Task.WhenAny(checks.Keys);
+            return await completed ? checks[completed] : AppPlatform.Unknown;
+        }
+
+        /// <summary>
+        /// The platform the user is using the application on
+        /// </summary>
+        public enum AppPlatform
+        {
+            /// <summary>
+            /// Web app
+            /// </summary>
+            Web,
+            /// <summary>
+            /// Desktop App
+            /// </summary>
+            Desktop,
+            /// <summary>
+            /// Mobile App
+            /// </summary>
+            Mobile,
+            /// <summary>
+            /// Platform could not easily be determined
+            /// </summary>
+            Unknown
+        }
+
+        #region Platform Detection Methods
+
+        /// <summary>
+        /// Determines if the current application is a web application
+        /// </summary>
+        private static bool IsWebApplication()
+        {
+            try
+            {
+                // Check for common web application indicators
+                var httpContextType = Type.GetType("System.Web.HttpContext, System.Web");
+                var httpContextCurrent = httpContextType?.GetProperty("Current")?.GetValue(null);
+
+                // Also check for ASP.NET Core
+                var httpContextAccessor = Type.GetType("Microsoft.AspNetCore.Http.IHttpContextAccessor, Microsoft.AspNetCore.Http.Abstractions");
+
+                var isWeb = httpContextCurrent != null || httpContextAccessor != null;
+                _logger?.LogDebug("Platform detection - IsWebApplication: {IsWeb}", isWeb);
+                return isWeb;
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogDebug(ex, "Error detecting web application");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Determines if the current application is a desktop application
+        /// </summary>
+        private static bool IsDesktopApplication()
+        {
+            var isDesktop = Environment.UserInteractive && !IsWebApplication();
+            _logger?.LogDebug("Platform detection - IsDesktopApplication: {IsDesktop}", isDesktop);
+            return isDesktop;
+        }
+
+        /// <summary>
+        /// Determines if the current application is a mobile application
+        /// </summary>
+        private static bool IsMobileApplication()
+        {
+            try
+            {
+                // Check for Xamarin/MAUI indicators
+                var xamarinFormsApp = Type.GetType("Xamarin.Forms.Application, Xamarin.Forms.Core");
+                var mauiApp = Type.GetType("Microsoft.Maui.Controls.Application, Microsoft.Maui.Controls");
+
+                var isMobile = xamarinFormsApp != null || mauiApp != null;
+                _logger?.LogDebug("Platform detection - IsMobileApplication: {IsMobile}", isMobile);
+                return isMobile;
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogDebug(ex, "Error detecting mobile application");
+                return false;
+            }
+        }
+
+        #endregion Platform Detection Methods
+
+        #region Platform-Specific Storage Methods
+
+        /// <summary>
+        /// Retrieves session ID from web application storage (cookies)
+        /// </summary>
+        private static string? GetWebSessionID()
+        {
+            // Simplified web cookie reading using reflection
+            try
+            {
+                var context = Type.GetType("System.Web.HttpContext, System.Web")?.GetProperty("Current")?.GetValue(null);
+                var request = context?.GetType().GetProperty("Request")?.GetValue(context);
+                var cookies = request?.GetType().GetProperty("Cookies")?.GetValue(request);
+                var indexer = cookies?.GetType().GetProperty("Item");
+
+                if (indexer != null)
+                {
+                    foreach (string name in new[] { "sessionid", "sessionId", "ASP.NET_SessionId" })
+                    {
+                        var value = indexer.GetValue(cookies, new object[] { name })?.ToString();
+                        if (!string.IsNullOrEmpty(value)) return value;
+                    }
+                }
+            }
+            catch { /* Intentionally ignored */ }
+            return Environment.GetEnvironmentVariable("SESSION_MANAGER_ID"); // Fallback
+        }
+
+        /// <summary>
+        /// Stores session ID to web application storage (cookies)
+        /// </summary>
+        private static void SetWebSessionID(string? sessionId)
+        {
+            // Simplified web cookie writing using reflection
+            try
+            {
+                var context = Type.GetType("System.Web.HttpContext, System.Web")?.GetProperty("Current")?.GetValue(null);
+                var response = context?.GetType().GetProperty("Response")?.GetValue(context);
+                var cookies = response?.GetType().GetProperty("Cookies")?.GetValue(response);
+                var cookieType = Type.GetType("System.Web.HttpCookie, System.Web");
+
+                if (cookies != null && cookieType != null)
+                {
+                    var cookie = Activator.CreateInstance(cookieType, "sessionid", sessionId ?? "");
+                    cookieType.GetProperty("Expires")?.SetValue(cookie, DateTime.Now.AddHours(24));
+                    cookieType.GetProperty("HttpOnly")?.SetValue(cookie, true);
+                    cookies.GetType().GetMethod("Add")?.Invoke(cookies, new[] { cookie });
+                    return;
+                }
+            }
+            catch { /* Intentionally ignored */ }
+
+            // Fallback to environment variable
+            Environment.SetEnvironmentVariable("SESSION_MANAGER_ID", sessionId);
+        }
+
+        /// <summary>
+        /// Retrieves session ID from desktop application storage
+        /// </summary>
+        private static string? GetDesktopSessionID()
+        {
+            // Try file-based storage first, fallback to environment variable
+            try
+            {
+                var filePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MyApp", "session.id");
+                if (File.Exists(filePath)) return File.ReadAllText(filePath).Trim();
+            }
+            catch { /* Intentionally ignored */ }
+
+            return Environment.GetEnvironmentVariable("SESSION_MANAGER_ID");
+        }
+
+        /// <summary>
+        /// Stores session ID to desktop application storage
+        /// </summary>
+        private static void SetDesktopSessionID(string? sessionId)
+        {
+            // Store to both file and environment variable
+            try
+            {
+                var appDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MyApp");
+                Directory.CreateDirectory(appDir);
+                var filePath = Path.Combine(appDir, "session.id");
+
+                if (sessionId != null) File.WriteAllText(filePath, sessionId);
+                else if (File.Exists(filePath)) File.Delete(filePath);
+            }
+            catch { /* File storage failed, continue with environment variable */ }
+
+            Environment.SetEnvironmentVariable("SESSION_MANAGER_ID", sessionId);
+        }
+
+        /// <summary>
+        /// Retrieves session ID from mobile application storage
+        /// </summary>
+        private static string? GetMobileSessionID()
+        {
+            // Try Essentials/Preferences via reflection, fallback to environment variable
+            try
+            {
+                var essentials = Type.GetType("Xamarin.Essentials.Preferences, Xamarin.Essentials") ??
+                                Type.GetType("CommunityToolkit.Maui.Preferences, CommunityToolkit.Maui");
+                var method = essentials?.GetMethod("Get", new[] { typeof(string), typeof(string) });
+                var result = method?.Invoke(null, new object[] { "SessionID", "" }) as string;
+                if (!string.IsNullOrEmpty(result)) return result;
+            }
+            catch { /* Intentionally ignored */ }
+
+            return Environment.GetEnvironmentVariable("SESSION_MANAGER_ID");
+        }
+
+        /// <summary>
+        /// Stores session ID to mobile application storage
+        /// </summary>
+        private static void SetMobileSessionID(string? sessionId)
+        {
+            // Try Essentials/Preferences via reflection, fallback to environment variable
+            try
+            {
+                var essentials = Type.GetType("Xamarin.Essentials.Preferences, Xamarin.Essentials") ??
+                                Type.GetType("CommunityToolkit.Maui.Preferences, CommunityToolkit.Maui");
+                MethodInfo method;
+
+                if (sessionId != null)
+                {
+                    method = essentials?.GetMethod("Set", new[] { typeof(string), typeof(string) })!;
+                    method?.Invoke(null, new object[] { "SessionID", sessionId });
+                }
+                else
+                {
+                    method = essentials?.GetMethod("Remove", new[] { typeof(string) })!;
+                    method?.Invoke(null, new object[] { "SessionID" });
+                }
+            }
+            catch { /* Intentionally ignored */ }
+
+            Environment.SetEnvironmentVariable("SESSION_MANAGER_ID", sessionId);
+        }
+
+        /// <summary>
+        /// Stores session ID to generic application storage
+        /// </summary>
+        private static void SetDefaultSessionID(string? sessionId)
+        {
+            _logger?.LogDebug("Attempting to store session ID to generic storage: {SessionId}", sessionId);
+
+            try
+            {
+                // Fallback to environment variables for generic applications
+                Environment.SetEnvironmentVariable("SESSION_MANAGER_ID", sessionId);
+                _logger?.LogInformation("Stored generic session ID to environment variable: {SessionId}", sessionId);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error storing generic session ID to environment variable: {SessionId}", sessionId);
+                throw;
+            }
+        }
+
+        #endregion Platform-Specific Storage Methods
 
     } // end class SessionManager
 
