@@ -5,6 +5,7 @@ using Microsoft.Azure.Cosmos.Table;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace ASCTableStorage.Data
@@ -2050,6 +2051,49 @@ namespace ASCTableStorage.Data
             return false;
         }
 
+        private readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+        };
+
+        /// <summary>
+        /// Stores a strongly typed object in the session state.
+        /// </summary>
+        /// <typeparam name="T">The type of the object to store.</typeparam>
+        /// <param name="key">The key to use for storing the object.</param>
+        /// <param name="value">The object to store.</param>
+        public void SetObject<T>(string key, T value)
+        {
+            if (string.IsNullOrEmpty(key) || value == null) return;
+
+            byte[] serializedBytes = JsonSerializer.SerializeToUtf8Bytes(value, JsonOptions);
+            this.Set(key, serializedBytes);
+        }
+
+        /// <summary>
+        /// Retrieves a strongly typed object from the session state.
+        /// </summary>
+        /// <typeparam name="T">The type of the object to retrieve.</typeparam>
+        /// <param name="key">The key used to store the object.</param>
+        /// <returns>The deserialized object, or the default value for <typeparamref name="T"/> if the key is not found or the value is null.</returns>
+        public T? GetObject<T>(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return default;
+
+            if (TryGetValue(key, out byte[]? valueBytes) && valueBytes != null)
+            {
+                try
+                {
+                    return JsonSerializer.Deserialize<T>(valueBytes, JsonOptions);
+                }
+                catch (JsonException ex)
+                {
+                    throw new InvalidOperationException($"Failed to deserialize object for key '{key}'.", ex);
+                }
+            }
+
+            return default(T);
+        }
         #endregion
 
         #region Core Implementation Methods (Async-First)

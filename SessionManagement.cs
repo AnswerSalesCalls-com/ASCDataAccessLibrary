@@ -2,6 +2,7 @@
 using ASCTableStorage.Data;
 using ASCTableStorage.Logging;
 using ASCTableStorage.Models;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Azure.Cosmos.Table;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -16,10 +17,60 @@ namespace ASCTableStorage.Sessions
     #region Session Configuration
 
     /// <summary>
+    /// Hosted Service to allow for proper initialization of the HttpContextAccessor for web sessions
+    /// </summary>
+    public class SessionManagerInitializerService : IHostedService
+    {
+        private readonly IServiceProvider _serviceProvider;
+        /// <summary>
+        /// Constructs the Service provider for HttpContext
+        /// </summary>
+        /// <param name="serviceProvider">The service provider</param>
+        public SessionManagerInitializerService(IServiceProvider serviceProvider)
+        {
+            _serviceProvider = serviceProvider;
+        }
+
+        /// <summary>
+        /// Starts up the service
+        /// </summary>
+        /// <param name="cancellationToken">Allows graceful shutdown</param>
+        public Task StartAsync(CancellationToken cancellationToken)
+        {
+            // Resolve dependencies *after* the service provider is built
+            var options = _serviceProvider.GetRequiredService<SessionOptions>();
+            var httpContextAccessor = _serviceProvider.GetService<IHttpContextAccessor>(); // Gets the real instance
+
+            // Pass the resolved accessor to the options
+            options.ContextAccessor = httpContextAccessor!; // Use your property name
+
+            // Now initialize SessionManager with the accessor available in options
+            SessionManager.Initialize(options.AccountName!, options.AccountKey!, opt =>
+            {
+                // Copy properties or pass options directly if signature allows
+                opt.ContextAccessor = options.ContextAccessor; // Ensure it's passed through
+                                                               // ... other options
+            });
+
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Gracefully stops the instance when needed
+        /// </summary>
+        /// <param name="cancellationToken">The stop token</param>
+        public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    /// <summary>
     /// Configuration options for Azure Table-based session management
     /// </summary>
     public class SessionOptions
     {
+        /// <summary>
+        /// Provides a HTTP Context for web applications
+        /// </summary>
+        public IHttpContextAccessor ContextAccessor { get; set; }
         /// <summary>
         /// The unique identifier for the session (optional)
         /// </summary>
@@ -161,6 +212,11 @@ namespace ASCTableStorage.Sessions
     /// </summary>
     public static class SessionManager
     {
+        private const string SessionIdName = "SESSION_MANAGER_ID";
+        // Fields for cross-platform session ID handling
+        private static IHttpContextAccessor? _httpContextAccessor;
+        private const string AspNetSessionCookieName = ".AspNetCore.Session"; // Standard ASP.NET Core session cookie name
+
         private static Session? _currentSession;
         private static string? _accountName;
         private static string? _accountKey;
@@ -171,7 +227,6 @@ namespace ASCTableStorage.Sessions
         private static CancellationTokenSource? _shutdownTokenSource;
         private static SessionBackgroundService? _backgroundService;
         internal static bool _initialized = false;
-
         private static readonly Lazy<ILogger> logger = new Lazy<ILogger>(() =>
         {
             // This code inside the lambda ONLY runs the first time _logger?.Value is accessed
@@ -206,9 +261,17 @@ namespace ASCTableStorage.Sessions
                         if (_currentSession == null)
                         {
                             string sessionId = _sessionId ?? _customIdProvider?.Invoke() ?? LocalSessionID!;
-                            if (_currentSession == null)
+                            if (_currentSession == null && !string.IsNullOrEmpty(sessionId))
+                            {
                                 _currentSession = new Session(_accountName!, _accountKey!, sessionId);
-                            _logger?.LogInformation("New session created successfully. Session ID: {SessionId}", sessionId);
+                                _logger?.LogInformation("New session created successfully. Session ID: {SessionId}", sessionId);
+                            }
+                            if (_currentSession == null)
+                            {
+                                string err = "No Session ID was able to be created in the SessionManager.Current property getter.";
+                                _logger?.LogError(err);
+                                throw new ArgumentNullException("SessionID", err);
+                            }
                         }
                     }
                 }
@@ -245,6 +308,14 @@ namespace ASCTableStorage.Sessions
                     AccountKey = accountKey
                 };
                 configure?.Invoke(options);
+
+                // Capture IHttpContextAccessor from options for web integration
+                _httpContextAccessor = options.ContextAccessor;
+                if (_httpContextAccessor != null)
+                    _logger?.LogInformation("IHttpContextAccessor provided and configured for web integration.");                
+                else                
+                    _logger?.LogDebug("No IHttpContextAccessor provided. Web-specific features will use fallbacks.");
+                
 
                 _logger?.LogDebug("Session options configured. SessionIdStrategy: {Strategy}, CustomIdProvider: {HasCustomProvider}, SessionId: {ExplicitSessionId}",
                     options.IdStrategy,
@@ -377,7 +448,7 @@ namespace ASCTableStorage.Sessions
 
                     // Always commit when timer fires - don't trust DataHasBeenCommitted
                     _currentSession.CommitData();
-                    _logger?.LogInformation("Auto-commit executed successfully for session: {SessionId}", sessionId);
+                    _logger?.LogDebug("Auto-commit executed successfully for session: {SessionId}", sessionId);
                 }
                 else
                 {
@@ -670,7 +741,7 @@ namespace ASCTableStorage.Sessions
         {
             _logger?.LogDebug("Retrieving default session ID from environment or generating fallback");
 
-            var stored = Environment.GetEnvironmentVariable("SESSION_MANAGER_ID");
+            var stored = Environment.GetEnvironmentVariable(SessionIdName);
             if (!string.IsNullOrWhiteSpace(stored))
             {
                 _logger?.LogInformation("Retrieved stored session ID from environment: {SessionId}", stored);
@@ -904,58 +975,57 @@ namespace ASCTableStorage.Sessions
         #region Platform-Specific Storage Methods
 
         /// <summary>
-        /// Retrieves session ID from web application storage (cookies)
+        /// A default fallback SessionID location on the local store if available
         /// </summary>
-        private static string? GetWebSessionID()
-        {
-            // Simplified web cookie reading using reflection
-            try
-            {
-                var context = Type.GetType("System.Web.HttpContext, System.Web")?.GetProperty("Current")?.GetValue(null);
-                var request = context?.GetType().GetProperty("Request")?.GetValue(context);
-                var cookies = request?.GetType().GetProperty("Cookies")?.GetValue(request);
-                var indexer = cookies?.GetType().GetProperty("Item");
+        public static string GetFallBackSessionID()
+            => Environment.GetEnvironmentVariable(SessionIdName) ?? GetDefaultSessionId(); // Fallback cause nothing was ever set        
 
-                if (indexer != null)
+        /// <summary>
+        /// Retrieves session ID from web application cookies
+        /// </summary>
+        public static string? GetWebSessionID()
+        {
+            var cookies = _httpContextAccessor?.HttpContext?.Request?.Cookies;
+            if (cookies == null)
+                return GetFallBackSessionID();
+
+            foreach (var name in new[] { "sessionid", "sessionId", AspNetSessionCookieName })
+            {
+                if (cookies.TryGetValue(name, out var value) && !string.IsNullOrEmpty(value))
                 {
-                    foreach (string name in new[] { "sessionid", "sessionId", "ASP.NET_SessionId" })
-                    {
-                        var value = indexer.GetValue(cookies, new object[] { name })?.ToString();
-                        if (!string.IsNullOrEmpty(value)) return value;
-                    }
+                    _sessionId = value;
+                    break;
                 }
             }
-            catch { /* Intentionally ignored */ }
-            return Environment.GetEnvironmentVariable("SESSION_MANAGER_ID"); // Fallback
+
+            if (string.IsNullOrEmpty(_sessionId))
+                _sessionId = GetFallBackSessionID();
+
+            SetWebSessionID(_sessionId);
+            return _sessionId;
         }
 
         /// <summary>
-        /// Stores session ID to web application storage (cookies)
+        /// Stores session ID to web application cookies
         /// </summary>
-        private static void SetWebSessionID(string? sessionId)
+        public static void SetWebSessionID(string? sessionId)
         {
-            // Simplified web cookie writing using reflection
-            try
+            if (_httpContextAccessor?.HttpContext?.Response?.Cookies is not { } cookies || string.IsNullOrEmpty(sessionId))
             {
-                var context = Type.GetType("System.Web.HttpContext, System.Web")?.GetProperty("Current")?.GetValue(null);
-                var response = context?.GetType().GetProperty("Response")?.GetValue(context);
-                var cookies = response?.GetType().GetProperty("Cookies")?.GetValue(response);
-                var cookieType = Type.GetType("System.Web.HttpCookie, System.Web");
-
-                if (cookies != null && cookieType != null)
-                {
-                    var cookie = Activator.CreateInstance(cookieType, "sessionid", sessionId ?? "");
-                    cookieType.GetProperty("Expires")?.SetValue(cookie, DateTime.Now.AddHours(24));
-                    cookieType.GetProperty("HttpOnly")?.SetValue(cookie, true);
-                    cookies.GetType().GetMethod("Add")?.Invoke(cookies, new[] { cookie });
-                    return;
-                }
+                SetDefaultSessionID(sessionId);
+                return;
             }
-            catch { /* Intentionally ignored */ }
 
-            // Fallback to environment variable
-            Environment.SetEnvironmentVariable("SESSION_MANAGER_ID", sessionId);
+            cookies.Append(SessionIdName, sessionId, new CookieOptions
+            {
+                Expires = DateTimeOffset.UtcNow.AddHours(24),
+                HttpOnly = true,
+                IsEssential = true,
+                Path = "/", // Ensures it's available across the app
+                SameSite = SameSiteMode.Lax // Or None if needed
+            });
         }
+
 
         /// <summary>
         /// Retrieves session ID from desktop application storage
@@ -966,11 +1036,16 @@ namespace ASCTableStorage.Sessions
             try
             {
                 var filePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MyApp", "session.id");
-                if (File.Exists(filePath)) return File.ReadAllText(filePath).Trim();
+                if (File.Exists(filePath)) 
+                    _sessionId = File.ReadAllText(filePath).Trim();
             }
             catch { /* Intentionally ignored */ }
 
-            return Environment.GetEnvironmentVariable("SESSION_MANAGER_ID");
+            if (string.IsNullOrEmpty(_sessionId))
+                _sessionId = GetFallBackSessionID();
+
+            SetDesktopSessionID(_sessionId);
+            return _sessionId;
         }
 
         /// <summary>
@@ -989,8 +1064,6 @@ namespace ASCTableStorage.Sessions
                 else if (File.Exists(filePath)) File.Delete(filePath);
             }
             catch { /* File storage failed, continue with environment variable */ }
-
-            Environment.SetEnvironmentVariable("SESSION_MANAGER_ID", sessionId);
         }
 
         /// <summary>
@@ -1005,11 +1078,16 @@ namespace ASCTableStorage.Sessions
                                 Type.GetType("CommunityToolkit.Maui.Preferences, CommunityToolkit.Maui");
                 var method = essentials?.GetMethod("Get", new[] { typeof(string), typeof(string) });
                 var result = method?.Invoke(null, new object[] { "SessionID", "" }) as string;
-                if (!string.IsNullOrEmpty(result)) return result;
+                if (!string.IsNullOrEmpty(result)) 
+                    _sessionId = result;
             }
             catch { /* Intentionally ignored */ }
 
-            return Environment.GetEnvironmentVariable("SESSION_MANAGER_ID");
+            if (string.IsNullOrEmpty(_sessionId))
+                _sessionId = GetFallBackSessionID();
+
+            SetMobileSessionID(_sessionId);
+            return _sessionId;
         }
 
         /// <summary>
@@ -1036,8 +1114,6 @@ namespace ASCTableStorage.Sessions
                 }
             }
             catch { /* Intentionally ignored */ }
-
-            Environment.SetEnvironmentVariable("SESSION_MANAGER_ID", sessionId);
         }
 
         /// <summary>
@@ -1050,7 +1126,7 @@ namespace ASCTableStorage.Sessions
             try
             {
                 // Fallback to environment variables for generic applications
-                Environment.SetEnvironmentVariable("SESSION_MANAGER_ID", sessionId);
+                Environment.SetEnvironmentVariable(SessionIdName, sessionId);
                 _logger?.LogInformation("Stored generic session ID to environment variable: {SessionId}", sessionId);
             }
             catch (Exception ex)
@@ -1676,10 +1752,6 @@ namespace ASCTableStorage.Sessions
         /// <summary>
         /// Add Azure Table sessions to services (ASP.NET Core)
         /// </summary>
-        /// <param name="services">The managed service collection</param>
-        /// <param name="accountName">Name of the database in Azure Tables</param>
-        /// <param name="accountKey">Key credential of the database</param>
-        /// <param name="configure">Session Options</param>
         public static IServiceCollection AddAzureTableSessions(this IServiceCollection services, string accountName, string accountKey, Action<SessionOptions>? configure = null)
         {
             var options = new SessionOptions
@@ -1694,6 +1766,14 @@ namespace ASCTableStorage.Sessions
             services.AddSingleton(options);
             services.AddHostedService<SessionBackgroundService>();
 
+            // Automatically add IHttpContextAccessor if needed
+            if (options.IdStrategy == SessionIdStrategy.HttpContext)
+            {
+                services.AddHttpContextAccessor();
+                // Register a hosted service to perform the actual initialization
+                services.AddHostedService<SessionManagerInitializerService>();
+            }
+
             // Initialize SessionManager
             SessionManager.Initialize(accountName, accountKey, configure);
 
@@ -1703,9 +1783,6 @@ namespace ASCTableStorage.Sessions
         /// <summary>
         /// Add Azure Table sessions with configuration
         /// </summary>
-        /// <param name="services">The managed service collection</param>
-        /// <param name="configure">Session Options</param>
-        /// <exception cref="ArgumentException"></exception>
         public static IServiceCollection AddAzureTableSessions(this IServiceCollection services, Action<SessionOptions> configure)
         {
             var options = new SessionOptions();
@@ -1722,17 +1799,12 @@ namespace ASCTableStorage.Sessions
         /// <summary>
         /// Add Azure Table sessions to host builder
         /// </summary>
-        /// <param name="builder">Builder object from application satup</param>
-        /// <param name="accountName">Name of the database in Azure Tables</param>
-        /// <param name="accountKey">Key credential of the database</param>
-        /// <param name="configure">Session Options</param>
-        public static IHostBuilder AddAzureTableSessions(this IHostBuilder builder, string accountName, string accountKey, Action<SessionOptions>? configure = null)        
+        public static IHostBuilder AddAzureTableSessions(this IHostBuilder builder, string accountName, string accountKey, Action<SessionOptions>? configure = null)
             => builder.ConfigureServices((context, services) =>
             {
                 services.AddAzureTableSessions(accountName, accountKey, configure);
             });
-
-    } // end class SessionExtensions
+    } // end SessionExtensions
 
     #endregion Extension Methods
 
