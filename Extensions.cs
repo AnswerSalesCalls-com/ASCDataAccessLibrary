@@ -1,5 +1,7 @@
 ﻿using ASCTableStorage.Models;
 using Newtonsoft.Json;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace ASCTableStorage.Common
 {
@@ -58,5 +60,15 @@ namespace ASCTableStorage.Common
         /// </summary>
         /// <returns>The option</returns>
         public static JsonSerializerSettings NewtonSoftRemoveNulls() { return new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore }; }
+
+        /// <summary>
+        /// Basic options for all serialization
+        /// </summary>
+        public static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            PropertyNameCaseInsensitive = true, 
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault
+        };
     }
 }

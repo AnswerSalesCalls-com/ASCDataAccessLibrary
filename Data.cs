@@ -1909,7 +1909,6 @@ namespace ASCTableStorage.Data
         private string? m_sessionID;
         private List<AppSessionData> m_sessionData = new List<AppSessionData>();
         private readonly DataAccess<AppSessionData> m_da;
-        private readonly Dictionary<string, byte[]> _cache = new Dictionary<string, byte[]>();
 
         /// <summary>
         /// Constructor initializes the configuration and data access setup
@@ -1981,7 +1980,7 @@ namespace ASCTableStorage.Data
         void ISession.Clear()
         {
             RestartSession();
-            _cache.Clear();
+            m_sessionData?.Clear();
         }
 
         /// <summary>
@@ -2006,7 +2005,7 @@ namespace ASCTableStorage.Data
         void ISession.Remove(string key)
         {
             m_sessionData?.RemoveAll(s => s.Key == key);
-            _cache.Remove(key);
+            DataHasBeenCommitted = false;
         }
 
         /// <summary>
@@ -2014,47 +2013,44 @@ namespace ASCTableStorage.Data
         /// </summary>
         public void Set(string key, byte[] value)
         {
-            _cache[key] = value;
-            var data = this[key];
-            if (data != null)
+            if (string.IsNullOrEmpty(key))
+                throw new ArgumentException("Key cannot be null or empty.", nameof(key));
+
+            DataHasBeenCommitted = false;
+            if (value == null)
             {
-                data.Value = Convert.ToBase64String(value);
+                // If value is null, remove the key (standard session behavior)
+                ((ISession)this).Remove(key);
+                return;
             }
+
+            this[key]!.Value = value;
         }
 
         /// <summary>
-        /// ISession - Tries to get a byte array value from the session
+        /// ISession - Tries to get a byte array value from the session.
         /// </summary>
+        /// <param name="key">The key of the value to retrieve.</param>
+        /// <param name="value">When this method returns, contains the byte array value 
+        /// associated with the specified key, if the key is found; otherwise, null.</param>
+        /// <returns>true if the key is found and the value is a byte array; otherwise, false.</returns>
+        /// <remarks>
+        /// This implementation assumes AppSessionData.Value directly stores the byte[] object.
+        /// </remarks>
         public bool TryGetValue(string key, out byte[] value)
         {
-            if (_cache.TryGetValue(key, out value!))
+            value = null!;
+            if (string.IsNullOrEmpty(key))
+                return false;
+
+            AppSessionData? data = this[key];
+            if (data != null && data.Value != null && data.Value is byte[] byteArray)
             {
+                value = byteArray;
                 return true;
             }
-            var data = this[key];
-            if (data != null && !string.IsNullOrEmpty(data.Value))
-            {
-                try
-                {
-                    value = Convert.FromBase64String(data.Value);
-                    _cache[key] = value;
-                    return true;
-                }
-                catch
-                {
-                    value = System.Text.Encoding.UTF8.GetBytes(data.Value);
-                    _cache[key] = value;
-                    return true;
-                }
-            }
-            value = null!;
             return false;
         }
-
-        private readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
-        {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-        };
 
         /// <summary>
         /// Stores a strongly typed object in the session state.
@@ -2065,9 +2061,8 @@ namespace ASCTableStorage.Data
         public void SetObject<T>(string key, T value)
         {
             if (string.IsNullOrEmpty(key) || value == null) return;
-
-            byte[] serializedBytes = JsonSerializer.SerializeToUtf8Bytes(value, JsonOptions);
-            this.Set(key, serializedBytes);
+            this[key]!.Value = value ;
+            DataHasBeenCommitted = false;
         }
 
         /// <summary>
@@ -2080,20 +2075,16 @@ namespace ASCTableStorage.Data
         {
             if (string.IsNullOrEmpty(key)) return default;
 
-            if (TryGetValue(key, out byte[]? valueBytes) && valueBytes != null)
+            var data = this[key];
+            if (data != null && data._rawValue != null)
             {
-                try
-                {
-                    return JsonSerializer.Deserialize<T>(valueBytes, JsonOptions);
-                }
-                catch (JsonException ex)
-                {
-                    throw new InvalidOperationException($"Failed to deserialize object for key '{key}'.", ex);
-                }
+                byte[] bytes = Convert.FromBase64String(data._rawValue);
+                return JsonSerializer.Deserialize<T>(bytes, Functions.JsonOptions); ;
             }
-
-            return default(T);
+                
+            return default;
         }
+
         #endregion
 
         #region Core Implementation Methods (Async-First)
@@ -2289,7 +2280,7 @@ namespace ASCTableStorage.Data
         public AppSessionData? this[string key]
         {
             get { return Find(key); }
-            set { Find(key)!.Value = value!.ToString(); DataHasBeenCommitted = false; }
+            set { Find(key)!.Value = value; DataHasBeenCommitted = false; }
         }
 
         /// <summary>

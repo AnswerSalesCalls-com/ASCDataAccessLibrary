@@ -1,6 +1,6 @@
-﻿using ASCTableStorage.Data;
+﻿using ASCTableStorage.Common;
+using ASCTableStorage.Data;
 using Microsoft.Azure.Cosmos.Table;
-using Newtonsoft.Json;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -8,6 +8,7 @@ using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Xml.Serialization;
@@ -611,7 +612,7 @@ namespace ASCTableStorage.Models
                 or long or ulong or float or double or decimal
                 or DateTime or DateTimeOffset or Guid
                     ? value
-                    : JsonConvert.SerializeObject(value);
+                    : JsonSerializer.Serialize(value, Functions.JsonOptions);
 
             // Optional: re-evaluate keys if needed
             ReevaluateKeysIfNeeded(name, _properties[name]);
@@ -694,9 +695,9 @@ namespace ASCTableStorage.Models
             try
             {
                 string json = value as string
-                    ?? JsonConvert.SerializeObject(value); // Boxed primitives, etc.
+                    ?? JsonSerializer.Serialize(value, Functions.JsonOptions); // Boxed primitives, etc.
 
-                return JsonConvert.DeserializeObject<T>(json);
+                return JsonSerializer.Deserialize<T>(json, Functions.JsonOptions);
             }
             catch
             {
@@ -772,7 +773,7 @@ namespace ASCTableStorage.Models
         /// <param name="jsonConfig">The JSON configuration string</param>
         public static KeyPatternConfig LoadPatternConfig(string jsonConfig)
         {
-            return JsonConvert.DeserializeObject<KeyPatternConfig>(jsonConfig) ?? new KeyPatternConfig();
+            return JsonSerializer.Deserialize<KeyPatternConfig>(jsonConfig, Functions.JsonOptions) ?? new KeyPatternConfig();
         }
 
         /// <summary>
@@ -783,7 +784,7 @@ namespace ASCTableStorage.Models
         /// <param name="patternConfig">Optional: custom pattern configuration</param>
         public static DynamicEntity CreateFromJson(string tableName, string json, KeyPatternConfig? patternConfig = null)
         {
-            var properties = JsonConvert.DeserializeObject<Dictionary<string, object>>(json) ?? new Dictionary<string, object>();
+            var properties = JsonSerializer.Deserialize<Dictionary<string, object>>(json, Functions.JsonOptions) ?? new Dictionary<string, object>();
             return new DynamicEntity(tableName, properties, patternConfig);
         }
 
@@ -1056,7 +1057,7 @@ namespace ASCTableStorage.Models
                     // If it looks like JSON, try to deserialize
                     if (stringValue.StartsWith("{") || stringValue.StartsWith("["))
                     {
-                        return JsonConvert.DeserializeObject(stringValue, underlyingType);
+                        return JsonSerializer.Deserialize(stringValue, underlyingType, Functions.JsonOptions);
                     }
                 }
                 catch { /* ignore */ }
@@ -1221,7 +1222,7 @@ namespace ASCTableStorage.Models
             // Serialize everything else to JSON
             try
             {
-                string json = JsonConvert.SerializeObject(value);
+                string json = JsonSerializer.Serialize(value, Functions.JsonOptions);
                 return new EntityProperty(json);
             }
             catch
@@ -1318,10 +1319,69 @@ namespace ASCTableStorage.Models
             get { return base.RowKey; }
             set { base.RowKey = value; }
         }
+
+        internal string? _rawValue;
         /// <summary>
         /// Data of the object for retrieval
         /// </summary>
-        public string? Value { get; set; }
+        public object? Value
+        {
+            get
+            {
+                if (string.IsNullOrEmpty(_rawValue))
+                    return null;
+
+                // Try base64 decode → deserialize
+                try
+                {
+                    byte[] bytes = Convert.FromBase64String(_rawValue);
+                    return JsonSerializer.Deserialize<object>(bytes, Functions.JsonOptions);
+                }
+                catch
+                {
+                    // Not base64 or not serialized → return raw string
+                    return _rawValue;
+                }
+            }
+            set
+            {
+                if (value == null)
+                {
+                    _rawValue = null;
+                    return;
+                }
+
+                if (value is string str)
+                {
+                    _rawValue = str;
+                }
+                else if (value is byte[] bytes)
+                {
+                    _rawValue = Convert.ToBase64String(bytes);
+                }
+                else
+                {
+                    byte[] serialized = JsonSerializer.SerializeToUtf8Bytes(value, Functions.JsonOptions);
+                    _rawValue = Convert.ToBase64String(serialized);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Allows for backward compatibiilty if the developer knows the value is supposed to be a string this allows that expectation
+        /// </summary>
+        /// <param name="data">The data to manage</param>
+        public static explicit operator string?(AppSessionData? data)
+            => data?.ToString();
+
+        /// <summary>
+        /// Allows for direct string manipulation to get the string value maintained by the instance.
+        /// Assumes you are knowledgeable on the data being maintained by the instance. 
+        /// Can produce unexpected results otherwise
+        /// </summary>
+        public override string ToString()
+          => this.Value?.ToString()!;        
+
         /// <summary>
         /// The table that will get created in your Table Storage account for managing session data.
         /// </summary>
@@ -2000,7 +2060,6 @@ namespace ASCTableStorage.Models
         /// </summary>
         [JsonInclude]
         [JsonPropertyName("CurrentIndex")]
-        [JsonProperty("CurrentIndex")]
         public int CurrentIndex { get; set; } = -1;
 
         /// <summary>
@@ -2008,7 +2067,6 @@ namespace ASCTableStorage.Models
         /// </summary>
         [JsonInclude]
         [JsonPropertyName("Description")]
-        [JsonProperty("Description")]
         public string? Description { get; set; }
 
         /// <summary>
@@ -2016,7 +2074,6 @@ namespace ASCTableStorage.Models
         /// </summary>
         [JsonInclude]
         [JsonPropertyName("Items")]
-        [JsonProperty("Items")]
         public List<T> Items
         {
             get => _items;

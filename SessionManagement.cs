@@ -156,9 +156,10 @@ namespace ASCTableStorage.Sessions
         }
 
         /// <summary>
-        /// Auto-commit interval (set to TimeSpan.Zero to disable, default is 10 seconds)
+        /// Auto-commit interval (set to TimeSpan.Zero to disable, default is 500 milliseconds or half a second).
+        /// Determines how quickly session will auto update to the data store.
         /// </summary>
-        public TimeSpan AutoCommitInterval { get; set; } = TimeSpan.FromSeconds(10);
+        public TimeSpan AutoCommitInterval { get; set; } = TimeSpan.FromMilliseconds(500);
 
         /// <summary>
         /// Delay before starting the first cleanup run (default: 30 seconds)
@@ -216,7 +217,7 @@ namespace ASCTableStorage.Sessions
         // Fields for cross-platform session ID handling
         private static IHttpContextAccessor? _httpContextAccessor;
         private const string AspNetSessionCookieName = ".AspNetCore.Session"; // Standard ASP.NET Core session cookie name
-
+        private static readonly ConcurrentDictionary<string, Session> _multiSessions = new();
         private static Session? _currentSession;
         private static string? _accountName;
         private static string? _accountKey;
@@ -278,6 +279,21 @@ namespace ASCTableStorage.Sessions
 
                 return _currentSession;
             }
+        }
+
+        /// <summary>
+        /// Gets or creates a session with the specified ID
+        /// </summary>
+        public static Session GetSession(string sessionId)
+        {
+            if (!_initialized)
+                throw new InvalidOperationException("SessionManager not initialized");
+
+            return _multiSessions.GetOrAdd(sessionId, id =>
+            {
+                _logger?.LogInformation("Creating new multi-session: {SessionId}", id);
+                return new Session(_accountName!, _accountKey!, id);
+            });
         }
 
         /// <summary>
@@ -441,25 +457,53 @@ namespace ASCTableStorage.Sessions
 
             try
             {
-                if (_currentSession != null)
-                {
-                    var sessionId = _currentSession.SessionID;
-                    _logger?.LogDebug("Executing auto-commit for session: {SessionId}", sessionId);
+                var sessionsToCommit = new List<Session>();
 
-                    // Always commit when timer fires - don't trust DataHasBeenCommitted
-                    _currentSession.CommitData();
-                    _logger?.LogDebug("Auto-commit executed successfully for session: {SessionId}", sessionId);
+                // Check current session
+                if (_currentSession != null && !_currentSession.DataHasBeenCommitted)
+                {
+                    sessionsToCommit.Add(_currentSession);
+                    _logger?.LogDebug("Current session needs commit: {SessionId}", _currentSession.SessionID);
+                }
+
+                // Check multi-sessions
+                foreach (var kvp in _multiSessions)
+                {
+                    if (!kvp.Value.DataHasBeenCommitted)
+                    {
+                        sessionsToCommit.Add(kvp.Value);
+                        _logger?.LogDebug("Multi-session needs commit: {SessionId}", kvp.Key);
+                    }
+                }
+
+                // Commit all dirty sessions
+                if (sessionsToCommit.Count > 0)
+                {
+                    _logger?.LogDebug("Auto-committing {Count} dirty sessions", sessionsToCommit.Count);
+
+                    Parallel.ForEach(sessionsToCommit, session =>
+                    {
+                        try
+                        {
+                            session.CommitData();
+                            _logger?.LogDebug("Auto-committed session: {SessionId}", session.SessionID);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger?.LogError(ex, "Failed to auto-commit session: {SessionId}", session.SessionID);
+                        }
+                    });
                 }
                 else
                 {
-                    _logger?.LogDebug("No current session to auto-commit");
+                    _logger?.LogDebug("No dirty sessions to auto-commit");
                 }
             }
             catch (Exception ex)
             {
-                _logger?.LogError(ex, "Auto-commit failed for current session");
+                _logger?.LogError(ex, "Error in auto-commit callback");
             }
-        }
+        } // end AutoCommitCallback()
 
         /// <summary>
         /// Handle process exit
@@ -517,19 +561,23 @@ namespace ASCTableStorage.Sessions
             {
                 lock (_lock)
                 {
-                    if (_currentSession != null)
+                    // Commit current session
+                    if (_currentSession != null && !_currentSession.DataHasBeenCommitted)
                     {
                         var sessionId = _currentSession.SessionID;
-                        _logger?.LogInformation("Committing session data before shutdown. Session ID: {SessionId}", sessionId);
-
-                        // ALWAYS commit on shutdown, ignore DataHasBeenCommitted flag
-                        // Use synchronous commit to ensure it completes
+                        _logger?.LogInformation("Committing current session during shutdown. Session ID: {SessionId}", sessionId);
                         _currentSession.CommitData();
-                        _logger?.LogInformation("Session data committed successfully during shutdown. Session ID: {SessionId}", sessionId);
+                        _logger?.LogDebug("Current session committed. Session ID: {SessionId}", sessionId);
                     }
-                    else
+
+                    // Commit multi-sessions
+                    foreach (var kvp in _multiSessions)
                     {
-                        _logger?.LogDebug("No session to commit during shutdown");
+                        if (!kvp.Value.DataHasBeenCommitted)
+                        {
+                            _logger?.LogInformation("Committing multi-session during shutdown. Session ID: {SessionId}", kvp.Key);
+                            kvp.Value.CommitData();
+                        }
                     }
                 }
 
@@ -582,6 +630,7 @@ namespace ASCTableStorage.Sessions
                         _autoCommitTimer = null;
                     }
 
+                    // Dispose current session
                     if (_currentSession != null)
                     {
                         var sessionId = _currentSession.SessionID;
@@ -595,10 +644,15 @@ namespace ASCTableStorage.Sessions
                         _logger?.LogInformation("Current session disposed. Session ID: {SessionId}", sessionId);
                         _currentSession = null;
                     }
-                    else
+
+                    // Dispose multi-sessions
+                    foreach (var kvp in _multiSessions)
                     {
-                        _logger?.LogDebug("No current session to dispose during shutdown");
+                        _logger?.LogInformation("Disposing multi-session. Session ID: {SessionId}", kvp.Key);
+                        kvp.Value.CommitData();
+                        kvp.Value.Dispose();
                     }
+                    _multiSessions.Clear();
                 }
                 finally
                 {
@@ -655,14 +709,12 @@ namespace ASCTableStorage.Sessions
                     await _currentSession.CommitDataAsync();
                     _logger?.LogInformation("Session data committed asynchronously during shutdown. Session ID: {SessionId}", sessionId);
                 }
-                else if (_currentSession != null)
-                {
-                    _logger?.LogDebug("Session data already committed, skipping async commit during shutdown. Session ID: {SessionId}", _currentSession.SessionID);
-                }
-                else
-                {
-                    _logger?.LogDebug("No current session to commit during async shutdown");
-                }
+
+                // Commit multi-sessions
+                var tasks = _multiSessions
+                    .Where(kvp => !kvp.Value.DataHasBeenCommitted)
+                    .Select(kvp => kvp.Value.CommitDataAsync());
+                await Task.WhenAll(tasks);
             }
             catch (Exception ex)
             {
@@ -672,7 +724,7 @@ namespace ASCTableStorage.Sessions
             {
                 Shutdown();
             }
-        }
+        } // end ShutDownAsync()
 
         /// <summary>
         /// Commits data from the current session
@@ -766,6 +818,23 @@ namespace ASCTableStorage.Sessions
             // Store it for future retrieval
             SetDefaultSessionID(sessionId);
             return sessionId;
+        }
+
+        /// <summary>
+        /// Force flush all pending session data
+        /// </summary>
+        public static async Task FlushAsync()
+        {
+            var tasks = new List<Task<bool>>();
+
+            if (_currentSession != null && !_currentSession.DataHasBeenCommitted)
+                tasks.Add(_currentSession.CommitDataAsync());
+
+            tasks.AddRange(_multiSessions
+                .Where(kvp => !kvp.Value.DataHasBeenCommitted)
+                .Select(kvp => kvp.Value.CommitDataAsync()));
+
+            await Task.WhenAll(tasks);
         }
 
         /// <summary>
