@@ -367,7 +367,7 @@ namespace ASCTableStorage.Data
             string queryString = TableQuery.GenerateFilterCondition("RowKey", QueryComparisons.Equal, rowKeyID);
             TableQuery<T> q = new TableQuery<T>().Where(queryString);
             var results = await GetCollectionCore(q);
-            return results.FirstOrDefault()!;
+            return results?.FirstOrDefault()!;
         }
 
         /// <summary>
@@ -378,7 +378,7 @@ namespace ASCTableStorage.Data
             string queryString = $"{fieldName} {howToCompare} '{fieldValue}'";
             TableQuery<T> q = new TableQuery<T>().Where(queryString);
             var results = await GetCollectionCore(q);
-            return results.FirstOrDefault()!;
+            return results?.FirstOrDefault()!;
         }
 
         /// <summary>
@@ -387,7 +387,7 @@ namespace ASCTableStorage.Data
         private async Task<T> GetRowObjectCore(Expression<Func<T, bool>> predicate)
         {
             var results = await GetCollectionCore(predicate);
-            return results.FirstOrDefault()!;
+            return results?.FirstOrDefault()!;
         }
 
         /// <summary>
