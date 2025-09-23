@@ -2076,16 +2076,68 @@ namespace ASCTableStorage.Data
             if (string.IsNullOrEmpty(key)) return default;
 
             var data = this[key];
-            if (data != null && data._rawValue != null)
-            {
-                byte[] bytes = Convert.FromBase64String(data._rawValue);
-                return JsonSerializer.Deserialize<T>(bytes, Functions.JsonOptions); ;
-            }
+            if (data != null && data.Value != null)
+                return JsonSerializer.Deserialize<T>(data.Value.ToString()!, Functions.JsonOptions); ;
                 
             return default;
         }
 
-        #endregion
+        /// <summary>
+        /// Sets an int value in the <see cref="ISession"/>.
+        /// </summary>
+        /// <param name="key">The key to assign.</param>
+        /// <param name="value">The value to assign.</param>
+        public void SetInt32(string key, int value)
+        {
+            Find(key)!.Value = value;
+        }
+
+        /// <summary>
+        /// Gets an int value from <see cref="ISession"/>.
+        /// </summary>
+        /// <param name="key">The key to read.</param>
+        public int? GetInt32(string key)
+        {
+            var data = Find(key);
+            string val = data?.Value?.ToString()!;
+            Int32.TryParse(val, out var val2);
+            return val2;
+        }
+
+        /// <summary>
+        /// Sets a <see cref="string"/> value in the <see cref="ISession"/>.
+        /// </summary>
+        /// <param name="key">The key to assign.</param>
+        /// <param name="value">The value to assign.</param>
+        public void SetString(string key, string value)
+            => Find(key)!.Value = value;        
+
+        /// <summary>
+        /// Gets a string value from <see cref="ISession"/>.
+        /// </summary>
+        /// <param name="key">The key to read.</param>
+        public string? GetString(string key)
+        {
+            var data = Find(key);
+            if (data == null)
+            {
+                return null;
+            }
+            return data.ToString();
+        }
+
+        /// <summary>
+        /// Gets a byte-array value from <see cref="ISession"/>.
+        /// </summary>
+        /// <param name="key">The key to read.</param>
+        public byte[]? Get(string key)
+        {
+            TryGetValue(key, out var value);
+            return value;
+        }
+
+
+        #endregion ISession Implementation
 
         #region Core Implementation Methods (Async-First)
 

@@ -1320,7 +1320,8 @@ namespace ASCTableStorage.Models
             set { base.RowKey = value; }
         }
 
-        internal string? _rawValue;
+        private const string PREFIX = "B64J:"; // Base64 JSON prefix - unique but short
+        private string? _rawValue;
         /// <summary>
         /// Data of the object for retrieval
         /// </summary>
@@ -1328,20 +1329,30 @@ namespace ASCTableStorage.Models
         {
             get
             {
-                if (string.IsNullOrEmpty(_rawValue))
+                if (string.IsNullOrWhiteSpace(_rawValue))
                     return null;
 
-                // Try base64 decode → deserialize
-                try
+                // Skip our prefix if present
+                var data = _rawValue.StartsWith(PREFIX)
+                    ? _rawValue.Substring(PREFIX.Length)
+                    : _rawValue;
+
+                var jsonBytes = Convert.FromBase64String(data);
+                var json = Encoding.UTF8.GetString(jsonBytes);
+
+                // Parse to get the actual value type
+                using var doc = JsonDocument.Parse(json);
+                var element = doc.RootElement;
+
+                return element.ValueKind switch
                 {
-                    byte[] bytes = Convert.FromBase64String(_rawValue);
-                    return JsonSerializer.Deserialize<object>(bytes, Functions.JsonOptions);
-                }
-                catch
-                {
-                    // Not base64 or not serialized → return raw string
-                    return _rawValue;
-                }
+                    JsonValueKind.String => element.GetString(),
+                    JsonValueKind.Number => element.TryGetInt32(out var i) ? i : element.GetDouble(),
+                    JsonValueKind.True => true,
+                    JsonValueKind.False => false,
+                    JsonValueKind.Null => null,
+                    _ => json // Return complex objects as JSON string
+                };
             }
             set
             {
@@ -1351,19 +1362,21 @@ namespace ASCTableStorage.Models
                     return;
                 }
 
-                if (value is string str)
+                // If it's already prefixed (coming back from storage), store as-is
+                if (value is EntityProperty entityProp &&
+                    entityProp.StringValue?.StartsWith(PREFIX) == true)
                 {
-                    _rawValue = str;
+                    _rawValue = entityProp.StringValue;
+                    return;
                 }
-                else if (value is byte[] bytes)
-                {
-                    _rawValue = Convert.ToBase64String(bytes);
-                }
-                else
-                {
-                    byte[] serialized = JsonSerializer.SerializeToUtf8Bytes(value, Functions.JsonOptions);
-                    _rawValue = Convert.ToBase64String(serialized);
-                }
+
+                // Extract from EntityProperty if needed
+                var actualValue = value is EntityProperty ep ? ep.StringValue : value;
+
+                // Serialize and prefix
+                var json = JsonSerializer.Serialize(actualValue, Functions.JsonOptions);
+                var jsonBytes = Encoding.UTF8.GetBytes(json);
+                _rawValue = PREFIX + Convert.ToBase64String(jsonBytes);
             }
         }
 
