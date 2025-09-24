@@ -2,6 +2,7 @@
 using ASCTableStorage.Models;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Azure.Cosmos.Table;
+using System.Globalization;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Text;
@@ -2124,6 +2125,97 @@ namespace ASCTableStorage.Data
                 return null;
             }
             return data.ToString();
+        }
+
+        /// <summary>
+        /// Retrieves a session value by key and attempts to parse it as a local DateTime.
+        /// Returns DateTime.MinValue if parsing fails or the key is missing.
+        /// </summary>
+        /// <param name="key">The key to retrieve.</param>
+        /// <returns>A parsed DateTime or DateTime.MinValue.</returns>
+        public DateTime GetDateTime(string key)
+        {
+            var value = GetString(key);
+            return DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out var result)
+                ? result
+                : DateTime.MinValue;
+        }
+
+        /// <summary>
+        /// Retrieves a session value by key and attempts to parse it as a UTC DateTime.
+        /// Returns DateTime.MinValue if parsing fails or the key is missing.
+        /// </summary>
+        /// <param name="key">The key to retrieve.</param>
+        /// <returns>A parsed UTC DateTime or DateTime.MinValue.</returns>
+        public DateTime GetUtcDateTime(string key)
+        {
+            var value = GetString(key);
+            return DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var result)
+                ? result
+                : DateTime.MinValue;
+        }
+
+        /// <summary>
+        /// Retrieves a session value by key and formats it as a currency string.
+        /// </summary>
+        /// <param name="key">The session key to retrieve.</param>
+        /// <param name="cultureName">
+        /// Optional culture name for formatting (e.g., "en-US", "fr-FR").
+        /// Defaults to "en-US" if not specified.
+        /// </param>
+        /// <returns>
+        /// A formatted currency string based on the parsed value and culture.
+        /// Returns "$0.00" if the value is missing or invalid.
+        /// </returns>
+        /// <example>
+        /// <code>
+        /// var usd = GetCurrency("CartTotal");           // "$123.45"
+        /// var euro = GetCurrency("CartTotal", "fr-FR"); // "123,45 €"
+        /// </code>
+        /// </example>
+        public string GetCurrencyString(string key, string cultureName = "en-US")
+        {
+            var raw = GetString(key);
+            if (string.IsNullOrWhiteSpace(raw) || !double.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var value))
+                return "$0.00"; // fallback
+
+            var culture = new CultureInfo(cultureName);
+            return value.ToString("C", culture);
+        }
+
+        /// <summary>
+        /// Retrieves a session value by key and attempts to parse it as a boolean.
+        /// </summary>
+        /// <param name="key">The session key to retrieve.</param>
+        /// <returns>
+        /// A parsed boolean value. Returns <c>false</c> if the value is missing, empty, or cannot be parsed.
+        /// </returns>
+        /// <remarks>
+        /// Accepts "true", "false", "1", "0", "yes", "no" (case-insensitive).
+        /// </remarks>
+        /// <example>
+        /// <code>
+        /// bool isAdmin = GetBool("IsAdmin"); // true or false
+        /// </code>
+        /// </example>
+        public bool GetBool(string key)
+        {
+            var raw = GetString(key);
+            if (string.IsNullOrWhiteSpace(raw))
+                return false;
+
+            raw = raw.Trim().ToLowerInvariant();
+
+            return raw switch
+            {
+                "true" => true,
+                "1" => true,
+                "yes" => true,
+                "false" => false,
+                "0" => false,
+                "no" => false,
+                _ => bool.TryParse(raw, out var result) && result
+            };
         }
 
         /// <summary>
