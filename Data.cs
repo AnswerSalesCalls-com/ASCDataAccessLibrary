@@ -347,17 +347,35 @@ namespace ASCTableStorage.Data
             return await GetCollectionCore(ResolveTableName(), definedQuery);
         }
 
+        /// <summary>
+        /// The primary function in all the code that retrieves data from the Tables
+        /// </summary>
+        /// <param name="tableName">Name of the table</param>
+        /// <param name="definedQuery">The query derived from all source types</param>
         private async Task<List<T>> GetCollectionCore(string tableName, TableQuery<T> definedQuery)
         {
             CloudTable table = await GetTableCore(tableName);
             var results = new List<T>();
             TableContinuationToken token = null!;
+
+            var resolver = new EntityResolver<T>((pk, rk, ts, props, etag) =>
+            {
+                var entity = Activator.CreateInstance<T>();
+                entity.ReadEntity(props, null!);
+                entity.PartitionKey = pk;
+                entity.RowKey = rk;
+                entity.Timestamp = ts;
+                entity.ETag = etag;
+                return entity;
+            });
+
             do
             {
-                var segment = await table.ExecuteQuerySegmentedAsync(definedQuery, token);
-                results.AddRange(segment);
+                var segment = await table.ExecuteQuerySegmentedAsync(definedQuery, resolver, token);
+                results.AddRange(segment.Results);
                 token = segment.ContinuationToken;
             } while (token != null);
+
             return results;
         }
 

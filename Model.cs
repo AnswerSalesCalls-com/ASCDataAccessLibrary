@@ -4,6 +4,7 @@ using Microsoft.Azure.Cosmos.Table;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -936,47 +937,43 @@ namespace ASCTableStorage.Models
         /// <param name="ctx">The data context</param>
         public virtual void ReadEntity(IDictionary<string, EntityProperty> props, OperationContext ctx)
         {
-            // Get cached property lookup for this type
             var propertyLookup = TableEntityTypeCache.GetPropertyLookup(this.GetType());
-
-            // Track which properties we've processed
             var processedProps = new HashSet<string>();
+            var systemProps = new HashSet<string> { "PartitionKey", "RowKey", "Timestamp", "ETag", "odata.etag" };
 
-            // Find string overflow fields
+            // Handle overflow fields
             var overflowFields = props
                 .Where(p => p.Value.PropertyType == EdmType.String && p.Key.Contains(fieldExtendedName))
                 .ToList();
 
-            if (overflowFields.Any())
+            if (overflowFields.Count > 0)
             {
-                List<string> origFieldNames = overflowFields
+                var origFieldNames = overflowFields
                     .Select(p => p.Key.Substring(0, p.Key.IndexOf(fieldExtendedName)))
                     .Distinct()
                     .ToList();
 
-                foreach (string origField in origFieldNames)
+                foreach (var origField in origFieldNames)
                 {
                     if (props.TryGetValue(origField, out var baseProp))
                         overflowFields.Insert(0, new KeyValuePair<string, EntityProperty>(origField, baseProp));
                     processedProps.Add(origField);
                 }
 
-                List<(string Key, string Value, bool IsLastTrip)> propData = new();
-                string pBaseName;
-                int extNameIndex = -1;
-                int pdIndex = -1;
+                var propData = new List<(string Key, string Value, bool IsLastTrip)>();
 
                 foreach (var eP in overflowFields)
                 {
                     processedProps.Add(eP.Key);
-                    extNameIndex = eP.Key.IndexOf(fieldExtendedName);
-                    pBaseName = (extNameIndex > 0) ? eP.Key.Substring(0, extNameIndex) : eP.Key;
-                    pdIndex = propData.FindIndex(v => v.Key == pBaseName);
+                    var extNameIndex = eP.Key.IndexOf(fieldExtendedName);
+                    var pBaseName = (extNameIndex > 0) ? eP.Key.Substring(0, extNameIndex) : eP.Key;
+                    var pdIndex = propData.FindIndex(v => v.Key == pBaseName);
 
                     if (pdIndex != -1)
                     {
                         var pD = propData[pdIndex];
-                        if (!pD.IsLastTrip) pD = (pD.Key, pD.Value + eP.Value.StringValue, pD.IsLastTrip);
+                        if (!pD.IsLastTrip)
+                            pD = (pD.Key, pD.Value + eP.Value.StringValue, pD.IsLastTrip);
                         pD.IsLastTrip = eP.Value.StringValue.Length < maxFieldSize;
                         propData[pdIndex] = pD;
                     }
@@ -990,12 +987,9 @@ namespace ASCTableStorage.Models
                 {
                     if (propertyLookup.TryGetValue(data.Key, out var prop))
                     {
-                        try
-                        {
-                            object? val = ConvertValue(data.Value, prop.PropertyType);
+                        var val = ConvertValue(data.Value, prop.PropertyType);
+                        if (IsSafeToAssign(val, prop.PropertyType))
                             prop.SetValue(this, val);
-                        }
-                        catch { }
                     }
                     else if (this is IDynamicProperties dynamic)
                     {
@@ -1004,10 +998,7 @@ namespace ASCTableStorage.Models
                 }
             }
 
-            // Skip system properties
-            var systemProps = new HashSet<string> { "PartitionKey", "RowKey", "Timestamp", "ETag", "odata.etag" };
-
-            // Process all other fields
+            // Handle non-overflow fields
             var nonOverflowFields = props
                 .Where(p => !processedProps.Contains(p.Key) && !systemProps.Contains(p.Key) && !p.Key.StartsWith("odata."));
 
@@ -1017,12 +1008,9 @@ namespace ASCTableStorage.Models
 
                 if (propertyLookup.TryGetValue(f.Key, out var prop))
                 {
-                    try
-                    {
-                        object? val = ConvertValue(f.Value, prop.PropertyType);
+                    var val = ConvertValue(f.Value, prop.PropertyType);
+                    if (IsSafeToAssign(val, prop.PropertyType))
                         prop.SetValue(this, val);
-                    }
-                    catch { }
                 }
                 else if (this is IDynamicProperties dynamic)
                 {
@@ -1031,48 +1019,86 @@ namespace ASCTableStorage.Models
             }
         } // end ReadEntity
 
+        private static bool IsSafeToAssign(object? val, Type targetType)
+        {
+            if (val == null)
+                return Nullable.GetUnderlyingType(targetType) != null || !targetType.IsValueType;
+
+            return targetType.IsAssignableFrom(val.GetType());
+        }
+
         /// <summary>
         /// Converts a value to the target type, with special handling for DateTime, Enum, and JSON-deserializable objects
         /// </summary>
         private object? ConvertValue(object? value, Type targetType)
         {
-            if (value == null) return null;
+            if (value is null) return null;
 
-            // Handle DateTime
-            if (TableEntityTypeCache.IsDateTimeType(targetType))
-                return Convert.ToDateTime(value);
-
-            // Handle Enum
-            if (targetType.IsEnum)
-                return Enum.Parse(targetType, value.ToString()!);
-
-            // Handle nullable
             Type underlyingType = Nullable.GetUnderlyingType(targetType) ?? targetType;
 
-            // If it's a string and target is not string, try JSON deserialization
-            if (value is string stringValue && targetType != typeof(string))
+            // Handle DateTime
+            if (TableEntityTypeCache.IsDateTimeType(underlyingType))
             {
-                try
-                {
-                    // If it looks like JSON, try to deserialize
-                    if (stringValue.StartsWith("{") || stringValue.StartsWith("["))
-                    {
-                        return JsonSerializer.Deserialize(stringValue, underlyingType, Functions.JsonOptions);
-                    }
-                }
-                catch { /* ignore */ }
+                if (DateTime.TryParse(value.ToString(), CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt))
+                    return dt;
+                return DateTime.MinValue;
             }
 
-            // Try direct conversion
-            try
+            // Handle Enum
+            if (underlyingType.IsEnum)
             {
-                return Convert.ChangeType(value, underlyingType);
+                var str = value.ToString();
+                if (!string.IsNullOrWhiteSpace(str) && Enum.TryParse(underlyingType, str, ignoreCase: true, out var enumVal))
+                    return enumVal;
+                return Activator.CreateInstance(underlyingType);
             }
-            catch
+
+            // Handle Boolean
+            if (underlyingType == typeof(bool))
             {
-                return value;
+                if (value is bool b) return b;
+
+                var raw = value.ToString()?.Trim().ToLowerInvariant();
+                return raw switch
+                {
+                    "true" => true,
+                    "1" => true,
+                    "yes" => true,
+                    "false" => false,
+                    "0" => false,
+                    "no" => false,
+                    _ => bool.TryParse(raw, out var result) && result
+                };
             }
-        } // end ConvertValue()
+
+            // Handle JSON deserialization for complex types
+            if (value is string stringValue && underlyingType != typeof(string))
+            {
+                if ((stringValue.StartsWith("{") || stringValue.StartsWith("[")) && JsonIsLikelyValid(stringValue))
+                {
+                    return JsonSerializer.Deserialize(stringValue, underlyingType, Functions.JsonOptions);
+                }
+            }
+
+            // Handle numeric and primitive types
+            if (underlyingType == typeof(int) && int.TryParse(value.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var i)) return i;
+            if (underlyingType == typeof(double) && double.TryParse(value.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var d)) return d;
+            if (underlyingType == typeof(long) && long.TryParse(value.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var l)) return l;
+            if (underlyingType == typeof(decimal) && decimal.TryParse(value.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var dec)) return dec;
+            if (underlyingType == typeof(Guid) && Guid.TryParse(value.ToString(), out var guid)) return guid;
+
+            // Fallback: return original value if no conversion matched
+            return value;
+        } // end ConvertValue
+
+        /// <summary>
+        /// Lightweight check to avoid deserializing invalid JSON.
+        /// </summary>
+        private static bool JsonIsLikelyValid(string json)
+        {
+            var trimmed = json.Trim();
+            return (trimmed.StartsWith("{") && trimmed.EndsWith("}")) || (trimmed.StartsWith("[") && trimmed.EndsWith("]"));
+        }
 
         /// <summary>
         /// Serialize the data to the database chunking any large data blocks into separated DB fields
@@ -1082,56 +1108,50 @@ namespace ASCTableStorage.Models
         {
             Dictionary<string, EntityProperty> ret = new();
 
-            // Get cached properties once
             var properties = TableEntityTypeCache.GetWritableProperties(this.GetType());
 
             foreach (PropertyInfo pI in properties)
             {
-                object? value = null;
-                try
-                {
-                    value = pI.GetValue(this);
-                }
-                catch
-                {
-                    continue; // Skip properties that throw on read
-                }
+                // Skip unreadable or indexer properties
+                if (!pI.CanRead || pI.GetIndexParameters().Length > 0)
+                    continue;
 
-                if (value == null)
+                object? value = pI.GetValue(this);
+
+                if (value is null)
                     continue;
 
                 // Handle string with chunking
                 if (pI.PropertyType == typeof(string))
                 {
-                    string strValue = (string)value;
+                    var strValue = (string)value;
                     if (strValue.Length > maxFieldSize)
                     {
                         ChunkString(pI.Name, strValue, ret);
                     }
                     else
                     {
-                        ret.Add(pI.Name, new EntityProperty(strValue));
+                        ret[pI.Name] = new EntityProperty(strValue);
                     }
                 }
                 else
                 {
-                    // Serialize ANY complex type to JSON
-                    EntityProperty? entityProp = TrySerializeComplexType(value);
-                    if (entityProp != null)
+                    var entityProp = TrySerializeComplexType(value);
+                    if (entityProp is null)
+                        continue;
+
+                    if (entityProp.PropertyType == EdmType.String && entityProp.StringValue?.Length > maxFieldSize)
                     {
-                        if (entityProp.PropertyType == EdmType.String && entityProp.StringValue?.Length > maxFieldSize)
-                        {
-                            ChunkString(pI.Name, entityProp.StringValue, ret);
-                        }
-                        else
-                        {
-                            ret.Add(pI.Name, entityProp);
-                        }
+                        ChunkString(pI.Name, entityProp.StringValue, ret);
+                    }
+                    else
+                    {
+                        ret[pI.Name] = entityProp;
                     }
                 }
             }
 
-            // Process dynamic properties if entity implements IDynamicProperties
+            // Handle dynamic properties
             if (this is IDynamicProperties dynamic)
             {
                 foreach (var prop in dynamic.DynamicProperties)
@@ -1139,17 +1159,17 @@ namespace ASCTableStorage.Models
                     if (ret.ContainsKey(prop.Key))
                         continue;
 
-                    EntityProperty? entityProp = TrySerializeComplexType(prop.Value);
-                    if (entityProp != null)
+                    var entityProp = TrySerializeComplexType(prop.Value);
+                    if (entityProp is null)
+                        continue;
+
+                    if (entityProp.PropertyType == EdmType.String && entityProp.StringValue?.Length > maxFieldSize)
                     {
-                        if (entityProp.PropertyType == EdmType.String && entityProp.StringValue?.Length > maxFieldSize)
-                        {
-                            ChunkString(prop.Key, entityProp.StringValue, ret);
-                        }
-                        else
-                        {
-                            ret.Add(prop.Key, entityProp);
-                        }
+                        ChunkString(prop.Key, entityProp.StringValue, ret);
+                    }
+                    else
+                    {
+                        ret[prop.Key] = entityProp;
                     }
                 }
             }
