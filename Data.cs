@@ -5,6 +5,7 @@ using Microsoft.Azure.Cosmos.Table;
 using System.Globalization;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -2501,5 +2502,70 @@ namespace ASCTableStorage.Data
         #endregion
 
     } // end class Session
+
+    // <summary>
+    /// Provides asynchronous enumeration with progress tracking functionality for a collection of items.
+    /// </summary>
+    /// <typeparam name="T">The type of elements in the collection.</typeparam>
+    public class AsyncProcessingState<T>
+    {
+        private readonly List<T> m_items;
+        private int m_currentIndex = -1;
+        private readonly object m_lock = new();
+        // <summary>
+        /// Initializes a new instance of the AsyncProcessingState class with the specified collection.
+        /// </summary>
+        /// <param name="items">The collection of items to process.</param>
+        public AsyncProcessingState(List<T> items)
+        {
+            m_items = items;
+        }
+
+        public int TotalCount => m_items.Count;
+        public int ProcessedCount => m_currentIndex + 1;
+        public int RemainingCount => TotalCount - ProcessedCount;
+
+        /// <summary>
+        /// Lazily retrieves and yields one item at a time along with its index.
+        /// This allows efficient asynchronous iteration without loading all items into memory at once.
+        /// </summary>
+        /// <param name="cancellationToken">A token to monitor for cancellation requests.</param>
+        /// <returns>An asynchronous enumerable that yields one (item, index) tuple at a time.</returns>
+        public async IAsyncEnumerable<(T item, int index)> GetItemAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            while (true)
+            {
+                int index;
+                T item;
+
+                // Lock to ensure only one thread modifies m_currentIndex at a time
+                lock (m_lock)
+                {
+                    if (this.ProcessedCount >= m_items.Count) yield break;
+
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    m_currentIndex++;
+                    item = m_items[m_currentIndex];
+                    index = m_currentIndex;
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return (item, index);
+                if (index % 10 == 0) await Task.Yield(); // Yield every 10 iterations, for efficiency
+            }
+        }
+
+        /// <summary>
+        /// Returns a list of all items that have not yet been processed
+        /// </summary>
+        /// <returns>A new list containing the remaining items</returns>
+        public List<T> GetRemainingItems()
+        {
+            return this.ProcessedCount < m_items.Count
+                ? m_items.GetRange(this.ProcessedCount, this.RemainingCount)
+                : new List<T>();
+        }
+    } // end class AsyncProcessingState
 
 } // end namespace ASCTableStorage.Data
