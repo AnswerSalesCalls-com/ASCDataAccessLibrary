@@ -931,17 +931,17 @@ namespace ASCTableStorage.Models
         private const string fieldExtendedName = "_pt_";
 
         /// <summary>
-        /// Deserialize the data back into the object reference keeping in mind any chunked fields
+        /// Reads entity properties from Azure Table Storage and populates the current object instance.
+        /// Handles overflow fields, dynamic properties, and safe type conversion.
         /// </summary>
-        /// <param name="props">The properties within the entity to consider</param>
-        /// <param name="ctx">The data context</param>
+        /// <param name="props">The dictionary of properties retrieved from Table Storage.</param>
+        /// <param name="ctx">The operation context for diagnostics and tracing.</param>
         public virtual void ReadEntity(IDictionary<string, EntityProperty> props, OperationContext ctx)
         {
             var propertyLookup = TableEntityTypeCache.GetPropertyLookup(this.GetType());
             var processedProps = new HashSet<string>();
             var systemProps = new HashSet<string> { "PartitionKey", "RowKey", "Timestamp", "ETag", "odata.etag" };
 
-            // Handle overflow fields
             var overflowFields = props
                 .Where(p => p.Value.PropertyType == EdmType.String && p.Key.Contains(fieldExtendedName))
                 .ToList();
@@ -998,7 +998,6 @@ namespace ASCTableStorage.Models
                 }
             }
 
-            // Handle non-overflow fields
             var nonOverflowFields = props
                 .Where(p => !processedProps.Contains(p.Key) && !systemProps.Contains(p.Key) && !p.Key.StartsWith("odata."));
 
@@ -1008,13 +1007,14 @@ namespace ASCTableStorage.Models
 
                 if (propertyLookup.TryGetValue(f.Key, out var prop))
                 {
-                    var val = ConvertValue(f.Value, prop.PropertyType);
+                    var val = ConvertFromEntityProperty(f.Value, prop.PropertyType);
                     if (IsSafeToAssign(val, prop.PropertyType))
                         prop.SetValue(this, val);
                 }
                 else if (this is IDynamicProperties dynamic)
                 {
-                    dynamic.DynamicProperties[f.Key] = ConvertFromEntityProperty(f.Value)!;
+                    var val = ConvertFromEntityProperty(f.Value, typeof(object));
+                    dynamic.DynamicProperties[f.Key] = val!;
                 }
             }
         } // end ReadEntity
@@ -1030,7 +1030,7 @@ namespace ASCTableStorage.Models
         /// <summary>
         /// Converts a value to the target type, with special handling for DateTime, Enum, and JSON-deserializable objects
         /// </summary>
-        private object? ConvertValue(object? value, Type targetType)
+        private static object? ConvertValue(object? value, Type targetType)
         {
             if (value is null) return null;
 
@@ -1101,9 +1101,11 @@ namespace ASCTableStorage.Models
         }
 
         /// <summary>
-        /// Serialize the data to the database chunking any large data blocks into separated DB fields
+        /// Serializes the current object into a dictionary of <see cref="EntityProperty"/> values for Azure Table Storage.
+        /// Handles chunking for oversized strings, dynamic properties, and complex type serialization.
         /// </summary>
-        /// <returns>Data for Table Storage that considers correct sized chunks</returns>
+        /// <param name="ctx">The operation context for diagnostics and tracing.</param>
+        /// <returns>A dictionary of serialized properties suitable for Table Storage.</returns>
         public virtual IDictionary<string, EntityProperty> WriteEntity(OperationContext ctx)
         {
             Dictionary<string, EntityProperty> ret = new();
@@ -1112,46 +1114,27 @@ namespace ASCTableStorage.Models
 
             foreach (PropertyInfo pI in properties)
             {
-                // Skip unreadable or indexer properties
                 if (!pI.CanRead || pI.GetIndexParameters().Length > 0)
                     continue;
 
                 object? value = pI.GetValue(this);
-
                 if (value is null)
                     continue;
 
-                // Handle string with chunking
-                if (pI.PropertyType == typeof(string))
+                EntityProperty? entityProp = ConvertToEntityProperty(value) ?? TrySerializeComplexType(value);
+                if (entityProp is null)
+                    continue;
+
+                if (entityProp.PropertyType == EdmType.String && entityProp.StringValue?.Length > maxFieldSize)
                 {
-                    var strValue = (string)value;
-                    if (strValue.Length > maxFieldSize)
-                    {
-                        ChunkString(pI.Name, strValue, ret);
-                    }
-                    else
-                    {
-                        ret[pI.Name] = new EntityProperty(strValue);
-                    }
+                    ChunkString(pI.Name, entityProp.StringValue, ret);
                 }
                 else
                 {
-                    var entityProp = TrySerializeComplexType(value);
-                    if (entityProp is null)
-                        continue;
-
-                    if (entityProp.PropertyType == EdmType.String && entityProp.StringValue?.Length > maxFieldSize)
-                    {
-                        ChunkString(pI.Name, entityProp.StringValue, ret);
-                    }
-                    else
-                    {
-                        ret[pI.Name] = entityProp;
-                    }
+                    ret[pI.Name] = entityProp;
                 }
             }
 
-            // Handle dynamic properties
             if (this is IDynamicProperties dynamic)
             {
                 foreach (var prop in dynamic.DynamicProperties)
@@ -1159,7 +1142,7 @@ namespace ASCTableStorage.Models
                     if (ret.ContainsKey(prop.Key))
                         continue;
 
-                    var entityProp = TrySerializeComplexType(prop.Value);
+                    EntityProperty? entityProp = ConvertToEntityProperty(prop.Value) ?? TrySerializeComplexType(prop.Value);
                     if (entityProp is null)
                         continue;
 
@@ -1196,6 +1179,18 @@ namespace ASCTableStorage.Models
             }
         }
 
+        /// <summary>
+        /// Converts a CLR object into an <see cref="EntityProperty"/> suitable for Azure Table Storage.
+        /// Handles native types explicitly and falls back to JSON serialization for complex types.
+        /// </summary>
+        /// <param name="value">The value to convert. Can be a primitive, complex object, or null.</param>
+        /// <returns>
+        /// An <see cref="EntityProperty"/> representing the serialized value, or null if the input is null.
+        /// </returns>
+        /// <remarks>
+        /// This method ensures type fidelity for Azure-supported types and avoids unnecessary JSON serialization.
+        /// Complex types are serialized using <see cref="TrySerializeComplexType"/>.
+        /// </remarks>
         private static EntityProperty? ConvertToEntityProperty(object? value) =>
             value switch
             {
@@ -1209,13 +1204,22 @@ namespace ASCTableStorage.Models
                 DateTimeOffset dto => new EntityProperty(dto),
                 Guid g => new EntityProperty(g),
                 byte[] bytes => new EntityProperty(bytes),
-                float f => new EntityProperty((double)f),
-                decimal dec => new EntityProperty(Convert.ToDouble(dec)),
-                _ => TrySerializeComplexType(value)
+                float f => new EntityProperty((double)f), // Note: coerced to double
+                decimal dec => new EntityProperty(Convert.ToDouble(dec)), // Note: coerced to double
+                _ => TrySerializeComplexType(value) // Fallback for complex types
             };
 
-        private static object? ConvertFromEntityProperty(EntityProperty? prop) =>
-            prop is null ? null : prop.PropertyType switch
+        /// <summary>
+        /// Converts an <see cref="EntityProperty"/> into its CLR representation using <see cref="ConvertValue"/>.
+        /// </summary>
+        /// <param name="prop">The entity property to convert.</param>
+        /// <param name="targetType">The expected CLR type.</param>
+        /// <returns>The converted value, or null if conversion fails.</returns>
+        private static object? ConvertFromEntityProperty(EntityProperty? prop, Type targetType)
+        {
+            if (prop is null) return null;
+
+            object? rawValue = prop.PropertyType switch
             {
                 EdmType.String => prop.StringValue,
                 EdmType.Binary => prop.BinaryValue,
@@ -1227,6 +1231,9 @@ namespace ASCTableStorage.Models
                 EdmType.Int64 => prop.Int64Value,
                 _ => prop.PropertyAsObject
             };
+
+            return ConvertValue(rawValue, targetType);
+        }
 
         /// <summary>
         /// Attempts to serialize complex types (IDictionary, IEnumerable, custom objects) to JSON
