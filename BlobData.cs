@@ -388,7 +388,17 @@ namespace ASCTableStorage.Blobs
             // 3. Apply client-side filtering if needed
             if (filterResult.RequiresClientFiltering && filterResult.UntranslatableExpression != null)
             {
-                filterResult.ClientSidePredicate = filterResult.UntranslatableExpression.Compile();
+                try
+                {
+                    filterResult.ClientSidePredicate = filterResult.UntranslatableExpression.Compile();
+                }
+                catch 
+                {
+                    throw new InvalidOperationException(
+                        @"The expression being used for client-side filtering is not valid. 
+                          It contains variables that cannot be unwrapped or reconciled on the server side. 
+                          Split the call to do extra client side processing after getting as little data back as possible from a working query.");
+                }
                 results = results
                     .Where(blob =>
                         filterResult.RequiredTagKeys.All(key => blob.Tags.ContainsKey(key)) &&
@@ -1071,7 +1081,6 @@ namespace ASCTableStorage.Blobs
         #endregion Helper Methods
 
         #region Lambda Expression Processing for Blobs
-
         /// <summary>
         /// Result of hybrid blob filter processing
         /// </summary>
@@ -1082,30 +1091,25 @@ namespace ASCTableStorage.Blobs
             /// These are extracted from the expression tree and used to guard against missing tags.
             /// </summary>
             public IReadOnlyCollection<string> RequiredTagKeys { get; set; } = Array.Empty<string>();
-
             /// <summary>
             /// The server-side tag query string, if one could be constructed.
             /// Used with SearchBlobsByTagsAsync for efficient filtering.
             /// </summary>
             public string? TagQuery { get; set; }
-
             /// <summary>
             /// The compiled predicate for client-side filtering, if needed.
             /// Only used when server-side filtering is insufficient.
             /// </summary>
             public Func<BlobData, bool>? ClientSidePredicate { get; set; }
-
             /// <summary>
             /// Indicates whether the filter requires client-side evaluation.
             /// True if the expression contains logic that cannot be translated to a tag query.
             /// </summary>
             public bool RequiresClientFiltering { get; set; }
 
-            /// <summary>
-            /// Holds the untranslatable parts of the expression tree for client side processing
-            /// </summary>
+            // NEW: Hold the untranslatable part of the expression tree for debugging or advanced scenarios.
             public Expression<Func<BlobData, bool>>? UntranslatableExpression { get; set; }
-        }
+        } // end class HybridBlobFilterResult
 
         /// <summary>
         /// Helper class to build tag filter strings from expression trees for blob searching.
@@ -1117,31 +1121,38 @@ namespace ASCTableStorage.Blobs
             private bool _hasClientSideOperations = false;
             private readonly HashSet<string> _requiredTagKeys = new();
             private readonly Stack<List<string>> _groupStack = new();
+
+            // NEW: List to hold expression trees for parts that cannot be translated to server-side tag queries.
             private readonly List<Expression> _untranslatableParts = new();
 
             public IReadOnlyCollection<string> RequiredTagKeys => _requiredTagKeys;
 
             /// <summary>
             /// Processes the expression tree, populating tag filters, required keys, and identifying untranslatable parts.
+            /// Performs validation during the process.
             /// </summary>
             /// <param name="expression">The lambda expression body to process.</param>
             /// <returns>A result object containing the server-side query, required keys, and a lambda for client-side filtering.</returns>
             public HybridBlobFilterResult BuildHybridFilter(Expression expression)
             {
+                // Clear previous state
                 _tagFilters.Clear();
                 _hasClientSideOperations = false;
                 _requiredTagKeys.Clear();
-                _untranslatableParts.Clear();
+                _untranslatableParts.Clear(); // NEW: Clear the untranslatable list
 
+                // Perform validation and building by visiting the expression tree
                 Visit(expression);
 
                 var result = new HybridBlobFilterResult
                 {
                     TagQuery = _tagFilters.Count > 0 ? string.Join(" AND ", _tagFilters) : null,
                     RequiresClientFiltering = _hasClientSideOperations,
+                    // CRITICAL FIX: Assign the collected RequiredTagKeys to the result
                     RequiredTagKeys = _requiredTagKeys
                 };
 
+                // NEW: Build the client-side predicate from untranslatable parts if any exist
                 if (_untranslatableParts.Count > 0)
                 {
                     Expression combinedUntranslatable = _untranslatableParts[0];
@@ -1152,15 +1163,17 @@ namespace ASCTableStorage.Blobs
 
                     if (combinedUntranslatable.Type == typeof(bool))
                     {
-                        var parameter = Expression.Parameter(typeof(BlobData), "b");
-                        var untranslatableLambda = Expression.Lambda<Func<BlobData, bool>>(combinedUntranslatable, parameter);
+                        // Use the parameter from the original expression context (if available, otherwise create one)
+                        var parameter = expression as LambdaExpression;
+                        var lambdaParam = parameter?.Parameters.FirstOrDefault() ?? Expression.Parameter(typeof(BlobData), "b");
+                        var untranslatableLambda = Expression.Lambda<Func<BlobData, bool>>(combinedUntranslatable, lambdaParam);
                         result.UntranslatableExpression = untranslatableLambda;
 
                         try
                         {
                             result.ClientSidePredicate = untranslatableLambda.Compile();
                         }
-                        catch (Exception ex)
+                        catch
                         {
                             result.ClientSidePredicate = null;
                         }
@@ -1282,6 +1295,15 @@ namespace ASCTableStorage.Blobs
 
             protected override Expression VisitMethodCall(MethodCallExpression node)
             {
+                // ✅ Validate: Reject client-side variable injection like: filenames.Contains(b.Tags["Name"])
+                if (node.Method.Name == "Contains" &&
+                    node.Object is MemberExpression objMember &&
+                    objMember.Expression is ConstantExpression) // Checks if the object (e.g., 'filenames') is a captured variable
+                {
+                    throw new InvalidOperationException("This lambda expression uses a client-side variable that cannot be evaluated on the server. Please simplify.");
+                }
+
+                // ✅ Handle Any(...) expressions
                 if (node.Method.Name == "Any" &&
                     node.Arguments.Count == 2 &&
                     node.Arguments[1] is UnaryExpression unary &&
@@ -1291,20 +1313,17 @@ namespace ASCTableStorage.Blobs
                     {
                         _hasClientSideOperations = true;
                         if (node.Type == typeof(bool))
-                        {
                             _untranslatableParts.Add(node);
-                        }
                         return node;
                     }
 
+                    // ExtractValuesFromExpression will now throw if it detects a closure variable being accessed incorrectly
                     var values = ExtractValuesFromExpression(node.Arguments[0]);
                     if (values == null || !values.Any())
                     {
                         _hasClientSideOperations = true;
                         if (node.Type == typeof(bool))
-                        {
                             _untranslatableParts.Add(node);
-                        }
                         return node;
                     }
 
@@ -1312,19 +1331,20 @@ namespace ASCTableStorage.Blobs
                     var orExpression = string.Join(" OR ", orConditions);
                     (_groupStack.Count > 0 ? _groupStack.Peek() : _tagFilters).Add($"({orExpression})");
                     _requiredTagKeys.Add(visitTagKey);
-                    return node;
+                    return node; // Successfully translated .Any() to server-side query
                 }
 
+                // ✅ Handle LIKE-style tag filters (Contains, StartsWith, EndsWith) on Tags
                 if (node.Object is MethodCallExpression tagAccess &&
                     tagAccess.Method.Name == "get_Item" &&
-                    tagAccess.Object is MemberExpression memberExpr &&
-                    memberExpr.Member.Name == "Tags" &&
+                    tagAccess.Object is MemberExpression tagMember &&
+                    tagMember.Member.Name == "Tags" &&
                     tagAccess.Arguments.Count == 1 &&
-                    tagAccess.Arguments[0] is ConstantExpression keyExpr &&
-                    keyExpr.Value is string tagKey &&
+                    tagAccess.Arguments[0] is ConstantExpression tagKeyExpr &&
+                    tagKeyExpr.Value is string tagKey &&
                     node.Arguments.Count == 1 &&
-                    node.Arguments[0] is ConstantExpression valueExpr &&
-                    valueExpr.Value is string tagValue)
+                    node.Arguments[0] is ConstantExpression tagValueExpr &&
+                    tagValueExpr.Value is string tagValue)
                 {
                     _requiredTagKeys.Add(tagKey);
                     string likePattern = node.Method.Name switch
@@ -1334,6 +1354,7 @@ namespace ASCTableStorage.Blobs
                         "EndsWith" => $"%{tagValue}",
                         _ => null!
                     };
+
                     if (likePattern != null)
                     {
                         _tagFilters.Add($"{tagKey} LIKE '{likePattern}'");
@@ -1341,34 +1362,66 @@ namespace ASCTableStorage.Blobs
                     }
                 }
 
-                if (node.Type == typeof(bool))
+                // ✅ Allow safe transforms like ToLower(), ToUpper(), Trim() on tag values
+                if (node.Method.Name is "ToLower" or "ToUpper" or "Trim" &&
+                    node.Object is MethodCallExpression transformAccess &&
+                    transformAccess.Method.Name == "get_Item" &&
+                    transformAccess.Object is MemberExpression transformMember &&
+                    transformMember.Member.Name == "Tags" &&
+                    transformAccess.Arguments.Count == 1 &&
+                    transformAccess.Arguments[0] is ConstantExpression transformKeyExpr &&
+                    transformKeyExpr.Value is string transformKey)
                 {
+                    _requiredTagKeys.Add(transformKey);
+                    // This is a translatable operation on a tag value, but the current builder doesn't generate a specific tag query for it.
+                    // It might need to be handled client-side or require a more complex server-side query if supported by Azure.
+                    // For now, we'll assume it's client-side, so we don't add it to _tagFilters.
+                    // However, if the tag key exists, it's a required key.
+                    // Let's mark it as client-side for now.
                     _hasClientSideOperations = true;
-                    _untranslatableParts.Add(node);
+                    // Add a placeholder or a more complex expression if needed.
+                    // For now, just mark it.
+                    return base.VisitMethodCall(node); // This will call Visit on the object (b.Tags["key"]), potentially adding to untranslatable if not handled elsewhere.
                 }
-                else
-                {
-                    _hasClientSideOperations = true;
-                }
-                return node;
-            }
+
+                // ✅ Allow metadata comparisons like b.UploadDate > DateTime.Today.AddDays(-7)
+                // This is handled by VisitBinary when the comparison happens.
+                // We just need to ensure the method call itself doesn't introduce untranslatable parts.
+                // Visit the method call to process its arguments (e.g., DateTime.Today.AddDays(-7))
+                return base.VisitMethodCall(node); // This allows processing of arguments like DateTime.Today.AddDays(-7)
+            } // end VisitMethodCall()
 
             private List<string>? ExtractValuesFromExpression(Expression expr)
             {
+                // Case 1: Direct constant (e.g., a literal array or list defined within the lambda)
                 if (expr is ConstantExpression constExpr && constExpr.Value is IEnumerable<string> stringEnum)
                 {
                     return stringEnum.ToList();
                 }
 
+                // Case 2: Captured variable from closure (e.g., the 'filenames' variable from GetExistingBlobs)
                 if (expr is MemberExpression memberExpr)
                 {
                     var containerExpr = memberExpr.Expression;
+
+                    // Unwrap unary expressions (e.g., conversions) that might wrap the closure constant
                     if (containerExpr is UnaryExpression unary && unary.Operand is ConstantExpression unaryConst)
                         containerExpr = unaryConst;
 
-                    if (containerExpr is ConstantExpression closure && closure.Value != null)
+                    // ✅ Validate: Check if the member being accessed (like 'filenames') is from a closure object
+                    if (containerExpr is ConstantExpression closureConst)
                     {
-                        var container = closure.Value;
+                        // ✅ NEW VALIDATION: Throw an exception immediately upon detecting a closure variable.
+                        // This prevents the expression from being processed further if it uses captured variables like 'filenames'.
+                        string varName = memberExpr.Member?.Name ?? "a captured variable";
+                        throw new InvalidOperationException($"This lambda expression uses a client-side variable ('{varName}') that cannot be evaluated on the server. Please simplify or ensure the collection is a constant.");
+
+                        // The original code below this point would attempt reflection to extract the value.
+                        // By throwing the exception above, this extraction logic is skipped,
+                        // causing the .Any() processing in VisitMethodCall to fail.
+                        /*
+                        // It's a captured variable. Now, try to extract the value.
+                        var container = closureConst.Value;
                         var member = memberExpr.Member;
 
                         object? capturedValue = null;
@@ -1386,9 +1439,23 @@ namespace ASCTableStorage.Blobs
                         {
                             return capturedStringEnum.ToList();
                         }
+                        else
+                        {
+                            // If the captured value is not the expected type, it's still a captured variable issue.
+                             throw new InvalidOperationException("This lambda expression uses a client-side variable that cannot be evaluated on the server. Please simplify.");
+                        }
+                        */
+                    }
+                    else
+                    {
+                        // If containerExpr is not a ConstantExpression, it's likely not a captured variable from a closure.
+                        // It could be a property access on the BlobData object itself, which is fine if handled elsewhere.
+                        // For the purpose of extracting *values* for .Any(), this path is not relevant.
+                        // We only care about extracting values from captured collections/variables.
                     }
                 }
 
+                // If we reach here, we couldn't extract the values, likely because the expression wasn't a constant or a simple captured variable.
                 return null;
             }
 
@@ -1487,7 +1554,7 @@ namespace ASCTableStorage.Blobs
 
                 return false;
             }
-        } // end class BlobFilterBuilder
+        }// end class BlobFilterBuilder
 
         #endregion Lambda Expression Processing for Blobs
     }
