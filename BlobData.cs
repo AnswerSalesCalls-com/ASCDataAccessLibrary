@@ -3,7 +3,9 @@ using Azure;
 using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
+using Newtonsoft.Json.Linq;
 using System.Linq.Expressions;
+using System.Reflection;
 using System.Text;
 
 namespace ASCTableStorage.Blobs
@@ -359,26 +361,38 @@ namespace ASCTableStorage.Blobs
         /// </example>
         public async Task<List<BlobData>> GetCollectionAsync(Expression<Func<BlobData, bool>> predicate, string? prefix = null)
         {
-            // Convert lambda to tag-based and metadata-based filters
             var filterResult = ConvertLambdaToHybridBlobFilter(predicate);
+            List<BlobData> results = new();
 
-            List<BlobData> results;
-
-            // If we have tag-based filters, use the fast tag search
+            // 1. Try server-side filtering via tag query
             if (!string.IsNullOrEmpty(filterResult.TagQuery))
             {
-                results = await SearchBlobsByTagsAsync(filterResult.TagQuery);
-            }
-            else
-            {
-                // Fallback to listing all blobs in container
-                results = await ListBlobsAsync(prefix);
+                var serverResults = await SearchBlobsByTagsAsync(filterResult.TagQuery);
+
+                // Internally track which required tag keys are present in each blob
+                foreach (var blob in serverResults)
+                {
+                    var matchedKeys = filterResult.RequiredTagKeys
+                        .Where(key => blob.Tags.ContainsKey(key))
+                        .ToList();
+
+                    if (matchedKeys.Count > 0)
+                        results.Add(blob); // Include blobs with at least one matching tag key
+                }
             }
 
-            // Apply any client-side filtering that couldn't be done server-side
+            // 2. If no matches found, fallback to listing blobs scoped to your data via prefix
+            if (results.Count == 0 && !string.IsNullOrEmpty(prefix))
+                results = await ListBlobsAsync(prefix); // Assumes prefix scopes to your tenant/client
+
+            // 3. Apply client-side filtering if needed
             if (filterResult.RequiresClientFiltering && filterResult.ClientSidePredicate != null)
             {
-                results = results.Where(filterResult.ClientSidePredicate).ToList();
+                results = results
+                    .Where(blob =>
+                        filterResult.RequiredTagKeys.All(key => blob.Tags.ContainsKey(key)) &&
+                        filterResult.ClientSidePredicate(blob))
+                    .ToList();
             }
 
             return results;
@@ -1040,17 +1054,19 @@ namespace ASCTableStorage.Blobs
         private HybridBlobFilterResult ConvertLambdaToHybridBlobFilter(Expression<Func<BlobData, bool>> predicate)
         {
             var builder = new BlobFilterBuilder();
+
+            // Build hybrid filter from expression tree
             var result = builder.BuildHybridFilter(predicate.Body);
 
-            // Set the client-side predicate if needed
-            if (result.RequiresClientFiltering)
-            {
-                result.ClientSidePredicate = predicate.Compile();
-            }
+            // Always compile the full predicate for client-side fallback
+            result.ClientSidePredicate = predicate.Compile();
+
+            // Even if client-side filtering is required, preserve partial tag query
+            // This allows server-side filtering to reduce blob scope
+            result.TagQuery = builder.BuildTagQueryFromExtractedConditions();
 
             return result;
         }
-
         #endregion Helper Methods
 
         #region Lambda Expression Processing for Blobs
@@ -1060,8 +1076,28 @@ namespace ASCTableStorage.Blobs
         /// </summary>
         private class HybridBlobFilterResult
         {
+            /// <summary>
+            /// The set of tag keys required for safe client-side evaluation.
+            /// These are extracted from the expression tree and used to guard against missing tags.
+            /// </summary>
+            public IReadOnlyCollection<string> RequiredTagKeys { get; set; } = Array.Empty<string>();
+
+            /// <summary>
+            /// The server-side tag query string, if one could be constructed.
+            /// Used with SearchBlobsByTagsAsync for efficient filtering.
+            /// </summary>
             public string? TagQuery { get; set; }
+
+            /// <summary>
+            /// The compiled predicate for client-side filtering, if needed.
+            /// Only used when server-side filtering is insufficient.
+            /// </summary>
             public Func<BlobData, bool>? ClientSidePredicate { get; set; }
+
+            /// <summary>
+            /// Indicates whether the filter requires client-side evaluation.
+            /// True if the expression contains logic that cannot be translated to a tag query.
+            /// </summary>
             public bool RequiresClientFiltering { get; set; }
         }
 
@@ -1070,8 +1106,12 @@ namespace ASCTableStorage.Blobs
         /// </summary>
         private class BlobFilterBuilder : ExpressionVisitor
         {
-            private List<string> _tagFilters = new List<string>();
+            private readonly List<string> _tagFilters = new();
             private bool _hasClientSideOperations = false;
+            private readonly HashSet<string> _requiredTagKeys = new();
+            private readonly Stack<List<string>> _groupStack = new();
+
+            public IReadOnlyCollection<string> RequiredTagKeys => _requiredTagKeys;
 
             public HybridBlobFilterResult BuildHybridFilter(Expression expression)
             {
@@ -1083,70 +1123,283 @@ namespace ASCTableStorage.Blobs
                 return new HybridBlobFilterResult
                 {
                     TagQuery = _tagFilters.Count > 0 ? string.Join(" AND ", _tagFilters) : null,
-                    RequiresClientFiltering = _hasClientSideOperations
+                    RequiresClientFiltering = _hasClientSideOperations,
+                    // ✅ Set the RequiredTagKeys property using the collected keys from the builder
+                    RequiredTagKeys = _requiredTagKeys // Use the private HashSet, which is implicitly converted to IReadOnlyCollection
                 };
             }
+            /// <summary>
+            /// Exposes the tag-safe portion of the query for reuse or inspection.
+            /// </summary>
+            public string BuildTagQueryFromExtractedConditions()
+            {
+                return _tagFilters.Count > 0 ? string.Join(" AND ", _tagFilters) : string.Empty;
+            }
+
 
             protected override Expression VisitBinary(BinaryExpression node)
             {
-                if (node.NodeType == ExpressionType.AndAlso)
+                // Handle logical AND/OR operations
+                if (node.NodeType == ExpressionType.AndAlso || node.NodeType == ExpressionType.OrElse)
                 {
-                    // For AND operations, we can combine tag filters
+                    // Simply visit the left and right operands
                     Visit(node.Left);
                     Visit(node.Right);
                     return node;
                 }
 
-                if (node.NodeType == ExpressionType.OrElse)
-                {
-                    // OR operations are complex for tag queries, mark for client-side processing
-                    _hasClientSideOperations = true;
-                    return node;
-                }
-
-                // Handle equality comparisons for tags
+                // Handle simple equality: b.Tags["Key"] == value
                 if (node.NodeType == ExpressionType.Equal && TryExtractTagFilter(node, out string? tagFilter))
                 {
-                    _tagFilters.Add(tagFilter!);
+                    (_groupStack.Count > 0 ? _groupStack.Peek() : _tagFilters).Add(tagFilter!);
                     return node;
                 }
 
-                // Other operations need client-side processing
+                // Handle OR chains: (b.Tags["Key"] == val1) || (b.Tags["Key"] == val2)
+                if (TryExtractOrChain(node, out string key, out List<string> values))
+                {
+                    var safeValues = values
+                        .Where(v => !string.IsNullOrWhiteSpace(v))
+                        .Select(v => $"{key} = '{v.Replace("'", "''")}'");
+                    var orExpression = string.Join(" OR ", safeValues);
+                    if (!string.IsNullOrWhiteSpace(orExpression))
+                    {
+                        (_groupStack.Count > 0 ? _groupStack.Peek() : _tagFilters).Add($"({orExpression})");
+                    }
+                    return node;
+                }
+
+                // If none of the above match, mark as client-side only
                 _hasClientSideOperations = true;
                 return node;
+            }
+
+            private bool TryExtractOrChain(Expression expr, out string key, out List<string> values)
+            {
+                key = null!;
+                values = new List<string>();
+
+                if (expr is BinaryExpression binary)
+                {
+                    if (binary.NodeType == ExpressionType.OrElse)
+                    {
+                        if (TryExtractOrChain(binary.Left, out var leftKey, out var leftVals) &&
+                            TryExtractOrChain(binary.Right, out var rightKey, out var rightVals) &&
+                            leftKey == rightKey)
+                        {
+                            key = leftKey;
+                            values.AddRange(leftVals);
+                            values.AddRange(rightVals);
+                            return true;
+                        }
+
+                        return false;
+                    }
+
+                    if (TryExtractTagComparison(binary, out var tagKey, out var tagValue))
+                    {
+                        key = tagKey;
+                        values.Add(tagValue);
+
+                        // ✅ Track required tag key
+                        _requiredTagKeys.Add(tagKey);
+
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            private bool TryExtractTagComparison(BinaryExpression expr, out string key, out string value)
+            {
+                key = null!;
+                value = null!;
+
+                if (expr.Left is MethodCallExpression leftCall &&
+                    leftCall.Method.Name == "get_Item" &&
+                    leftCall.Object is MemberExpression tagsMember &&
+                    tagsMember.Member.Name == "Tags" &&
+                    leftCall.Arguments[0] is ConstantExpression keyConst &&
+                    expr.Right is ConstantExpression valueConst)
+                {
+                    key = keyConst.Value?.ToString() ?? "";
+                    value = valueConst.Value?.ToString() ?? "";
+                    return !string.IsNullOrEmpty(key) && !string.IsNullOrEmpty(value);
+                }
+
+                return false;
             }
 
             protected override Expression VisitMethodCall(MethodCallExpression node)
             {
-                // Most method calls require client-side processing
+                // Match: collection.Any(val => b.Tags["Key"] == val) OR collection.Any(val => val == b.Tags["Key"])
+                if (node.Method.Name == "Any" &&
+                    node.Arguments.Count == 2 &&
+                    node.Arguments[1] is UnaryExpression unary &&
+                    unary.Operand is LambdaExpression lambda)
+                {
+                    // Extract the tag key from the lambda body (handles both directions now)
+                    if (!TryExtractTagKey(lambda.Body, out string visitTagKey))
+                    {
+                        _hasClientSideOperations = true;
+                        return node;
+                    }
+
+                    // Extract the list of values from the collection passed to Any()
+                    var values = ExtractValuesFromExpression(node.Arguments[0]);
+                    if (values == null || !values.Any())
+                    {
+                        _hasClientSideOperations = true;
+                        return node;
+                    }
+
+                    // Generate OR conditions for each value
+                    var orConditions = values.Select(v => $"{visitTagKey} = '{v.Replace("'", "''")}'"); // Escape single quotes
+                    var orExpression = string.Join(" OR ", orConditions);
+
+                    // Add the OR group to the current tag filter group
+                    (_groupStack.Count > 0 ? _groupStack.Peek() : _tagFilters).Add($"({orExpression})");
+
+                    // ✅ Track the required tag key AFTER successful processing
+                    _requiredTagKeys.Add(visitTagKey);
+
+                    return node;
+                }
+
+                // Match: b.Tags["Key"].Contains("val"), StartsWith, EndsWith
+                if (node.Object is MethodCallExpression tagAccess &&
+                    tagAccess.Method.Name == "get_Item" &&
+                    tagAccess.Object is MemberExpression memberExpr &&
+                    memberExpr.Member.Name == "Tags" &&
+                    tagAccess.Arguments.Count == 1 &&
+                    tagAccess.Arguments[0] is ConstantExpression keyExpr &&
+                    keyExpr.Value is string tagKey &&
+                    node.Arguments.Count == 1 &&
+                    node.Arguments[0] is ConstantExpression valueExpr &&
+                    valueExpr.Value is string tagValue)
+                {
+                    _requiredTagKeys.Add(tagKey);
+                    string likePattern = node.Method.Name switch
+                    {
+                        "Contains" => $"%{tagValue}%",
+                        "StartsWith" => $"{tagValue}%",
+                        "EndsWith" => $"%{tagValue}",
+                        _ => null!
+                    };
+                    if (likePattern != null)
+                    {
+                        _tagFilters.Add($"{tagKey} LIKE '{likePattern}'");
+                        return node;
+                    }
+                }
+
                 _hasClientSideOperations = true;
                 return node;
+            } // end VisitMethodCall()
+            
+            private List<string>? ExtractValuesFromExpression(Expression expr)
+            {
+                // Case 1: Direct constant (e.g., a literal array or list defined within the lambda)
+                if (expr is ConstantExpression constExpr && constExpr.Value is IEnumerable<string> stringEnum)
+                {
+                    return stringEnum.ToList();
+                }
+
+                // Case 2: Captured variable from closure (e.g., the 'filenames' variable from GetExistingBlobs)
+                // This handles both fields and properties within the closure object.
+                if (expr is MemberExpression memberExpr)
+                {
+                    var containerExpr = memberExpr.Expression;
+                    // Unwrap unary expressions (e.g., conversions) that might wrap the closure constant
+                    if (containerExpr is UnaryExpression unary && unary.Operand is ConstantExpression unaryConst)
+                        containerExpr = unaryConst;
+
+                    // Check if the container is the closure object (a constant representing the lambda's captured scope)
+                    if (containerExpr is ConstantExpression closure && closure.Value != null)
+                    {
+                        var container = closure.Value;
+                        var member = memberExpr.Member;
+
+                        // Attempt to get the value using reflection, handling both fields and properties
+                        object? capturedValue = null;
+                        switch (member)
+                        {
+                            case FieldInfo field:
+                                capturedValue = field.GetValue(container);
+                                break;
+                            case PropertyInfo prop:
+                                capturedValue = prop.GetValue(container);
+                                break;
+                        }
+
+                        // Check if the captured value is the expected IEnumerable<string>
+                        if (capturedValue is IEnumerable<string> capturedStringEnum)
+                        {
+                            return capturedStringEnum.ToList();
+                        }
+                    }
+                }
+
+                return null;
+            } // end ExtractValuesFromExpression()
+
+            private bool TryExtractTagKey(Expression expr, out string key)
+            {
+                key = null!;
+
+                // Handle simple equality: b.Tags["Key"] == value/parameter
+                if (expr is BinaryExpression binary && binary.NodeType == ExpressionType.Equal)
+                {
+                    if (binary.Left is MethodCallExpression methodCall &&
+                        methodCall.Method.Name == "get_Item" &&
+                        methodCall.Object is MemberExpression memberExpr &&
+                        memberExpr.Member.Name == "Tags" &&
+                        methodCall.Arguments.Count == 1 &&
+                        methodCall.Arguments[0] is ConstantExpression keyExpr &&
+                        keyExpr.Value is string tagKey)
+                    {
+                        key = tagKey;
+                        return true;
+                    }
+                    // Also handle the case where the comparison is reversed: value/parameter == b.Tags["Key"]
+                    if (binary.Right is MethodCallExpression methodCallRev &&
+                        methodCallRev.Method.Name == "get_Item" &&
+                        methodCallRev.Object is MemberExpression memberExprRev &&
+                        memberExprRev.Member.Name == "Tags" &&
+                        methodCallRev.Arguments.Count == 1 &&
+                        methodCallRev.Arguments[0] is ConstantExpression keyExprRev &&
+                        keyExprRev.Value is string tagKeyRev)
+                    {
+                        key = tagKeyRev;
+                        return true;
+                    }
+                }
+
+                return false;
             }
 
-            /// <summary>
-            /// Tries to extract a tag filter from a binary expression
-            /// </summary>
             private bool TryExtractTagFilter(BinaryExpression node, out string? tagFilter)
             {
                 tagFilter = null;
 
-                // Look for patterns like: b.Tags["key"] == "value"
                 if (node.Left is MethodCallExpression methodCall &&
                     methodCall.Method.Name == "get_Item" &&
                     methodCall.Object is MemberExpression memberExpr &&
                     memberExpr.Member.Name == "Tags" &&
                     memberExpr.Expression is ParameterExpression)
                 {
-                    // Extract the tag key
                     if (methodCall.Arguments.Count == 1 &&
                         methodCall.Arguments[0] is ConstantExpression keyExpr &&
                         keyExpr.Value is string tagKey)
                     {
-                        // Extract the tag value
-                        if (node.Right is ConstantExpression valueExpr &&
-                            valueExpr.Value is string tagValue)
+                        if (TryExtractValue(node.Right, out string tagValue))
                         {
-                            tagFilter = $"{tagKey} = '{tagValue}'";
+                            tagFilter = $"{tagKey} = '{tagValue.Replace("'", "''")}'";
+
+                            // ✅ Track required tag key
+                            _requiredTagKeys.Add(tagKey);
+
                             return true;
                         }
                     }
@@ -1154,7 +1407,48 @@ namespace ASCTableStorage.Blobs
 
                 return false;
             }
-        }
+
+            private bool TryExtractValue(Expression expr, out string value)
+            {
+                value = null!;
+
+                // Case 1: Direct constant
+                if (expr is ConstantExpression constExpr && constExpr.Value is string strValue)
+                {
+                    value = strValue;
+                    return true;
+                }
+
+                // Case 2: Captured variable from closure
+                if (expr is MemberExpression memberExpr)
+                {
+                    var containerExpr = memberExpr.Expression;
+
+                    // Unwrap unary expressions (e.g., conversions)
+                    if (containerExpr is UnaryExpression unary && unary.Operand is ConstantExpression unaryConst)
+                        containerExpr = unaryConst;
+
+                    if (containerExpr is ConstantExpression closure && closure.Value != null)
+                    {
+                        var container = closure.Value;
+                        var member = memberExpr.Member;
+
+                        switch (member)
+                        {
+                            case FieldInfo field when field.GetValue(container) is string fieldValue:
+                                value = fieldValue;
+                                return true;
+
+                            case PropertyInfo prop when prop.GetValue(container) is string propValue:
+                                value = propValue;
+                                return true;
+                        }
+                    }
+                }
+
+                return false;
+            }
+        } // end class BlobFilterBuilder
 
         #endregion Lambda Expression Processing for Blobs
     }
