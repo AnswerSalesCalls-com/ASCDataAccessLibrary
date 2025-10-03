@@ -386,8 +386,9 @@ namespace ASCTableStorage.Blobs
                 results = await ListBlobsAsync(prefix); // Assumes prefix scopes to your tenant/client
 
             // 3. Apply client-side filtering if needed
-            if (filterResult.RequiresClientFiltering && filterResult.ClientSidePredicate != null)
+            if (filterResult.RequiresClientFiltering && filterResult.UntranslatableExpression != null)
             {
+                filterResult.ClientSidePredicate = filterResult.UntranslatableExpression.Compile();
                 results = results
                     .Where(blob =>
                         filterResult.RequiredTagKeys.All(key => blob.Tags.ContainsKey(key)) &&
@@ -1099,10 +1100,16 @@ namespace ASCTableStorage.Blobs
             /// True if the expression contains logic that cannot be translated to a tag query.
             /// </summary>
             public bool RequiresClientFiltering { get; set; }
+
+            /// <summary>
+            /// Holds the untranslatable parts of the expression tree for client side processing
+            /// </summary>
+            public Expression<Func<BlobData, bool>>? UntranslatableExpression { get; set; }
         }
 
         /// <summary>
-        /// Helper class to build tag filter strings from expression trees for blob searching
+        /// Helper class to build tag filter strings from expression trees for blob searching.
+        /// It separates translatable parts (for server-side TagQuery) from untranslatable parts (for client-side ClientSidePredicate).
         /// </summary>
         private class BlobFilterBuilder : ExpressionVisitor
         {
@@ -1110,24 +1117,68 @@ namespace ASCTableStorage.Blobs
             private bool _hasClientSideOperations = false;
             private readonly HashSet<string> _requiredTagKeys = new();
             private readonly Stack<List<string>> _groupStack = new();
+            private readonly List<Expression> _untranslatableParts = new();
 
             public IReadOnlyCollection<string> RequiredTagKeys => _requiredTagKeys;
 
+            /// <summary>
+            /// Processes the expression tree, populating tag filters, required keys, and identifying untranslatable parts.
+            /// </summary>
+            /// <param name="expression">The lambda expression body to process.</param>
+            /// <returns>A result object containing the server-side query, required keys, and a lambda for client-side filtering.</returns>
             public HybridBlobFilterResult BuildHybridFilter(Expression expression)
             {
                 _tagFilters.Clear();
                 _hasClientSideOperations = false;
+                _requiredTagKeys.Clear();
+                _untranslatableParts.Clear();
 
                 Visit(expression);
 
-                return new HybridBlobFilterResult
+                var result = new HybridBlobFilterResult
                 {
                     TagQuery = _tagFilters.Count > 0 ? string.Join(" AND ", _tagFilters) : null,
                     RequiresClientFiltering = _hasClientSideOperations,
-                    // ✅ Set the RequiredTagKeys property using the collected keys from the builder
-                    RequiredTagKeys = _requiredTagKeys // Use the private HashSet, which is implicitly converted to IReadOnlyCollection
+                    RequiredTagKeys = _requiredTagKeys
                 };
+
+                if (_untranslatableParts.Count > 0)
+                {
+                    Expression combinedUntranslatable = _untranslatableParts[0];
+                    for (int i = 1; i < _untranslatableParts.Count; i++)
+                    {
+                        combinedUntranslatable = Expression.AndAlso(combinedUntranslatable, _untranslatableParts[i]);
+                    }
+
+                    if (combinedUntranslatable.Type == typeof(bool))
+                    {
+                        var parameter = Expression.Parameter(typeof(BlobData), "b");
+                        var untranslatableLambda = Expression.Lambda<Func<BlobData, bool>>(combinedUntranslatable, parameter);
+                        result.UntranslatableExpression = untranslatableLambda;
+
+                        try
+                        {
+                            result.ClientSidePredicate = untranslatableLambda.Compile();
+                        }
+                        catch (Exception ex)
+                        {
+                            result.ClientSidePredicate = null;
+                        }
+                    }
+                    else
+                    {
+                        result.ClientSidePredicate = null;
+                    }
+                }
+                else if (_hasClientSideOperations)
+                {
+                    // If RequiresClientFiltering is true but no untranslatable parts were collected,
+                    // the predicate will be compiled in ConvertLambdaToHybridBlobFilter.
+                }
+
+                return result;
             }
+
             /// <summary>
             /// Exposes the tag-safe portion of the query for reuse or inspection.
             /// </summary>
@@ -1136,26 +1187,21 @@ namespace ASCTableStorage.Blobs
                 return _tagFilters.Count > 0 ? string.Join(" AND ", _tagFilters) : string.Empty;
             }
 
-
             protected override Expression VisitBinary(BinaryExpression node)
             {
-                // Handle logical AND/OR operations
                 if (node.NodeType == ExpressionType.AndAlso || node.NodeType == ExpressionType.OrElse)
                 {
-                    // Simply visit the left and right operands
                     Visit(node.Left);
                     Visit(node.Right);
                     return node;
                 }
 
-                // Handle simple equality: b.Tags["Key"] == value
                 if (node.NodeType == ExpressionType.Equal && TryExtractTagFilter(node, out string? tagFilter))
                 {
                     (_groupStack.Count > 0 ? _groupStack.Peek() : _tagFilters).Add(tagFilter!);
                     return node;
                 }
 
-                // Handle OR chains: (b.Tags["Key"] == val1) || (b.Tags["Key"] == val2)
                 if (TryExtractOrChain(node, out string key, out List<string> values))
                 {
                     var safeValues = values
@@ -1169,8 +1215,15 @@ namespace ASCTableStorage.Blobs
                     return node;
                 }
 
-                // If none of the above match, mark as client-side only
-                _hasClientSideOperations = true;
+                if (node.Type == typeof(bool))
+                {
+                    _hasClientSideOperations = true;
+                    _untranslatableParts.Add(node);
+                }
+                else
+                {
+                    _hasClientSideOperations = true;
+                }
                 return node;
             }
 
@@ -1192,7 +1245,6 @@ namespace ASCTableStorage.Blobs
                             values.AddRange(rightVals);
                             return true;
                         }
-
                         return false;
                     }
 
@@ -1200,10 +1252,7 @@ namespace ASCTableStorage.Blobs
                     {
                         key = tagKey;
                         values.Add(tagValue);
-
-                        // ✅ Track required tag key
                         _requiredTagKeys.Add(tagKey);
-
                         return true;
                     }
                 }
@@ -1233,41 +1282,39 @@ namespace ASCTableStorage.Blobs
 
             protected override Expression VisitMethodCall(MethodCallExpression node)
             {
-                // Match: collection.Any(val => b.Tags["Key"] == val) OR collection.Any(val => val == b.Tags["Key"])
                 if (node.Method.Name == "Any" &&
                     node.Arguments.Count == 2 &&
                     node.Arguments[1] is UnaryExpression unary &&
                     unary.Operand is LambdaExpression lambda)
                 {
-                    // Extract the tag key from the lambda body (handles both directions now)
                     if (!TryExtractTagKey(lambda.Body, out string visitTagKey))
                     {
                         _hasClientSideOperations = true;
+                        if (node.Type == typeof(bool))
+                        {
+                            _untranslatableParts.Add(node);
+                        }
                         return node;
                     }
 
-                    // Extract the list of values from the collection passed to Any()
                     var values = ExtractValuesFromExpression(node.Arguments[0]);
                     if (values == null || !values.Any())
                     {
                         _hasClientSideOperations = true;
+                        if (node.Type == typeof(bool))
+                        {
+                            _untranslatableParts.Add(node);
+                        }
                         return node;
                     }
 
-                    // Generate OR conditions for each value
-                    var orConditions = values.Select(v => $"{visitTagKey} = '{v.Replace("'", "''")}'"); // Escape single quotes
+                    var orConditions = values.Select(v => $"{visitTagKey} = '{v.Replace("'", "''")}'");
                     var orExpression = string.Join(" OR ", orConditions);
-
-                    // Add the OR group to the current tag filter group
                     (_groupStack.Count > 0 ? _groupStack.Peek() : _tagFilters).Add($"({orExpression})");
-
-                    // ✅ Track the required tag key AFTER successful processing
                     _requiredTagKeys.Add(visitTagKey);
-
                     return node;
                 }
 
-                // Match: b.Tags["Key"].Contains("val"), StartsWith, EndsWith
                 if (node.Object is MethodCallExpression tagAccess &&
                     tagAccess.Method.Name == "get_Item" &&
                     tagAccess.Object is MemberExpression memberExpr &&
@@ -1294,34 +1341,36 @@ namespace ASCTableStorage.Blobs
                     }
                 }
 
-                _hasClientSideOperations = true;
+                if (node.Type == typeof(bool))
+                {
+                    _hasClientSideOperations = true;
+                    _untranslatableParts.Add(node);
+                }
+                else
+                {
+                    _hasClientSideOperations = true;
+                }
                 return node;
-            } // end VisitMethodCall()
-            
+            }
+
             private List<string>? ExtractValuesFromExpression(Expression expr)
             {
-                // Case 1: Direct constant (e.g., a literal array or list defined within the lambda)
                 if (expr is ConstantExpression constExpr && constExpr.Value is IEnumerable<string> stringEnum)
                 {
                     return stringEnum.ToList();
                 }
 
-                // Case 2: Captured variable from closure (e.g., the 'filenames' variable from GetExistingBlobs)
-                // This handles both fields and properties within the closure object.
                 if (expr is MemberExpression memberExpr)
                 {
                     var containerExpr = memberExpr.Expression;
-                    // Unwrap unary expressions (e.g., conversions) that might wrap the closure constant
                     if (containerExpr is UnaryExpression unary && unary.Operand is ConstantExpression unaryConst)
                         containerExpr = unaryConst;
 
-                    // Check if the container is the closure object (a constant representing the lambda's captured scope)
                     if (containerExpr is ConstantExpression closure && closure.Value != null)
                     {
                         var container = closure.Value;
                         var member = memberExpr.Member;
 
-                        // Attempt to get the value using reflection, handling both fields and properties
                         object? capturedValue = null;
                         switch (member)
                         {
@@ -1333,7 +1382,6 @@ namespace ASCTableStorage.Blobs
                                 break;
                         }
 
-                        // Check if the captured value is the expected IEnumerable<string>
                         if (capturedValue is IEnumerable<string> capturedStringEnum)
                         {
                             return capturedStringEnum.ToList();
@@ -1342,13 +1390,12 @@ namespace ASCTableStorage.Blobs
                 }
 
                 return null;
-            } // end ExtractValuesFromExpression()
+            }
 
             private bool TryExtractTagKey(Expression expr, out string key)
             {
                 key = null!;
 
-                // Handle simple equality: b.Tags["Key"] == value/parameter
                 if (expr is BinaryExpression binary && binary.NodeType == ExpressionType.Equal)
                 {
                     if (binary.Left is MethodCallExpression methodCall &&
@@ -1362,7 +1409,6 @@ namespace ASCTableStorage.Blobs
                         key = tagKey;
                         return true;
                     }
-                    // Also handle the case where the comparison is reversed: value/parameter == b.Tags["Key"]
                     if (binary.Right is MethodCallExpression methodCallRev &&
                         methodCallRev.Method.Name == "get_Item" &&
                         methodCallRev.Object is MemberExpression memberExprRev &&
@@ -1396,10 +1442,7 @@ namespace ASCTableStorage.Blobs
                         if (TryExtractValue(node.Right, out string tagValue))
                         {
                             tagFilter = $"{tagKey} = '{tagValue.Replace("'", "''")}'";
-
-                            // ✅ Track required tag key
                             _requiredTagKeys.Add(tagKey);
-
                             return true;
                         }
                     }
@@ -1412,19 +1455,15 @@ namespace ASCTableStorage.Blobs
             {
                 value = null!;
 
-                // Case 1: Direct constant
                 if (expr is ConstantExpression constExpr && constExpr.Value is string strValue)
                 {
                     value = strValue;
                     return true;
                 }
 
-                // Case 2: Captured variable from closure
                 if (expr is MemberExpression memberExpr)
                 {
                     var containerExpr = memberExpr.Expression;
-
-                    // Unwrap unary expressions (e.g., conversions)
                     if (containerExpr is UnaryExpression unary && unary.Operand is ConstantExpression unaryConst)
                         containerExpr = unaryConst;
 
