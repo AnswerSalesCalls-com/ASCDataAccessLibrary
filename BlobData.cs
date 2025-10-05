@@ -3,10 +3,10 @@ using Azure;
 using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
-using Newtonsoft.Json.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace ASCTableStorage.Blobs
 {
@@ -279,14 +279,53 @@ namespace ASCTableStorage.Blobs
                 contentType = GetContentType(fileName);
             }
 
+            // Sanitize metadata keys to comply with Azure Blob Storage requirements
+            var sanitizedMetaTags = SanitizeMetadataKeys(indexTags!);
+            var sanitizedMetadata = SanitizeMetadataKeys(metadata!);
+
             // Prepare upload options
-            var uploadOptions = CreateUploadOptions(contentType, fileName, stream.Length, indexTags, metadata);
+            var uploadOptions = CreateUploadOptions(contentType, fileName, stream.Length, sanitizedMetaTags, sanitizedMetadata);
 
             // Upload the stream (overwrite by default)
             await bc.UploadAsync(stream, uploadOptions);
 
             return bc.Uri;
         }
+
+        /// <summary>
+        /// Ensures clean meta data and tags for going into blob storage
+        /// </summary>
+        /// <param name="metadata">The data to consider</param>
+        public static Dictionary<string, string> SanitizeMetadataKeys(Dictionary<string, string> metadata)
+        {
+            if (metadata == null) return new();
+
+            var sanitized = new Dictionary<string, string>();
+
+            foreach (var kvp in metadata)
+            {
+                string key = kvp.Key ?? "";
+                string value = kvp.Value?.ToString()?.Trim() ?? "";
+
+                // Replace known symbols with semantic tokens
+                key = key.Replace("@", "at").Replace("#", "hash").Replace("&", "and");
+
+                // Remove all remaining invalid characters
+                key = Regex.Replace(key, @"[^a-zA-Z0-9_]", "_");
+
+                // Prefix if starts with digit
+                if (key.Length > 0 && char.IsDigit(key[0]))
+                    key = "key_" + key;
+
+                // Trim to 64 characters
+                key = key.Length > 64 ? key.Substring(0, 64) : key;
+
+                if (!string.IsNullOrWhiteSpace(key))
+                    sanitized[key] = value;
+            }
+
+            return sanitized;
+        } // end SanitizeMetasataKeys()
 
         /// <summary>
         /// Uploads multiple files to Azure Blob Storage with optional index tags
