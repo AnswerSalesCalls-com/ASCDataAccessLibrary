@@ -1909,4 +1909,640 @@ namespace ASCTableStorage.Sessions
     }
 
     #endregion Backwards Compatibility Bridge
+
+    /// <summary>
+    /// Manages session based data into the database with unified async/sync operations
+    /// Now implements ISession for compatibility with ASP.NET Core
+    /// </summary>
+    public class Session : IDisposable, IAsyncDisposable, ISession
+    {
+        private string? m_sessionID;
+        private List<AppSessionData> m_sessionData = new List<AppSessionData>();
+        private readonly DataAccess<AppSessionData> m_da;
+
+        #region Constructors
+
+        /// <summary>
+        /// Constructor initializes the configuration and data access setup
+        /// </summary>
+        /// <param name="accountName">The Azure Account name for the Table Store</param>
+        /// <param name="accountKey">The Azure account key for the table store</param>
+        public Session(string accountName, string accountKey)
+        {
+            m_da = new DataAccess<AppSessionData>(accountName, accountKey);
+        }
+
+        /// <summary>
+        /// Constructor to setup the Session object and table
+        /// </summary>
+        /// <param name="accountName">The Azure Account name for the Table Store</param>
+        /// <param name="accountKey">The Azure account key for the table store</param>
+        /// <param name="sessionID">Session Identifier</param>
+        public Session(string accountName, string accountKey, string sessionID) : this(accountName, accountKey)
+        {
+            m_sessionID = sessionID;
+            m_sessionData = LoadSessionDataCore(m_sessionID).GetAwaiter().GetResult();
+        }
+
+        /// <summary>
+        /// Asynchronously creates a Session instance
+        /// </summary>
+        /// <param name="accountName">The Azure Account name for the Table Store</param>
+        /// <param name="accountKey">The Azure account key for the table store</param>
+        /// <param name="sessionID">Session Identifier</param>
+        /// <returns>A new Session instance with data loaded asynchronously</returns>
+        public static async Task<Session> CreateAsync(string accountName, string accountKey, string sessionID)
+        {
+            var session = new Session(accountName, accountKey);
+            session.m_sessionID = sessionID;
+            session.m_sessionData = await session.LoadSessionDataCore(sessionID);
+            return session;
+        }
+        
+        #endregion Constructors
+
+        #region ISession Implementation
+
+        /// <summary>
+        /// ISession - Indicates whether the session is available
+        /// </summary>
+        public bool IsAvailable => true;
+
+        /// <summary>
+        /// ISession - Gets the session ID
+        /// </summary>
+        public string Id => m_sessionID ?? Guid.NewGuid().ToString();
+
+        /// <summary>
+        /// ISession - Gets all keys in the session
+        /// </summary>
+        public IEnumerable<string> Keys
+        {
+            get
+            {
+                if (m_sessionData != null)
+                {
+                    return m_sessionData.Select(s => s.Key).Where(k => !string.IsNullOrEmpty(k))!;
+                }
+                return Enumerable.Empty<string>();
+            }
+        }
+
+        /// <summary>
+        /// ISession - Clears all session data
+        /// </summary>
+        public void Clear()
+        {
+            RestartSession();
+            m_sessionData?.Clear();
+        }
+
+        /// <summary>
+        /// ISession - Commits session changes asynchronously
+        /// </summary>
+        public async Task CommitAsync(CancellationToken cancellationToken = default)
+        {
+            await CommitDataAsync();
+        }
+
+        /// <summary>
+        /// ISession - Loads session data asynchronously
+        /// </summary>
+        public async Task LoadAsync(CancellationToken cancellationToken = default)
+        {
+            await RefreshSessionDataAsync();
+        }
+
+        /// <summary>
+        /// ISession - Removes a key from the session
+        /// </summary>
+        public void Remove(string key)
+        {
+            m_sessionData?.RemoveAll(s => s.Key == key);
+            DataHasBeenCommitted = false;
+        }
+
+        /// <summary>
+        /// ISession - Sets a byte array value in the session
+        /// </summary>
+        public void Set(string key, byte[] value)
+        {
+            if (string.IsNullOrEmpty(key))
+                throw new ArgumentException("Key cannot be null or empty.", nameof(key));
+
+            DataHasBeenCommitted = false;
+            if (value == null)
+            {
+                // If value is null, remove the key (standard session behavior)
+                Remove(key);
+                return;
+            }
+
+            this[key]!.Value = value;
+        }
+
+        /// <summary>
+        /// ISession - Tries to get a byte array value from the session.
+        /// </summary>
+        public bool TryGetValue(string key, out byte[] value)
+        {
+            value = null!;
+            if (string.IsNullOrEmpty(key))
+                return false;
+
+            AppSessionData? data = this[key];
+            if (data != null && data.Value != null && data.Value is byte[] byteArray)
+            {
+                value = byteArray;
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Stores a strongly typed object in the session state.
+        /// </summary>
+        public void SetObject<T>(string key, T value)
+        {
+            if (string.IsNullOrEmpty(key) || value == null) return;
+            this[key]!.Value = value;
+            DataHasBeenCommitted = false;
+        }
+
+        /// <summary>
+        /// Retrieves a strongly typed object from the session state.
+        /// </summary>
+        public T? GetObject<T>(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return default;
+
+            var data = this[key];
+            if (data != null && data.Value != null)
+                return System.Text.Json.JsonSerializer.Deserialize<T>(data.Value.ToString()!, ASCTableStorage.Common.Functions.JsonOptions); ;
+
+            return default;
+        }
+
+        /// <summary>
+        /// Sets an int value in the <see cref="ISession"/>.
+        /// </summary>
+        public void SetInt32(string key, int value)
+        {
+            Find(key)!.Value = value;
+        }
+
+        /// <summary>
+        /// Gets an int value from <see cref="ISession"/>.
+        /// </summary>
+        public int? GetInt32(string key)
+        {
+            var data = Find(key);
+            string val = data?.Value?.ToString()!;
+            Int32.TryParse(val, out var val2);
+            return val2;
+        }
+
+        /// <summary>
+        /// Sets a <see cref="string"/> value in the <see cref="ISession"/>.
+        /// </summary>
+        public void SetString(string key, string value)
+            => Find(key)!.Value = value;
+
+        /// <summary>
+        /// Gets a string value from <see cref="ISession"/>.
+        /// </summary>
+        public string? GetString(string key)
+        {
+            var data = Find(key);
+            if (data == null)
+            {
+                return null;
+            }
+            return data.ToString();
+        }
+
+        /// <summary>
+        /// Retrieves a session value by key and attempts to parse it as a local DateTime.
+        /// </summary>
+        public DateTime GetDateTime(string key)
+        {
+            var value = GetString(key);
+            return DateTime.TryParse(value, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var result)
+                ? result
+                : DateTime.MinValue;
+        }
+
+        /// <summary>
+        /// Retrieves a session value by key and attempts to parse it as a UTC DateTime.
+        /// </summary>
+        public DateTime GetUtcDateTime(string key)
+        {
+            var value = GetString(key);
+            return DateTime.TryParse(value, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out var result)
+                ? result
+                : DateTime.MinValue;
+        }
+
+        /// <summary>
+        /// Retrieves a session value by key and formats it as a currency string.
+        /// </summary>
+        public string GetCurrencyString(string key, string cultureName = "en-US")
+        {
+            var raw = GetString(key);
+            if (string.IsNullOrWhiteSpace(raw) || !double.TryParse(raw, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var value))
+                return "$0.00"; // fallback
+
+            var culture = new System.Globalization.CultureInfo(cultureName);
+            return value.ToString("C", culture);
+        }
+
+        /// <summary>
+        /// Retrieves a session value by key and attempts to parse it as a boolean.
+        /// </summary>
+        public bool GetBool(string key)
+        {
+            var raw = GetString(key);
+            if (string.IsNullOrWhiteSpace(raw))
+                return false;
+
+            raw = raw.Trim().ToLowerInvariant();
+
+            return raw switch
+            {
+                "true" => true,
+                "1" => true,
+                "yes" => true,
+                "false" => false,
+                "0" => false,
+                "no" => false,
+                _ => bool.TryParse(raw, out var result) && result
+            };
+        }
+
+        /// <summary>
+        /// Gets a byte-array value from <see cref="ISession"/>.
+        /// </summary>
+        public byte[]? Get(string key)
+        {
+            TryGetValue(key, out var value);
+            return value;
+        }
+
+        /// <summary>
+        /// Checks if a key exists in the session.
+        /// </summary>
+        public bool ContainsKey(string key)
+        {
+            return m_sessionData.Any(s => s.Key == key);
+        }
+
+        /// <summary>
+        /// Asynchronously removes an item from the session and persists the change.
+        /// </summary>
+        public async Task<bool> RemoveAsync(string key)
+        {
+            var itemsToRemove = m_sessionData.Where(s => s.Key == key).ToList();
+            if (itemsToRemove.Any())
+            {
+                m_sessionData.RemoveAll(s => s.Key == key);
+                var result = await m_da.BatchUpdateListAsync(itemsToRemove, Microsoft.Azure.Cosmos.Table.TableOperationType.Delete);
+                return result.Success;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Asynchronously clears all data from the session and persists the change.
+        /// </summary>
+        public Task ClearAsync()
+        {
+            return RestartSessionCore();
+        }
+
+        /// <summary>
+        /// Asynchronously persists all pending changes to the underlying data store.
+        /// </summary>
+        public Task FlushAsync()
+        {
+            return CommitDataAsync();
+        }
+
+        #endregion ISession Implementation
+
+        #region Core Implementation Methods (Async-First)
+
+        /// <summary>
+        /// Core implementation for loading session data
+        /// </summary>
+        private async Task<List<AppSessionData>> LoadSessionDataCore(string sessionID) => await m_da.GetCollectionAsync(sessionID);
+
+        /// <summary>
+        /// Core implementation for getting stale sessions
+        /// </summary>
+        private async Task<List<string>> GetStaleSessionsCore()
+        {
+            string filter = @"(Key eq 'SessionSubmittedToCRM' and Value eq 'false') or (Key eq 'prospectChannel' and Value eq 'facebook')";
+            TableQuery<AppSessionData> q = new TableQuery<AppSessionData>().Where(filter);
+            List<AppSessionData> coll = await m_da.GetCollectionAsync(q);
+            coll = coll.FindAll(s => s.Timestamp.IsTimeBetween(DateTime.Now, 5, 60));
+            return coll.DistinctBy(s => s.SessionID).Select(s => s.SessionID).ToList()!;
+        }
+
+        /// <summary>
+        /// Core implementation for cleaning session data
+        /// </summary>
+        private async Task CleanSessionDataCore()
+        {
+            string queryString = TableQuery.GenerateFilterConditionForDate("Timestamp", QueryComparisons.LessThan, DateTime.Now.AddHours(-2));
+            TableQuery<AppSessionData> q = new TableQuery<AppSessionData>().Where(queryString);
+            List<AppSessionData> data = await m_da.GetCollectionAsync(q);
+            await m_da.BatchUpdateListAsync(data, TableOperationType.Delete);
+        }
+
+        /// <summary>
+        /// Core implementation for committing data
+        /// </summary>
+        private async Task<bool> CommitDataCore(List<AppSessionData> data, TableOperationType direction)
+        {
+            await m_da.BatchUpdateListAsync(data, direction);
+            DataHasBeenCommitted = direction != TableOperationType.Delete;
+            return DataHasBeenCommitted;
+        }
+
+        /// <summary>
+        /// Core implementation for restarting session
+        /// </summary>
+        private async Task RestartSessionCore()
+        {
+            await m_da.BatchUpdateListAsync(SessionData!, TableOperationType.Delete);
+            m_sessionData = new List<AppSessionData>();
+        }
+
+        #endregion
+
+        #region Public Sync Methods (Wrap Async Core)
+
+        /// <summary>
+        /// Finds the abandoned or stale conversations in session (Synchronous)
+        /// </summary>
+        public List<string> GetStaleSessions() => GetStaleSessionsCore().GetAwaiter().GetResult();
+
+        /// <summary>
+        /// Removes legacy session data (Synchronous)
+        /// </summary>
+        public void CleanSessionData() => CleanSessionDataCore().GetAwaiter().GetResult();
+
+        /// <summary>
+        /// Uploads all session data to the dB (Synchronous)
+        /// </summary>
+        public bool CommitData()
+        {
+            CleanSessionData();
+            return CommitData(m_sessionData, TableOperationType.InsertOrReplace);
+        }
+
+        /// <summary>
+        /// Commits all of the data stored in a collection (Synchronous)
+        /// </summary>
+        public bool CommitData(List<AppSessionData> data, TableOperationType direction) => CommitDataCore(data, direction).GetAwaiter().GetResult();
+
+        /// <summary>
+        /// Restarts the session by removing previous session data (Synchronous)
+        /// </summary>
+        public void RestartSession() => RestartSessionCore().GetAwaiter().GetResult();
+
+        /// <summary>
+        /// Loads session data from the database (Synchronous)
+        /// </summary>
+        public void LoadSessionData(string sessionID)
+        {
+            m_sessionID = sessionID;
+            m_sessionData = LoadSessionDataCore(m_sessionID).GetAwaiter().GetResult();
+        }
+
+        /// <summary>
+        /// Refreshes the current session data from the database (Synchronous)
+        /// </summary>
+        public void RefreshSessionData()
+        {
+            if (!string.IsNullOrEmpty(m_sessionID))
+                m_sessionData = LoadSessionDataCore(m_sessionID).GetAwaiter().GetResult();
+        }
+
+        #endregion
+
+        #region Public Async Methods (Call Core Directly)
+
+        /// <summary>
+        /// Finds the abandoned or stale conversations in session (Asynchronous)
+        /// </summary>
+        public Task<List<string>> GetStaleSessionsAsync() => GetStaleSessionsCore();
+
+        /// <summary>
+        /// Removes legacy session data (Asynchronous)
+        /// </summary>
+        public Task CleanSessionDataAsync() => CleanSessionDataCore();
+
+        /// <summary>
+        /// Uploads all session data to the dB (Asynchronous)
+        /// </summary>
+        public async Task<bool> CommitDataAsync()
+        {
+            await CleanSessionDataAsync();
+            return await CommitDataAsync(m_sessionData, TableOperationType.InsertOrReplace);
+        }
+
+        /// <summary>
+        /// Commits all of the data stored in a collection (Asynchronous)
+        /// </summary>
+        public Task<bool> CommitDataAsync(List<AppSessionData> data, TableOperationType direction) => CommitDataCore(data, direction);
+
+        /// <summary>
+        /// Restarts the session by removing previous session data (Asynchronous)
+        /// </summary>
+        public Task RestartSessionAsync() => RestartSessionCore();
+
+        /// <summary>
+        /// Loads session data from the database (Asynchronous)
+        /// </summary>
+        public async Task LoadSessionDataAsync(string sessionID)
+        {
+            m_sessionID = sessionID;
+            m_sessionData = await LoadSessionDataCore(m_sessionID);
+        }
+
+        /// <summary>
+        /// Refreshes the current session data from the database (Asynchronous)
+        /// </summary>
+        public async Task RefreshSessionDataAsync()
+        {
+            if (!string.IsNullOrEmpty(m_sessionID))
+                m_sessionData = await LoadSessionDataCore(m_sessionID);
+        }
+
+        #endregion Public Async Methods
+
+        #region Helper Methods and Properties
+
+        /// <summary>
+        /// Checks to see if an object already exists within the collection
+        /// </summary>
+        private AppSessionData? Find(string key)
+        {
+            AppSessionData? b = SessionData!.Find(s => s.Key == key);
+            if (b == null)
+            {
+                b = new AppSessionData() { SessionID = m_sessionID, Key = key };
+                SessionData!.Add(b);
+                DataHasBeenCommitted = false;
+            }
+            return b;
+        }
+
+        /// <summary>
+        /// Locates the object within the collection matching the specified key
+        /// </summary>
+        public AppSessionData? this[string key]
+        {
+            get { return Find(key); }
+            set { Find(key)!.Value = value; DataHasBeenCommitted = false; }
+        }
+
+        /// <summary>
+        /// Readonly reference to the data stored 
+        /// </summary>
+        public List<AppSessionData>? SessionData => m_sessionData;
+
+        /// <summary>
+        /// Gets the current session ID
+        /// </summary>
+        public string? SessionID => m_sessionID;
+
+        /// <summary>
+        /// Determines whether the data has successfully been committed to the database
+        /// </summary>
+        public bool DataHasBeenCommitted { get; set; }
+
+        public string SessionId => throw new NotImplementedException();
+
+        public int Count => throw new NotImplementedException();
+
+        #endregion Helper Methods and Properties
+
+        #region Disposal Pattern
+
+        /// <summary>
+        /// Destructor makes sure the data is committed to the DB
+        /// </summary>
+        ~Session()
+        {
+            if (!DataHasBeenCommitted)
+                CommitData();
+        }
+
+        /// <summary>
+        /// Implements IDisposable pattern for proper resource cleanup
+        /// </summary>
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// Asynchronously implements disposal pattern
+        /// </summary>
+        public async ValueTask DisposeAsync()
+        {
+            await DisposeAsyncCore();
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// Protected dispose method
+        /// </summary>
+        protected virtual void Dispose(bool disposing)
+        {
+            if (disposing && !DataHasBeenCommitted)
+                CommitData();
+        }
+
+        /// <summary>
+        /// Protected async dispose core method
+        /// </summary>
+        protected virtual async ValueTask DisposeAsyncCore()
+        {
+            if (!DataHasBeenCommitted)
+                await CommitDataCore(m_sessionData, TableOperationType.InsertOrReplace);
+        }
+
+        #endregion Disposal Pattern
+
+    } // end class Session
+
+    /// <summary>
+    /// Provides asynchronous enumeration with progress tracking functionality for a collection of items.
+    /// </summary>
+    /// <typeparam name="T">The type of elements in the collection.</typeparam>
+    public class AsyncProcessingState<T>
+    {
+        private readonly List<T> m_items;
+        private int m_currentIndex = -1;
+        private readonly object m_lock = new();
+
+        /// <summary>
+        /// Initializes a new instance of the AsyncProcessingState class with the specified collection.
+        /// </summary>
+        /// <param name="items">The collection of items to process.</param>
+        public AsyncProcessingState(List<T> items)
+        {
+            m_items = items;
+        }
+
+        public int TotalCount => m_items.Count;
+        public int ProcessedCount => m_currentIndex + 1;
+        public int RemainingCount => TotalCount - ProcessedCount;
+
+        /// <summary>
+        /// Lazily retrieves and yields one item at a time along with its index.
+        /// This allows efficient asynchronous iteration without loading all items into memory at once.
+        /// </summary>
+        /// <param name="cancellationToken">A token to monitor for cancellation requests.</param>
+        /// <returns>An asynchronous enumerable that yields one (item, index) tuple at a time.</returns>
+        public async IAsyncEnumerable<(T item, int index)> GetItemAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            while (true)
+            {
+                int index;
+                T item;
+
+                // Lock to ensure only one thread modifies m_currentIndex at a time
+                lock (m_lock)
+                {
+                    if (this.ProcessedCount >= m_items.Count) yield break;
+
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    m_currentIndex++;
+                    item = m_items[m_currentIndex];
+                    index = m_currentIndex;
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return (item, index);
+                if (index % 10 == 0) await Task.Yield(); // Yield every 10 iterations, for efficiency
+            }
+        }
+
+        /// <summary>
+        /// Returns a list of all items that have not yet been processed
+        /// </summary>
+        /// <returns>A new list containing the remaining items</returns>
+        public List<T> GetRemainingItems()
+        {
+            return this.ProcessedCount < m_items.Count
+                ? m_items.GetRange(this.ProcessedCount, this.RemainingCount)
+                : new List<T>();
+        }
+    } // end class AsyncProcessingState
 }

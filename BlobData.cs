@@ -4,7 +4,7 @@ using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using System.Linq.Expressions;
-using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -390,6 +390,7 @@ namespace ASCTableStorage.Blobs
 
         /// <summary>
         /// Searches blobs using lambda expressions with hybrid tag/metadata filtering
+        /// ENHANCED WITH FAIL-SAFE
         /// </summary>
         /// <param name="predicate">Lambda expression for filtering blobs</param>
         /// <param name="prefix">Optional prefix filter</param>
@@ -400,52 +401,112 @@ namespace ASCTableStorage.Blobs
         /// </example>
         public async Task<List<BlobData>> GetCollectionAsync(Expression<Func<BlobData, bool>> predicate, string? prefix = null)
         {
-            var filterResult = ConvertLambdaToHybridBlobFilter(predicate);
-            List<BlobData> results = new();
+            var visitor = new BlobTagFilterVisitor<BlobData>();
+            var analysisResult = visitor.Analyze(predicate);
+            var serverFilter = visitor.GenerateFilter(analysisResult.ServerExpression);
 
-            // 1. Try server-side filtering via tag query
-            if (!string.IsNullOrEmpty(filterResult.TagQuery))
+            // FAIL-SAFE: If a predicate was provided but could not be translated, abort.
+            // This prevents accidentally fetching all blobs in the container
+            if (string.IsNullOrEmpty(serverFilter) && analysisResult.ClientExpression == null)
             {
-                var serverResults = await SearchBlobsByTagsAsync(filterResult.TagQuery);
-
-                // Internally track which required tag keys are present in each blob
-                foreach (var blob in serverResults)
-                {
-                    var matchedKeys = filterResult.RequiredTagKeys
-                        .Where(key => blob.Tags.ContainsKey(key))
-                        .ToList();
-
-                    if (matchedKeys.Count > 0)
-                        results.Add(blob); // Include blobs with at least one matching tag key
-                }
+                throw new InvalidOperationException(
+                    "The provided lambda expression could not be translated into a valid server-side blob tag query. " +
+                    "To prevent dangerously fetching all blobs, this operation has been aborted. " +
+                    "Expression: " + predicate.ToString()
+                );
             }
 
-            // 2. If no matches found, fallback to listing blobs scoped to your data via prefix
-            if (results.Count == 0 && !string.IsNullOrEmpty(prefix))
-                results = await ListBlobsAsync(prefix); // Assumes prefix scopes to your tenant/client
-
-            // 3. Apply client-side filtering if needed
-            if (filterResult.RequiresClientFiltering && filterResult.UntranslatableExpression != null)
+            // If we have no server filter but we do have a client filter,
+            // we still need to be careful about fetching everything
+            if (string.IsNullOrEmpty(serverFilter) && analysisResult.ClientExpression != null)
             {
-                try
-                {
-                    filterResult.ClientSidePredicate = filterResult.UntranslatableExpression.Compile();
-                }
-                catch 
-                {
-                    throw new InvalidOperationException(
-                        @"The expression being used for client-side filtering is not valid. 
-                          It contains variables that cannot be unwrapped or reconciled on the server side. 
-                          Split the call to do extra client side processing after getting as little data back as possible from a working query.");
-                }
-                results = results
-                    .Where(blob =>
-                        filterResult.RequiredTagKeys.All(key => blob.Tags.ContainsKey(key)) &&
-                        filterResult.ClientSidePredicate(blob))
-                    .ToList();
+                // In this case, we'll need to fetch all blobs and filter client-side
+                // This should be explicitly allowed or warned about
+                // For now, we'll allow it but you may want to add a warning or parameter to control this
+                var allBlobs = await ListBlobsAsync(prefix);
+                var clientLambda = Expression.Lambda<Func<BlobData, bool>>(analysisResult.ClientExpression, predicate.Parameters);
+                var clientPredicate = clientLambda.Compile();
+                return allBlobs.Where(clientPredicate).ToList();
             }
 
-            return results;
+            // Execute server-side search
+            List<BlobData> serverResults = await SearchBlobsByTagsAsync(serverFilter);
+
+            // Apply client-side filtering if needed
+            if (analysisResult.ClientExpression != null)
+            {
+                var clientLambda = Expression.Lambda<Func<BlobData, bool>>(analysisResult.ClientExpression, predicate.Parameters);
+                var clientPredicate = clientLambda.Compile();
+                return serverResults.Where(clientPredicate).ToList();
+            }
+
+            return serverResults;
+        }
+
+        /// <summary>
+        /// Retrieves a collection of BlobData items asynchronously, yielding results as they are found and processed.
+        /// This method is designed for scenarios where you want to start processing results before the entire query completes,
+        /// improving perceived performance for large datasets.
+        /// ENHANCED WITH FAIL-SAFE
+        /// </summary>
+        /// <param name="predicate">The lambda expression to filter blobs.</param>
+        /// <param name="prefix">Optional prefix filter for the fallback ListBlobsAsync call.</param>
+        /// <param name="loadContent">
+        /// True if you also want to have the data within the blog loaded.
+        /// This is a performance hit but it's TRUE by default because its the assumption you want the data
+        /// </param>
+        /// <param name="cancellationToken">Allows the operation to be cancelled.</param>
+        /// <returns>An IAsyncEnumerable of BlobData items.</returns>
+        public async IAsyncEnumerable<BlobData> GetCollectionAsyncEnumerable(Expression<Func<BlobData, bool>> predicate, string? prefix = null,
+          bool loadContent = true, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            var visitor = new BlobTagFilterVisitor<BlobData>();
+            var analysisResult = visitor.Analyze(predicate);
+            var serverFilter = visitor.GenerateFilter(analysisResult.ServerExpression);
+
+            // FAIL-SAFE: Enforce the same rule for the enumerable version.
+            if (string.IsNullOrEmpty(serverFilter) && analysisResult.ClientExpression == null)
+            {
+                throw new InvalidOperationException(
+                   "The provided lambda expression could not be translated into a valid server-side blob tag query. " +
+                   "To prevent dangerously fetching all blobs, this operation has been aborted. " +
+                   "Expression: " + predicate.ToString()
+               );
+            }
+
+            Func<BlobData, bool>? clientPredicate = null;
+            if (analysisResult.ClientExpression != null)
+            {
+                var clientLambda = Expression.Lambda<Func<BlobData, bool>>(analysisResult.ClientExpression, predicate.Parameters);
+                clientPredicate = clientLambda.Compile();
+            }
+
+            IAsyncEnumerable<BlobData> serverEnumerator;
+
+            // If we have a server filter, use it
+            if (!string.IsNullOrEmpty(serverFilter))
+            {
+                serverEnumerator = SearchBlobsByTagsAsyncEnumerable(serverFilter, loadContent, cancellationToken);
+            }
+            // If no server filter but we have client filter, we need to list all (with warning)
+            else if (clientPredicate != null)
+            {
+                serverEnumerator = ListBlobsAsyncEnumerable(prefix, loadContent, cancellationToken);
+            }
+            else
+            {
+                // This shouldn't happen due to fail-safe above, but just in case
+                throw new InvalidOperationException("No valid filter could be generated.");
+            }
+
+            await foreach (var item in serverEnumerator)
+            {
+                if (cancellationToken.IsCancellationRequested) yield break;
+                if (clientPredicate == null || clientPredicate(item))
+                {
+                    yield return item;
+                }
+            }
         }
 
         /// <summary>
@@ -518,7 +579,80 @@ namespace ASCTableStorage.Blobs
                 throw new InvalidOperationException($"Error searching blobs by tags: {ex.Message}", ex);
             }
             return results;
-        }
+        } // end SearchBlobsByTagsAsync()
+
+        /// <summary>
+        /// Asynchronously enumerates blobs found by tag query, yielding BlobData items.
+        /// </summary>
+        /// <param name="tagQuery">OData-style tag query (container filter will be added automatically)</param>
+        /// <param name="loadContent">
+        /// True if you also want to have the data within the blog loaded.
+        /// This is a performance hit but it's TRUE by default because its the assumption you want the data
+        /// </param>
+        /// <param name="cancellationToken">Allows the operation to be cancelled.</param>
+        /// <returns>List of matching blob data</returns>
+        /// <example>
+        /// var query = "brand = 'volvo' AND type = 'pdf'";
+        /// var blobs = await azureBlobs.SearchBlobsByTagsAsync(query);
+        /// </example>
+        public async IAsyncEnumerable<BlobData> SearchBlobsByTagsAsyncEnumerable(string tagQuery, bool loadContent = true, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            var fullQuery = BuildTagQuery(tagQuery);
+
+            if (string.IsNullOrEmpty(fullQuery))
+            {
+                await foreach (var blob in ListBlobsAsyncEnumerable(null, loadContent, cancellationToken))
+                {
+                    yield return blob;
+                }
+                yield break;
+            }
+
+            await foreach (var taggedBlobItem in m_client.FindBlobsByTagsAsync(fullQuery, cancellationToken))
+            {
+                if (taggedBlobItem.BlobContainerName != m_containerName)
+                    continue;
+
+                var blobClient = m_containerClient.GetBlobClient(taggedBlobItem.BlobName);
+
+                BlobData? blobData = null;
+
+                try
+                {
+                    var properties = await blobClient.GetPropertiesAsync(conditions: null, cancellationToken: cancellationToken);
+
+                    var tags = await blobClient.GetTagsAsync(cancellationToken: cancellationToken);
+
+                    blobData = new BlobData
+                    {
+                        Name = taggedBlobItem.BlobName,
+                        OriginalFilename = properties.Value.Metadata.TryGetValue("OriginalFilename", out var origName)
+                            ? origName
+                            : taggedBlobItem.BlobName,
+                        ContentType = properties.Value.ContentType,
+                        Size = properties.Value.ContentLength,
+                        UploadDate = properties.Value.LastModified.DateTime,
+                        Tags = tags.Value.Tags.ToDictionary(kvp => kvp.Key, kvp => kvp.Value),
+                        Metadata = properties.Value.Metadata.ToDictionary(kvp => kvp.Key, kvp => kvp.Value),
+                        Url = blobClient.Uri
+                    };
+
+                    if (loadContent)
+                    {
+                        using var memoryStream = new MemoryStream();
+                        await blobClient.DownloadToAsync(memoryStream, cancellationToken);
+                        blobData.Data = memoryStream.ToArray();
+                    }
+                }
+                catch (RequestFailedException ex) when (ex.Status == 404)
+                {
+                    continue; // Skip missing blob
+                }
+
+                if (blobData != null)
+                    yield return blobData;
+            }
+        } // end SearchBlobsByTagsAsyncEnumerable()
 
         /// <summary>
         /// Lists all blobs in the container with optional filtering
@@ -577,7 +711,68 @@ namespace ASCTableStorage.Blobs
                 results.Add(blobData);
             }
             return results;
-        }
+        } // end ListBlobsAsync()
+
+        /// <summary>
+        /// Asynchronously enumerates all blobs in the container, yielding BlobData items.
+        /// Uses the same structure as the existing ListBlobsAsync method.
+        /// </summary>
+        /// <param name="prefix">Optional prefix filter</param>
+        /// <param name="loadContent">
+        /// True if you also want to have the data within the blog loaded.
+        /// This is a performance hit so it's FALSE by default because its the 
+        /// assumption you DON'T want the data for the Whole Container
+        /// </param>
+        /// <param name="cancellationToken">Allows the operation to be cancelled.</param>
+        public async IAsyncEnumerable<BlobData> ListBlobsAsyncEnumerable(string? prefix, bool loadContent, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            // Create blob listing options - Match ListBlobsAsync structure
+            BlobTraits traits = BlobTraits.Metadata | BlobTraits.Tags;
+            BlobStates states = BlobStates.None;
+
+            // List blobs using GetBlobsAsync - Match ListBlobsAsync structure
+            AsyncPageable<BlobItem> blobs = m_containerClient.GetBlobsAsync(traits, states, prefix, cancellationToken: cancellationToken);
+
+            await foreach (BlobItem bi in blobs)
+            {
+                // Match the logic from ListBlobsAsync for extracting properties and metadata
+                DateTime uploadDate = bi.Properties.CreatedOn?.DateTime ?? DateTime.UtcNow; // Use CreatedOn if available, fallback to UtcNow
+                string originalFilename = bi.Name;
+                long fileSize = bi.Properties.ContentLength ?? 0;
+
+                // Extract metadata if available - Match ListBlobsAsync structure
+                if (bi.Metadata != null)
+                {
+                    if (bi.Metadata.TryGetValue("UploadedOn", out string? uploadedOn))
+                        DateTime.TryParse(uploadedOn, out uploadDate);
+                    if (bi.Metadata.TryGetValue("OriginalFilename", out string? filename))
+                        originalFilename = filename;
+                }
+
+                var blobData = new BlobData
+                {
+                    Name = bi.Name,
+                    OriginalFilename = originalFilename,
+                    ContentType = bi.Properties.ContentType ?? "application/octet-stream", // Provide a default if null
+                    Size = fileSize,
+                    UploadDate = uploadDate, // Use the date extracted above
+                    Tags = bi.Tags?.ToDictionary(kvp => kvp.Key, kvp => kvp.Value) ?? new Dictionary<string, string>(),
+                    Metadata = bi?.Metadata?.ToDictionary(kvp => kvp.Key, kvp => kvp.Value) ?? new Dictionary<string, string>(),
+                    Url = m_containerClient.GetBlobClient(bi?.Name).Uri // Construct URL
+                };
+
+                if (loadContent)
+                {
+                    using var memoryStream = new MemoryStream();
+                    var blobClient = m_containerClient.GetBlobClient(bi?.Name);
+                    await blobClient.DownloadToAsync(memoryStream, cancellationToken: cancellationToken);
+                    blobData.Data = memoryStream.ToArray();
+                }
+
+                yield return blobData; // Yield the constructed blob data
+            }
+        } // end ListBlobsAsyncEnumerable()
+
 
         /// <summary>
         /// Gets blob data with content loaded
@@ -1069,15 +1264,19 @@ namespace ASCTableStorage.Blobs
         /// </summary>
         private string BuildTagQuery(string? tagQuery)
         {
-            var queryParts = new List<string>
+            // If no query provided, return just the container filter
+            if (string.IsNullOrEmpty(tagQuery))
             {
-                $"@container = '{m_containerName}'"
-            };
+                return $"@container = '{m_containerName}'";
+            }
 
-            if (!string.IsNullOrEmpty(tagQuery))
-                queryParts.Add(tagQuery);
+            // Check if container filter is already included
+            if (!tagQuery.Contains($"@container = '{m_containerName}'"))
+            {
+                return $"@container = '{m_containerName}' AND ({tagQuery})";
+            }
 
-            return string.Join(" AND ", queryParts);
+            return tagQuery;
         }
 
         /// <summary>
@@ -1092,509 +1291,12 @@ namespace ASCTableStorage.Blobs
 
             foreach (var tag in tagFilters)
             {
-                queryParts.Add($"{tag.Key} = '{tag.Value}'");
+                queryParts.Add($"\"{tag.Key}\" = '{tag.Value.Replace("'", "''")}'");
             }
 
             return string.Join(" AND ", queryParts);
         }
 
-        /// <summary>
-        /// Converts lambda expression to hybrid blob filter with tag and metadata support
-        /// </summary>
-        private HybridBlobFilterResult ConvertLambdaToHybridBlobFilter(Expression<Func<BlobData, bool>> predicate)
-        {
-            var builder = new BlobFilterBuilder();
-
-            // Build hybrid filter from expression tree
-            var result = builder.BuildHybridFilter(predicate.Body);
-
-            // Always compile the full predicate for client-side fallback
-            result.ClientSidePredicate = predicate.Compile();
-
-            // Even if client-side filtering is required, preserve partial tag query
-            // This allows server-side filtering to reduce blob scope
-            result.TagQuery = builder.BuildTagQueryFromExtractedConditions();
-
-            return result;
-        }
         #endregion Helper Methods
-
-        #region Lambda Expression Processing for Blobs
-        /// <summary>
-        /// Result of hybrid blob filter processing
-        /// </summary>
-        private class HybridBlobFilterResult
-        {
-            /// <summary>
-            /// The set of tag keys required for safe client-side evaluation.
-            /// These are extracted from the expression tree and used to guard against missing tags.
-            /// </summary>
-            public IReadOnlyCollection<string> RequiredTagKeys { get; set; } = Array.Empty<string>();
-            /// <summary>
-            /// The server-side tag query string, if one could be constructed.
-            /// Used with SearchBlobsByTagsAsync for efficient filtering.
-            /// </summary>
-            public string? TagQuery { get; set; }
-            /// <summary>
-            /// The compiled predicate for client-side filtering, if needed.
-            /// Only used when server-side filtering is insufficient.
-            /// </summary>
-            public Func<BlobData, bool>? ClientSidePredicate { get; set; }
-            /// <summary>
-            /// Indicates whether the filter requires client-side evaluation.
-            /// True if the expression contains logic that cannot be translated to a tag query.
-            /// </summary>
-            public bool RequiresClientFiltering { get; set; }
-
-            // NEW: Hold the untranslatable part of the expression tree for debugging or advanced scenarios.
-            public Expression<Func<BlobData, bool>>? UntranslatableExpression { get; set; }
-        } // end class HybridBlobFilterResult
-
-        /// <summary>
-        /// Helper class to build tag filter strings from expression trees for blob searching.
-        /// It separates translatable parts (for server-side TagQuery) from untranslatable parts (for client-side ClientSidePredicate).
-        /// </summary>
-        private class BlobFilterBuilder : ExpressionVisitor
-        {
-            private readonly List<string> _tagFilters = new();
-            private bool _hasClientSideOperations = false;
-            private readonly HashSet<string> _requiredTagKeys = new();
-            private readonly Stack<List<string>> _groupStack = new();
-
-            // NEW: List to hold expression trees for parts that cannot be translated to server-side tag queries.
-            private readonly List<Expression> _untranslatableParts = new();
-
-            public IReadOnlyCollection<string> RequiredTagKeys => _requiredTagKeys;
-
-            /// <summary>
-            /// Processes the expression tree, populating tag filters, required keys, and identifying untranslatable parts.
-            /// Performs validation during the process.
-            /// </summary>
-            /// <param name="expression">The lambda expression body to process.</param>
-            /// <returns>A result object containing the server-side query, required keys, and a lambda for client-side filtering.</returns>
-            public HybridBlobFilterResult BuildHybridFilter(Expression expression)
-            {
-                // Clear previous state
-                _tagFilters.Clear();
-                _hasClientSideOperations = false;
-                _requiredTagKeys.Clear();
-                _untranslatableParts.Clear(); // NEW: Clear the untranslatable list
-
-                // Perform validation and building by visiting the expression tree
-                Visit(expression);
-
-                var result = new HybridBlobFilterResult
-                {
-                    TagQuery = _tagFilters.Count > 0 ? string.Join(" AND ", _tagFilters) : null,
-                    RequiresClientFiltering = _hasClientSideOperations,
-                    // CRITICAL FIX: Assign the collected RequiredTagKeys to the result
-                    RequiredTagKeys = _requiredTagKeys
-                };
-
-                // NEW: Build the client-side predicate from untranslatable parts if any exist
-                if (_untranslatableParts.Count > 0)
-                {
-                    Expression combinedUntranslatable = _untranslatableParts[0];
-                    for (int i = 1; i < _untranslatableParts.Count; i++)
-                    {
-                        combinedUntranslatable = Expression.AndAlso(combinedUntranslatable, _untranslatableParts[i]);
-                    }
-
-                    if (combinedUntranslatable.Type == typeof(bool))
-                    {
-                        // Use the parameter from the original expression context (if available, otherwise create one)
-                        var parameter = expression as LambdaExpression;
-                        var lambdaParam = parameter?.Parameters.FirstOrDefault() ?? Expression.Parameter(typeof(BlobData), "b");
-                        var untranslatableLambda = Expression.Lambda<Func<BlobData, bool>>(combinedUntranslatable, lambdaParam);
-                        result.UntranslatableExpression = untranslatableLambda;
-
-                        try
-                        {
-                            result.ClientSidePredicate = untranslatableLambda.Compile();
-                        }
-                        catch
-                        {
-                            result.ClientSidePredicate = null;
-                        }
-                    }
-                    else
-                    {
-                        result.ClientSidePredicate = null;
-                    }
-                }
-                else if (_hasClientSideOperations)
-                {
-                    // If RequiresClientFiltering is true but no untranslatable parts were collected,
-                    // the predicate will be compiled in ConvertLambdaToHybridBlobFilter.
-                }
-
-                return result;
-            }
-
-            /// <summary>
-            /// Exposes the tag-safe portion of the query for reuse or inspection.
-            /// </summary>
-            public string BuildTagQueryFromExtractedConditions()
-            {
-                return _tagFilters.Count > 0 ? string.Join(" AND ", _tagFilters) : string.Empty;
-            }
-
-            protected override Expression VisitBinary(BinaryExpression node)
-            {
-                if (node.NodeType == ExpressionType.AndAlso || node.NodeType == ExpressionType.OrElse)
-                {
-                    Visit(node.Left);
-                    Visit(node.Right);
-                    return node;
-                }
-
-                if (node.NodeType == ExpressionType.Equal && TryExtractTagFilter(node, out string? tagFilter))
-                {
-                    (_groupStack.Count > 0 ? _groupStack.Peek() : _tagFilters).Add(tagFilter!);
-                    return node;
-                }
-
-                if (TryExtractOrChain(node, out string key, out List<string> values))
-                {
-                    var safeValues = values
-                        .Where(v => !string.IsNullOrWhiteSpace(v))
-                        .Select(v => $"{key} = '{v.Replace("'", "''")}'");
-                    var orExpression = string.Join(" OR ", safeValues);
-                    if (!string.IsNullOrWhiteSpace(orExpression))
-                    {
-                        (_groupStack.Count > 0 ? _groupStack.Peek() : _tagFilters).Add($"({orExpression})");
-                    }
-                    return node;
-                }
-
-                if (node.Type == typeof(bool))
-                {
-                    _hasClientSideOperations = true;
-                    _untranslatableParts.Add(node);
-                }
-                else
-                {
-                    _hasClientSideOperations = true;
-                }
-                return node;
-            }
-
-            private bool TryExtractOrChain(Expression expr, out string key, out List<string> values)
-            {
-                key = null!;
-                values = new List<string>();
-
-                if (expr is BinaryExpression binary)
-                {
-                    if (binary.NodeType == ExpressionType.OrElse)
-                    {
-                        if (TryExtractOrChain(binary.Left, out var leftKey, out var leftVals) &&
-                            TryExtractOrChain(binary.Right, out var rightKey, out var rightVals) &&
-                            leftKey == rightKey)
-                        {
-                            key = leftKey;
-                            values.AddRange(leftVals);
-                            values.AddRange(rightVals);
-                            return true;
-                        }
-                        return false;
-                    }
-
-                    if (TryExtractTagComparison(binary, out var tagKey, out var tagValue))
-                    {
-                        key = tagKey;
-                        values.Add(tagValue);
-                        _requiredTagKeys.Add(tagKey);
-                        return true;
-                    }
-                }
-
-                return false;
-            }
-
-            private bool TryExtractTagComparison(BinaryExpression expr, out string key, out string value)
-            {
-                key = null!;
-                value = null!;
-
-                if (expr.Left is MethodCallExpression leftCall &&
-                    leftCall.Method.Name == "get_Item" &&
-                    leftCall.Object is MemberExpression tagsMember &&
-                    tagsMember.Member.Name == "Tags" &&
-                    leftCall.Arguments[0] is ConstantExpression keyConst &&
-                    expr.Right is ConstantExpression valueConst)
-                {
-                    key = keyConst.Value?.ToString() ?? "";
-                    value = valueConst.Value?.ToString() ?? "";
-                    return !string.IsNullOrEmpty(key) && !string.IsNullOrEmpty(value);
-                }
-
-                return false;
-            }
-
-            protected override Expression VisitMethodCall(MethodCallExpression node)
-            {
-                // ✅ Validate: Reject client-side variable injection like: filenames.Contains(b.Tags["Name"])
-                if (node.Method.Name == "Contains" &&
-                    node.Object is MemberExpression objMember &&
-                    objMember.Expression is ConstantExpression) // Checks if the object (e.g., 'filenames') is a captured variable
-                {
-                    throw new InvalidOperationException("This lambda expression uses a client-side variable that cannot be evaluated on the server. Please simplify.");
-                }
-
-                // ✅ Handle Any(...) expressions
-                if (node.Method.Name == "Any" &&
-                    node.Arguments.Count == 2 &&
-                    node.Arguments[1] is UnaryExpression unary &&
-                    unary.Operand is LambdaExpression lambda)
-                {
-                    if (!TryExtractTagKey(lambda.Body, out string visitTagKey))
-                    {
-                        _hasClientSideOperations = true;
-                        if (node.Type == typeof(bool))
-                            _untranslatableParts.Add(node);
-                        return node;
-                    }
-
-                    // ExtractValuesFromExpression will now throw if it detects a closure variable being accessed incorrectly
-                    var values = ExtractValuesFromExpression(node.Arguments[0]);
-                    if (values == null || !values.Any())
-                    {
-                        _hasClientSideOperations = true;
-                        if (node.Type == typeof(bool))
-                            _untranslatableParts.Add(node);
-                        return node;
-                    }
-
-                    var orConditions = values.Select(v => $"{visitTagKey} = '{v.Replace("'", "''")}'");
-                    var orExpression = string.Join(" OR ", orConditions);
-                    (_groupStack.Count > 0 ? _groupStack.Peek() : _tagFilters).Add($"({orExpression})");
-                    _requiredTagKeys.Add(visitTagKey);
-                    return node; // Successfully translated .Any() to server-side query
-                }
-
-                // ✅ Handle LIKE-style tag filters (Contains, StartsWith, EndsWith) on Tags
-                if (node.Object is MethodCallExpression tagAccess &&
-                    tagAccess.Method.Name == "get_Item" &&
-                    tagAccess.Object is MemberExpression tagMember &&
-                    tagMember.Member.Name == "Tags" &&
-                    tagAccess.Arguments.Count == 1 &&
-                    tagAccess.Arguments[0] is ConstantExpression tagKeyExpr &&
-                    tagKeyExpr.Value is string tagKey &&
-                    node.Arguments.Count == 1 &&
-                    node.Arguments[0] is ConstantExpression tagValueExpr &&
-                    tagValueExpr.Value is string tagValue)
-                {
-                    _requiredTagKeys.Add(tagKey);
-                    string likePattern = node.Method.Name switch
-                    {
-                        "Contains" => $"%{tagValue}%",
-                        "StartsWith" => $"{tagValue}%",
-                        "EndsWith" => $"%{tagValue}",
-                        _ => null!
-                    };
-
-                    if (likePattern != null)
-                    {
-                        _tagFilters.Add($"{tagKey} LIKE '{likePattern}'");
-                        return node;
-                    }
-                }
-
-                // ✅ Allow safe transforms like ToLower(), ToUpper(), Trim() on tag values
-                if (node.Method.Name is "ToLower" or "ToUpper" or "Trim" &&
-                    node.Object is MethodCallExpression transformAccess &&
-                    transformAccess.Method.Name == "get_Item" &&
-                    transformAccess.Object is MemberExpression transformMember &&
-                    transformMember.Member.Name == "Tags" &&
-                    transformAccess.Arguments.Count == 1 &&
-                    transformAccess.Arguments[0] is ConstantExpression transformKeyExpr &&
-                    transformKeyExpr.Value is string transformKey)
-                {
-                    _requiredTagKeys.Add(transformKey);
-                    // This is a translatable operation on a tag value, but the current builder doesn't generate a specific tag query for it.
-                    // It might need to be handled client-side or require a more complex server-side query if supported by Azure.
-                    // For now, we'll assume it's client-side, so we don't add it to _tagFilters.
-                    // However, if the tag key exists, it's a required key.
-                    // Let's mark it as client-side for now.
-                    _hasClientSideOperations = true;
-                    // Add a placeholder or a more complex expression if needed.
-                    // For now, just mark it.
-                    return base.VisitMethodCall(node); // This will call Visit on the object (b.Tags["key"]), potentially adding to untranslatable if not handled elsewhere.
-                }
-
-                // ✅ Allow metadata comparisons like b.UploadDate > DateTime.Today.AddDays(-7)
-                // This is handled by VisitBinary when the comparison happens.
-                // We just need to ensure the method call itself doesn't introduce untranslatable parts.
-                // Visit the method call to process its arguments (e.g., DateTime.Today.AddDays(-7))
-                return base.VisitMethodCall(node); // This allows processing of arguments like DateTime.Today.AddDays(-7)
-            } // end VisitMethodCall()
-
-            private List<string>? ExtractValuesFromExpression(Expression expr)
-            {
-                // Case 1: Direct constant (e.g., a literal array or list defined within the lambda)
-                if (expr is ConstantExpression constExpr && constExpr.Value is IEnumerable<string> stringEnum)
-                {
-                    return stringEnum.ToList();
-                }
-
-                // Case 2: Captured variable from closure (e.g., the 'filenames' variable from GetExistingBlobs)
-                if (expr is MemberExpression memberExpr)
-                {
-                    var containerExpr = memberExpr.Expression;
-
-                    // Unwrap unary expressions (e.g., conversions) that might wrap the closure constant
-                    if (containerExpr is UnaryExpression unary && unary.Operand is ConstantExpression unaryConst)
-                        containerExpr = unaryConst;
-
-                    // ✅ Validate: Check if the member being accessed (like 'filenames') is from a closure object
-                    if (containerExpr is ConstantExpression closureConst)
-                    {
-                        // ✅ NEW VALIDATION: Throw an exception immediately upon detecting a closure variable.
-                        // This prevents the expression from being processed further if it uses captured variables like 'filenames'.
-                        string varName = memberExpr.Member?.Name ?? "a captured variable";
-                        throw new InvalidOperationException($"This lambda expression uses a client-side variable ('{varName}') that cannot be evaluated on the server. Please simplify or ensure the collection is a constant.");
-
-                        // The original code below this point would attempt reflection to extract the value.
-                        // By throwing the exception above, this extraction logic is skipped,
-                        // causing the .Any() processing in VisitMethodCall to fail.
-                        /*
-                        // It's a captured variable. Now, try to extract the value.
-                        var container = closureConst.Value;
-                        var member = memberExpr.Member;
-
-                        object? capturedValue = null;
-                        switch (member)
-                        {
-                            case FieldInfo field:
-                                capturedValue = field.GetValue(container);
-                                break;
-                            case PropertyInfo prop:
-                                capturedValue = prop.GetValue(container);
-                                break;
-                        }
-
-                        if (capturedValue is IEnumerable<string> capturedStringEnum)
-                        {
-                            return capturedStringEnum.ToList();
-                        }
-                        else
-                        {
-                            // If the captured value is not the expected type, it's still a captured variable issue.
-                             throw new InvalidOperationException("This lambda expression uses a client-side variable that cannot be evaluated on the server. Please simplify.");
-                        }
-                        */
-                    }
-                    else
-                    {
-                        // If containerExpr is not a ConstantExpression, it's likely not a captured variable from a closure.
-                        // It could be a property access on the BlobData object itself, which is fine if handled elsewhere.
-                        // For the purpose of extracting *values* for .Any(), this path is not relevant.
-                        // We only care about extracting values from captured collections/variables.
-                    }
-                }
-
-                // If we reach here, we couldn't extract the values, likely because the expression wasn't a constant or a simple captured variable.
-                return null;
-            }
-
-            private bool TryExtractTagKey(Expression expr, out string key)
-            {
-                key = null!;
-
-                if (expr is BinaryExpression binary && binary.NodeType == ExpressionType.Equal)
-                {
-                    if (binary.Left is MethodCallExpression methodCall &&
-                        methodCall.Method.Name == "get_Item" &&
-                        methodCall.Object is MemberExpression memberExpr &&
-                        memberExpr.Member.Name == "Tags" &&
-                        methodCall.Arguments.Count == 1 &&
-                        methodCall.Arguments[0] is ConstantExpression keyExpr &&
-                        keyExpr.Value is string tagKey)
-                    {
-                        key = tagKey;
-                        return true;
-                    }
-                    if (binary.Right is MethodCallExpression methodCallRev &&
-                        methodCallRev.Method.Name == "get_Item" &&
-                        methodCallRev.Object is MemberExpression memberExprRev &&
-                        memberExprRev.Member.Name == "Tags" &&
-                        methodCallRev.Arguments.Count == 1 &&
-                        methodCallRev.Arguments[0] is ConstantExpression keyExprRev &&
-                        keyExprRev.Value is string tagKeyRev)
-                    {
-                        key = tagKeyRev;
-                        return true;
-                    }
-                }
-
-                return false;
-            }
-
-            private bool TryExtractTagFilter(BinaryExpression node, out string? tagFilter)
-            {
-                tagFilter = null;
-
-                if (node.Left is MethodCallExpression methodCall &&
-                    methodCall.Method.Name == "get_Item" &&
-                    methodCall.Object is MemberExpression memberExpr &&
-                    memberExpr.Member.Name == "Tags" &&
-                    memberExpr.Expression is ParameterExpression)
-                {
-                    if (methodCall.Arguments.Count == 1 &&
-                        methodCall.Arguments[0] is ConstantExpression keyExpr &&
-                        keyExpr.Value is string tagKey)
-                    {
-                        if (TryExtractValue(node.Right, out string tagValue))
-                        {
-                            tagFilter = $"{tagKey} = '{tagValue.Replace("'", "''")}'";
-                            _requiredTagKeys.Add(tagKey);
-                            return true;
-                        }
-                    }
-                }
-
-                return false;
-            }
-
-            private bool TryExtractValue(Expression expr, out string value)
-            {
-                value = null!;
-
-                if (expr is ConstantExpression constExpr && constExpr.Value is string strValue)
-                {
-                    value = strValue;
-                    return true;
-                }
-
-                if (expr is MemberExpression memberExpr)
-                {
-                    var containerExpr = memberExpr.Expression;
-                    if (containerExpr is UnaryExpression unary && unary.Operand is ConstantExpression unaryConst)
-                        containerExpr = unaryConst;
-
-                    if (containerExpr is ConstantExpression closure && closure.Value != null)
-                    {
-                        var container = closure.Value;
-                        var member = memberExpr.Member;
-
-                        switch (member)
-                        {
-                            case FieldInfo field when field.GetValue(container) is string fieldValue:
-                                value = fieldValue;
-                                return true;
-
-                            case PropertyInfo prop when prop.GetValue(container) is string propValue:
-                                value = propValue;
-                                return true;
-                        }
-                    }
-                }
-
-                return false;
-            }
-        }// end class BlobFilterBuilder
-
-        #endregion Lambda Expression Processing for Blobs
     }
-} //end namespace ASCTableStorage.Blobs
+}

@@ -1,14 +1,8 @@
-﻿using ASCTableStorage.Common;
-using ASCTableStorage.Models;
-using Microsoft.AspNetCore.Http;
+﻿using ASCTableStorage.Models;
 using Microsoft.Azure.Cosmos.Table;
-using System.Globalization;
 using System.Linq.Expressions;
 using System.Reflection;
-using System.Runtime.CompilerServices;
 using System.Text;
-using System.Text.Json;
-using System.Text.RegularExpressions;
 
 namespace ASCTableStorage.Data
 {
@@ -266,37 +260,6 @@ namespace ASCTableStorage.Data
         }
 
         /// <summary>
-        /// Replaces specific operator names in the input string with their corresponding  Dynamic LINQ operator
-        /// equivalents and removes parameter prefixes. 
-        /// </summary>
-        /// <param name="input">The input string containing operator names and parameter prefixes to be replaced.</param>
-        /// <returns>A string where recognized operator names are replaced with their Dynamic LINQ equivalents  and parameter
-        /// prefixes (e.g., "u.") are removed.</returns>
-        /// <exception cref="NotSupportedException">Thrown if the input string contains an unsupported operator name.</exception>
-        private static string ReplaceOperators(string input)
-        {
-            // Replace ExpressionType operators with Dynamic LINQ equivalents
-            string cleaned = Regex.Replace(input, @"\b(Equal|OrElse|AndAlso|NotEqual|GreaterThan|LessThan)\b", match =>
-            {
-                return match.Value switch
-                {
-                    "Equal" => "==",
-                    "OrElse" => "||",
-                    "AndAlso" => "&&",
-                    "NotEqual" => "!=",
-                    "GreaterThan" => ">",
-                    "LessThan" => "<",
-                    _ => throw new NotSupportedException($"Unsupported operator: {match.Value}")
-                };
-            }, RegexOptions.IgnoreCase);
-
-            // Remove parameter prefix (e.g., "u.")
-            cleaned = Regex.Replace(cleaned, @"\bu\.", "", RegexOptions.IgnoreCase);
-
-            return cleaned;
-        }
-
-        /// <summary>
         /// Core implementation for getting collection by partition key
         /// </summary>
         private async Task<List<T>> GetCollectionCore(string partitionKeyID)
@@ -308,25 +271,58 @@ namespace ASCTableStorage.Data
 
         /// <summary>
         /// Core implementation for getting collection by lambda expression with hybrid filtering
+        /// ENHANCED WITH FAIL-SAFE
         /// </summary>
         private async Task<List<T>> GetCollectionCore(Expression<Func<T, bool>> predicate)
         {
-            var hybridResult = ConvertLambdaToHybridFilter(predicate);
+            var visitor = new ODataFilterVisitor<T>();
+            var analysisResult = visitor.Analyze(predicate);
+            var serverFilter = visitor.GenerateFilter(analysisResult.ServerExpression);
 
-            TableQuery<T> query = new TableQuery<T>();
-            if (!string.IsNullOrEmpty(hybridResult.ServerSideFilter))
-                query = new TableQuery<T>().Where(hybridResult.ServerSideFilter);
-
-            List<T> clientResults = new();
-            List<T> serverResults = await GetCollectionCore(query);
-            if (hybridResult.RequiresClientFiltering && hybridResult.ClientSidePredicate != null)
+            // FAIL-SAFE: If no server filter could be generated and no client filter exists,
+            // this means the entire predicate failed to translate
+            if (string.IsNullOrEmpty(serverFilter) && analysisResult.ClientExpression == null)
             {
-                clientResults = serverResults.Where(hybridResult.ClientSidePredicate).ToList();
+                throw new InvalidOperationException(
+                    "The provided lambda expression could not be translated into a valid server-side query. " +
+                    "To prevent returning the entire table, this operation has been aborted. " +
+                    "Expression: " + predicate.ToString()
+                );
             }
 
-            //return the smaller of the two result sets because that is actually what the client is looking for -- narrowed results
-            //Also solves a bug because the ServerResults is always going to not compile with the ClientResults so this is a workaround
-            return new[] { clientResults, serverResults}.Where(l => l.Count > 0).OrderBy(l => l.Count).FirstOrDefault()!;
+            // Build the query
+            TableQuery<T> query = new TableQuery<T>();
+            if (!string.IsNullOrEmpty(serverFilter))
+            {
+                query = query.Where(serverFilter);
+            }
+
+            // FAIL-SAFE: If we have a predicate but no server filter, only proceed if we have client filter
+            if (string.IsNullOrEmpty(serverFilter) && analysisResult.ClientExpression == null)
+            {
+                throw new InvalidOperationException(
+                    "No valid filter could be generated from the provided lambda expression. " +
+                    "This would result in fetching the entire table, which is not allowed."
+                );
+            }
+
+            // Execute the query
+            List<T> serverResults = await GetCollectionCore(query);
+
+            // Apply client-side filtering if needed
+            if (analysisResult.ClientExpression != null)
+            {
+                // This "rebuilds" the lambda by creating a new visitor that substitutes
+                // the body of the original predicate with our new client-side expression.
+                var replacer = new ExpressionReplacer(predicate.Body, analysisResult.ClientExpression);
+                var newBody = replacer.Visit(predicate.Body);
+                var clientLambda = Expression.Lambda<Func<T, bool>>(newBody!, predicate.Parameters);
+
+                var clientPredicate = clientLambda.Compile();
+                return serverResults.Where(clientPredicate).ToList();
+            }
+
+            return serverResults;
         }
 
         /// <summary>
@@ -403,6 +399,7 @@ namespace ASCTableStorage.Data
 
         /// <summary>
         /// Core implementation for getting single row by lambda expression with hybrid filtering
+        /// ENHANCED WITH FAIL-SAFE
         /// </summary>
         private async Task<T> GetRowObjectCore(Expression<Func<T, bool>> predicate)
         {
@@ -412,6 +409,7 @@ namespace ASCTableStorage.Data
 
         /// <summary>
         /// Core implementation for paginated collection retrieval with hybrid filtering support
+        /// ENHANCED WITH FAIL-SAFE
         /// </summary>
         private async Task<PagedResult<T>> GetPagedCollectionCore(int pageSize = DEFAULT_PAGE_SIZE, string continuationToken = null!,
             TableQuery<T> definedQuery = null!, Expression<Func<T, bool>> predicate = null!)
@@ -419,38 +417,62 @@ namespace ASCTableStorage.Data
             CloudTable table = await GetTableCore(ResolveTableName());
             TableQuery<T> query;
             Func<T, bool> clientFilter = null!;
+
             if (predicate != null)
             {
-                var hybridResult = ConvertLambdaToHybridFilter(predicate);
-                if (!string.IsNullOrEmpty(hybridResult.ServerSideFilter))
+                var visitor = new ODataFilterVisitor<T>();
+                var analysisResult = visitor.Analyze(predicate);
+                var serverFilter = visitor.GenerateFilter(analysisResult.ServerExpression);
+
+                // FAIL-SAFE: Similar to GetCollectionCore
+                if (string.IsNullOrEmpty(serverFilter) && analysisResult.ClientExpression == null)
                 {
-                    query = new TableQuery<T>().Where(hybridResult.ServerSideFilter);
+                    throw new InvalidOperationException(
+                        "The provided lambda expression could not be translated into a valid query. " +
+                        "To prevent returning the entire table, this operation has been aborted."
+                    );
                 }
-                else
+
+                query = !string.IsNullOrEmpty(serverFilter)
+                    ? new TableQuery<T>().Where(serverFilter)
+                    : new TableQuery<T>();
+
+                if (analysisResult.ClientExpression != null)
                 {
-                    query = new TableQuery<T>();
+                    clientFilter = Expression.Lambda<Func<T, bool>>(
+                        analysisResult.ClientExpression,
+                        predicate.Parameters
+                    ).Compile();
                 }
-                if (hybridResult.RequiresClientFiltering)
+
+                // Additional check: if no server filter and no client filter, abort
+                if (string.IsNullOrEmpty(serverFilter) && clientFilter == null)
                 {
-                    clientFilter = hybridResult.ClientSidePredicate!;
+                    throw new InvalidOperationException(
+                        "No valid filter could be generated from the provided lambda expression."
+                    );
                 }
             }
             else
             {
                 query = definedQuery ?? new TableQuery<T>();
             }
+
             query = query.Take(pageSize);
             TableContinuationToken token = null!;
             if (!string.IsNullOrEmpty(continuationToken))
             {
                 token = DeserializeContinuationToken(continuationToken);
             }
+
             var segment = await table.ExecuteQuerySegmentedAsync(query, token);
             var results = segment.ToList();
+
             if (clientFilter != null)
             {
                 results = results.Where(clientFilter).ToList();
             }
+
             return new PagedResult<T>
             {
                 Data = results,
@@ -888,7 +910,7 @@ namespace ASCTableStorage.Data
         /// <param name="direction">How to put the data into the DB</param>
         /// <param name="progressCallback">Optional callback to track progress</param>
         /// <returns>Result indicating success and any errors encountered</returns>
-        public Task<BatchUpdateResult> BatchUpdateListAsync(List<T> data, TableOperationType direction = TableOperationType.InsertOrReplace, IProgress<BatchUpdateProgress> progressCallback = null)
+        public Task<BatchUpdateResult> BatchUpdateListAsync(List<T> data, TableOperationType direction = TableOperationType.InsertOrReplace, IProgress<BatchUpdateProgress> progressCallback = null!)
         {
             return BatchUpdateListCore(data, direction, progressCallback);
         }
@@ -900,7 +922,7 @@ namespace ASCTableStorage.Data
         /// <param name="direction">How to put the data into the DB</param>
         /// <param name="progressCallback">Optional callback to track progress</param>
         /// <returns>Result indicating success and any errors encountered</returns>
-        public Task<BatchUpdateResult> BatchUpdateListAsync(List<DynamicEntity> data, TableOperationType direction = TableOperationType.InsertOrReplace, IProgress<BatchUpdateProgress> progressCallback = null)
+        public Task<BatchUpdateResult> BatchUpdateListAsync(List<DynamicEntity> data, TableOperationType direction = TableOperationType.InsertOrReplace, IProgress<BatchUpdateProgress> progressCallback = null!)
         {
             return BatchUpdateListCore(data, direction, progressCallback);
         }
@@ -951,7 +973,7 @@ namespace ASCTableStorage.Data
         /// <param name="pageSize">Number of items per page</param>
         /// <param name="continuationToken">Token to continue from previous page</param>
         /// <returns>Paginated result</returns>
-        public async Task<PagedResult<T>> GetPagedCollectionAsync(string partitionKeyID, int pageSize = DEFAULT_PAGE_SIZE, string continuationToken = null)
+        public async Task<PagedResult<T>> GetPagedCollectionAsync(string partitionKeyID, int pageSize = DEFAULT_PAGE_SIZE, string continuationToken = null!)
         {
             string queryString = TableQuery.GenerateFilterCondition("PartitionKey", QueryComparisons.Equal, partitionKeyID);
             TableQuery<T> q = new TableQuery<T>().Where(queryString);
@@ -1074,1516 +1096,6 @@ namespace ASCTableStorage.Data
             }
         }
 
-        /// <summary>
-        /// Batch update result information
-        /// </summary>
-        public class BatchUpdateResult
-        {
-            public bool Success { get; set; }
-            public int SuccessfulItems { get; set; }
-            public int FailedItems { get; set; }
-            public List<string> Errors { get; set; } = new List<string>();
-        } // end class BatchUpdateResult
-
-        /// <summary>
-        /// Batch update progress information
-        /// </summary>
-        public class BatchUpdateProgress
-        {
-            public int CompletedBatches { get; set; }
-            public int TotalBatches { get; set; }
-            public int ProcessedItems { get; set; }
-            public int TotalItems { get; set; }
-            public int CurrentBatchSize { get; set; }
-            public double PercentComplete => TotalItems > 0 ? (double)ProcessedItems / TotalItems * 100 : 0;
-        } // end class BatchUpdateProgress
-
         #endregion Helper Methods and Support Classes
-
-        #region Lambda Expression Processing
-
-        /// <summary>
-        /// Converts a lambda expression to OData filter string for Azure Table Storage
-        /// with hybrid server/client-side filtering for maximum efficiency
-        /// </summary>
-        /// <param name="predicate">The lambda expression to convert</param>
-        /// <returns>Hybrid filter result containing server filter and client predicate</returns>
-        private HybridFilterResult<T> ConvertLambdaToHybridFilter(Expression<Func<T, bool>> predicate)
-        {
-            var builder = new ODataFilterBuilder();
-            var result = builder.BuildHybridFilter(predicate.Body);
-
-            Func<T, bool>? clientPredicate = null;
-
-            if (result.HasClientSideOperations)
-            {
-                if (typeof(T) == typeof(DynamicEntity))
-                {
-                    clientPredicate = _ => true;
-                    System.Diagnostics.Debug.WriteLine("DynamicEntity expression requires client-side filtering - returning all results");
-                }
-                else
-                {
-                    try
-                    {
-                        // Attempt to compile only method calls that aren't ToString()
-                        var methodPredicates = CompileNonToStringMethods(predicate, builder);
-                        if (methodPredicates.Count > 0)
-                        {
-                            // Combine all compiled method predicates into a single delegate
-                            clientPredicate = entity => methodPredicates.All(p => p(entity));
-                        }
-                        else
-                        {
-                            // Fallback to full predicate compilation
-                            clientPredicate = predicate.Compile();
-                        }
-
-                        // Validate compiled predicate
-                        try
-                        {
-                            T testEntity = Activator.CreateInstance<T>();
-                            var testResult = clientPredicate(testEntity);
-                        }
-                        catch (Exception testEx)
-                        {
-                            System.Diagnostics.Debug.WriteLine($"Compiled predicate is not executable: {testEx.Message}");
-                            clientPredicate = _ => true;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"Failed to compile predicate: {ex.Message}");
-                        clientPredicate = _ => true;
-                    }
-                }
-            }
-
-            return new HybridFilterResult<T>
-            {
-                ServerSideFilter = result.ServerSideOData,
-                ClientSidePredicate = clientPredicate,
-                RequiresClientFiltering = result.HasClientSideOperations
-            };
-        }
-
-        /// <summary>
-        /// Extracts and compiles all method call expressions from a predicate that invoke methods
-        /// other than <c>ToString()</c>. This enables partial client-side evaluation of filters
-        /// that cannot be translated to server-side OData queries.
-        /// </summary>
-        /// <remarks>
-        /// This method avoids compiling the entire predicate, which may include unsupported constructs
-        /// or brittle logic. Instead, it walks the expression tree recursively and isolates method calls
-        /// that are safe and meaningful for client-side filtering. Calls to <c>ToString()</c> are excluded
-        /// to reduce noise and avoid redundant evaluations.
-        /// </remarks>
-        /// <typeparam name="T">The entity type being filtered.</typeparam>
-        /// <param name="predicate">The original predicate expression to inspect.</param>
-        /// <param name="builder">The OData filter builder instance used for constructing OData queries.</param>
-        /// <returns>
-        /// A list of compiled delegates representing each non-<c>ToString()</c> method call found
-        /// in the expression tree. These can be combined or evaluated independently for client-side filtering.
-        /// </returns>
-        private static List<Func<T, bool>> CompileNonToStringMethods<T>(Expression<Func<T, bool>> predicate, ODataFilterBuilder builder)
-        {
-            var compiledList = new List<Func<T, bool>>();
-            var param = predicate.Parameters[0];
-
-            void Traverse(Expression expr)
-            {
-                switch (expr)
-                {
-                    case MethodCallExpression methodCall:
-                        if (methodCall.Method.Name != "ToString" &&
-                            methodCall.Method.DeclaringType != typeof(object) &&
-                            methodCall.Type == typeof(bool))
-                        {
-                            try
-                            {
-                                builder.Parameter = param;
-                                var reboundCall = (MethodCallExpression)builder.Visit(methodCall);
-                                var lambda = Expression.Lambda<Func<T, bool>>(reboundCall, param);
-                                compiledList.Add(lambda.Compile());
-                            }
-                            catch (Exception ex)
-                            {
-                                System.Diagnostics.Debug.WriteLine($"Failed to compile method call '{methodCall.Method.Name}': {ex.Message}");
-                            }
-                        }
-                        break;
-
-                    case BinaryExpression binary:
-                        Traverse(binary.Left);
-                        Traverse(binary.Right);
-                        break;
-
-                    case UnaryExpression unary:
-                        Traverse(unary.Operand);
-                        break;
-
-                    case MemberExpression member:
-                        Traverse(member.Expression!);
-                        break;
-
-                    case ConditionalExpression conditional:
-                        Traverse(conditional.Test);
-                        Traverse(conditional.IfTrue);
-                        Traverse(conditional.IfFalse);
-                        break;
-
-                    case InvocationExpression invocation:
-                        Traverse(invocation.Expression);
-                        foreach (var arg in invocation.Arguments)
-                            Traverse(arg);
-                        break;
-
-                    case LambdaExpression lambda:
-                        Traverse(lambda.Body);
-                        break;
-
-                    case NewArrayExpression newArray:
-                        foreach (var exprItem in newArray.Expressions)
-                            Traverse(exprItem);
-                        break;
-
-                    case ListInitExpression listInit:
-                        Traverse(listInit.NewExpression);
-                        foreach (var init in listInit.Initializers)
-                            foreach (var arg in init.Arguments)
-                                Traverse(arg);
-                        break;
-
-                    case MemberInitExpression memberInit:
-                        Traverse(memberInit.NewExpression);
-                        foreach (var binding in memberInit.Bindings.OfType<MemberAssignment>())
-                            Traverse(binding.Expression);
-                        break;
-
-                    case BlockExpression block:
-                        foreach (var exprItem in block.Expressions)
-                            Traverse(exprItem);
-                        break;
-
-                        // Add more cases as needed for completeness
-                }
-            }
-
-            Traverse(predicate.Body);
-            return compiledList;
-        }
-
-        /// <summary>
-        /// Result of hybrid filter processing
-        /// </summary>
-        private class HybridFilterResult<TEntity>
-        {
-            public string? ServerSideFilter { get; set; }
-            public Func<TEntity, bool>? ClientSidePredicate { get; set; }
-            public bool RequiresClientFiltering { get; set; }
-        } // end class HybridFilterResult<TEntity>
-
-
-        /// <summary>
-        /// Expression visitor that converts a LINQ expression tree into an OData $filter string,
-        /// while detecting parts that must be evaluated client-side.
-        /// Supports closure-captured variables (e.g., local variables in lambdas).
-        /// </summary>
-        private class ODataFilterBuilder : ExpressionVisitor
-        {
-            private StringBuilder _filter = new();
-            private bool _hasClientSideOperations = false;
-
-            /// <summary>
-            /// The parameter expression representing the lambda parameter (e.g., 'd' in 'd => d.Name == "test"').
-            /// Must be set before calling BuildHybridFilter if rebinding is needed.
-            /// </summary>
-            public ParameterExpression? Parameter { get; set; }
-
-            /// <summary>
-            /// Analyzes the expression and returns a server-side OData filter string and a flag indicating
-            /// whether any part of the expression requires client-side evaluation.
-            /// </summary>
-            /// <param name="expression">The expression tree to analyze (e.g., d => d.Name == "John").</param>
-            /// <returns>Result containing OData filter string and client-side flag.</returns>
-            public FilterAnalysisResult BuildHybridFilter(Expression expression)
-            {
-                _filter.Clear();
-                _hasClientSideOperations = false;
-
-                // Normalize the expression: replace closure references with constants
-                var normalized = NormalizeClosureExpressions(expression);
-                Visit(normalized);
-
-                return new FilterAnalysisResult
-                {
-                    ServerSideOData = _filter.Length > 0 ? _filter.ToString() : null,
-                    HasClientSideOperations = _hasClientSideOperations
-                };
-            }
-
-            /// <summary>
-            /// Converts an expression directly into an OData filter string (legacy support).
-            /// Returns empty string if no server-side part exists.
-            /// </summary>
-            /// <param name="expression">The expression to convert.</param>
-            /// <returns>OData $filter string, or empty if fully client-side.</returns>
-            public string Build(Expression expression)
-            {
-                var result = BuildHybridFilter(expression);
-                return result.ServerSideOData ?? "";
-            }
-
-            /// <summary>
-            /// Handles binary operations (==, !=, &&, ||, etc.).
-            /// Splits AND/OR into hybrid-aware branches to allow partial server-side filtering.
-            /// </summary>
-            protected override Expression VisitBinary(BinaryExpression node)
-            {
-                return node.NodeType switch
-                {
-                    ExpressionType.AndAlso => HandleLogicalAndOr(node),
-                    ExpressionType.OrElse => HandleLogicalAndOr(node),
-                    _ => HandleSimpleBinary(node)
-                };
-            }
-
-            /// <summary>
-            /// Processes logical AND/OR by analyzing each branch independently.
-            /// Allows combining server-side filters while preserving client-side requirements.
-            /// </summary>
-            private Expression HandleLogicalAndOr(BinaryExpression node)
-            {
-                var leftResult = AnalyzeBranch(node.Left);
-                var rightResult = AnalyzeBranch(node.Right);
-
-                var serverParts = new List<string>();
-                if (!string.IsNullOrEmpty(leftResult.ServerSideOData))
-                    serverParts.Add($"({leftResult.ServerSideOData})");
-                if (!string.IsNullOrEmpty(rightResult.ServerSideOData))
-                    serverParts.Add($"({rightResult.ServerSideOData})");
-
-                // Append server-side parts with correct operator
-                foreach (var part in serverParts)
-                {
-                    if (_filter.Length > 0) _filter.Append(node.NodeType == ExpressionType.AndAlso ? " and " : " or ");
-                    _filter.Append(part);
-                }
-
-                // If either side needs client-side eval, mark entire expression as client-side
-                _hasClientSideOperations = leftResult.HasClientSideOperations || rightResult.HasClientSideOperations;
-
-                return node;
-            }
-
-            /// <summary>
-            /// Handles simple binary operations (==, !=, <, >, etc.).
-            /// Only emits OData if both sides are server-compatible.
-            /// </summary>
-            private Expression HandleSimpleBinary(BinaryExpression node)
-            {
-                if (IsSupportedOperator(node.NodeType) && IsServerSupported(node.Left) && IsServerSupported(node.Right))
-                {
-                    _filter.Append("(");
-                    Visit(node.Left);
-                    _filter.Append($" {ConvertOperator(node.NodeType)} ");
-                    Visit(node.Right);
-                    _filter.Append(")");
-                }
-                else
-                {
-                    _hasClientSideOperations = true;
-                }
-                return node;
-            }
-
-            /// <summary>
-            /// Visits member expressions (e.g., d.Property or closure.Value).
-            /// Resolves closure-captured values into constants.
-            /// Rebinds known members to the target parameter if possible.
-            /// </summary>
-            protected override Expression VisitMember(MemberExpression node)
-            {
-                // Case 1: Direct access to parameter (e.g., d.BaseUrl)
-                if (node.Expression == Parameter || (node.Expression is ParameterExpression))
-                {
-                    _filter.Append(node.Member.Name);
-                    return node;
-                }
-
-                // Case 2: Access to closure field (e.g., value(...).userPartitionKey)
-                if (node.Expression is ConstantExpression constExpr && constExpr.Value != null)
-                {
-                    var field = node.Member as FieldInfo;
-                    if (field != null)
-                    {
-                        var value = field.GetValue(constExpr.Value);
-                        var constant = Expression.Constant(value, node.Type);
-                        Visit(constant); // Will call VisitConstant
-                        return constant;
-                    }
-                }
-
-                // Case 3: Any other member access (e.g., d.Nested.Prop) not directly supported
-                _hasClientSideOperations = true;
-                return node;
-            }
-
-            /// <summary>
-            /// Visits constant values and appends them in OData-safe format.
-            /// Handles strings, nulls, dates, booleans, GUIDs, and numbers.
-            /// </summary>
-            protected override Expression VisitConstant(ConstantExpression node)
-            {
-                if (node.Value == null)
-                {
-                    _filter.Append("'__null__'");
-                }
-                else if (node.Type == typeof(string))
-                {
-                    _filter.Append($"'{EscapeODataString(node.Value.ToString()!)}'");
-                }
-                else if (node.Type == typeof(DateTime) || node.Type == typeof(DateTime?))
-                {
-                    var dt = (DateTime)node.Value;
-                    _filter.Append($"datetime'{dt:yyyy-MM-ddTHH:mm:ss.fffZ}'");
-                }
-                else if (node.Type == typeof(bool) || node.Type == typeof(bool?))
-                {
-                    _filter.Append(node.Value.ToString()!.ToLower());
-                }
-                else if (node.Type == typeof(Guid) || node.Type == typeof(Guid?))
-                {
-                    _filter.Append($"guid'{node.Value}'");
-                }
-                else if (IsNumericType(node.Type))
-                {
-                    _filter.Append(node.Value.ToString());
-                }
-                else
-                {
-                    // Fallback for other types (e.g., enums)
-                    _filter.Append($"'{EscapeODataString(node.Value.ToString()!)}'");
-                }
-
-                return node;
-            }
-
-            /// <summary>
-            /// Visits method calls and determines whether they can be translated to OData.
-            /// Only allows .ToString() on direct property/indexer access in equality checks.
-            /// All other methods (Contains, StartsWith, etc.) go client-side.
-            /// </summary>
-            protected override Expression VisitMethodCall(MethodCallExpression node)
-            {
-                // Handle DynamicEntity indexer: d["Field"]
-                if (IsIndexerAccess(node))
-                {
-                    if (node.Method.Name == "ToString" && node.Arguments.Count == 0 && IsDirectComparison(node))
-                    {
-                        var indexer = (MethodCallExpression)node.Object!;
-                        var keyArg = (ConstantExpression)indexer.Arguments[0];
-                        _filter.Append(keyArg.Value!.ToString());
-                        return node;
-                    }
-                    _hasClientSideOperations = true;
-                    return node;
-                }
-
-                // Handle POCO property method: u.Field.ToString()
-                if (IsPropertyAccess(node.Object!))
-                {
-                    if (node.Method.Name == "ToString" && node.Arguments.Count == 0 && IsDirectComparison(node))
-                    {
-                        Visit(node.Object);
-                        return node;
-                    }
-                    _hasClientSideOperations = true;
-                    return node;
-                }
-
-                // Handle static string checks
-                if (node.Method.DeclaringType == typeof(string) && node.Method.IsStatic)
-                {
-                    return node.Method.Name switch
-                    {
-                        "IsNullOrEmpty" => ProcessStringNullCheck(node, "eq"),
-                        "IsNullOrWhiteSpace" => ProcessStringNullCheck(node, "ne"),
-                        _ => throw new NotSupportedException($"Static method {node.Method.Name} not supported in OData.")
-                    };
-                }
-
-                // Handle DateTime.Add* if evaluatable
-                if (node.Method.DeclaringType == typeof(DateTime) && node.Method.Name.StartsWith("Add"))
-                {
-                    if (IsEvaluatable(node))
-                    {
-                        var compiled = Expression.Lambda(node).Compile().DynamicInvoke();
-                        Visit(Expression.Constant(compiled, node.Type));
-                        return node;
-                    }
-                    _hasClientSideOperations = true;
-                    return node;
-                }
-
-                // All other methods (Contains, custom, etc.) → client-side
-                _hasClientSideOperations = true;
-                return node;
-            }
-
-            /// <summary>
-            /// Visits unary expressions (e.g., !expression).
-            /// Translates !string.IsNullOrEmpty and !boolField to OData.
-            /// </summary>
-            protected override Expression VisitUnary(UnaryExpression node)
-            {
-                if (node.NodeType == ExpressionType.Not)
-                {
-                    if (node.Operand is MethodCallExpression mce && mce.Method.DeclaringType == typeof(string))
-                    {
-                        var op = mce.Method.Name == "IsNullOrEmpty" ? "ne" : "ne";
-                        _filter.Append("(");
-                        Visit(mce.Arguments[0]);
-                        _filter.Append($" {op} '__null__' and ");
-                        Visit(mce.Arguments[0]);
-                        _filter.Append($" {op} '')");
-                        return node;
-                    }
-
-                    if (node.Operand is MemberExpression me && me.Expression is ParameterExpression)
-                    {
-                        _filter.Append("(");
-                        Visit(me);
-                        _filter.Append(" eq false)");
-                        return node;
-                    }
-
-                    _hasClientSideOperations = true;
-                    return node;
-                }
-
-                return base.VisitUnary(node);
-            }
-
-            // ========================================
-            // Helper Methods
-            // ========================================
-
-            /// <summary>
-            /// Normalizes an expression by replacing closure references (e.g., value(...).field) with constants.
-            /// This prevents malformed OData like "value(...).field" from appearing in the output.
-            /// </summary>
-            /// <param name="expression">The original expression tree.</param>
-            /// <returns>A new expression with closure values inlined as constants.</returns>
-            private Expression NormalizeClosureExpressions(Expression expression)
-            {
-                return new ClosureExpressionRewriter().Visit(expression);
-            }
-
-            /// <summary>
-            /// Analyzes a sub-expression independently to determine its server/client behavior.
-            /// Prevents state pollution between left/right sides of logical operations.
-            /// </summary>
-            /// <param name="expr">The expression branch to analyze.</param>
-            /// <returns>Filter analysis result for this branch.</returns>
-            private FilterAnalysisResult AnalyzeBranch(Expression expr)
-            {
-                var builder = new ODataFilterBuilder { Parameter = this.Parameter };
-                return builder.BuildHybridFilter(expr);
-            }
-
-            /// <summary>
-            /// Checks if a method call is accessing a DynamicEntity indexer (d["Field"]).
-            /// </summary>
-            private bool IsIndexerAccess(MethodCallExpression node) =>
-                node.Method.DeclaringType == typeof(DynamicEntity) &&
-                node.Method.Name == "get_Item" &&
-                node.Object is ParameterExpression &&
-                node.Arguments.Count == 1 &&
-                node.Arguments[0] is ConstantExpression;
-
-            /// <summary>
-            /// Checks if the expression is a direct property access (e.g., u.Field).
-            /// </summary>
-            private bool IsPropertyAccess(Expression expr) =>
-                expr is MemberExpression me && (me.Expression == Parameter || me.Expression is ParameterExpression);
-
-            /// <summary>
-            /// Determines if a method call (e.g., .ToString()) is used directly in a comparison.
-            /// Prevents misuse like (x.ToString().Length > 0).
-            /// </summary>
-            private bool IsDirectComparison(MethodCallExpression node)
-            {
-                var parent = GetParent(node);
-                return parent is BinaryExpression binary &&
-                       IsSupportedOperator(binary.NodeType) &&
-                       (binary.Left == node || binary.Right == node);
-            }
-
-            /// <summary>
-            /// Gets the parent expression of the given node in the expression tree.
-            /// Uses a visitor to walk the tree and find the first node that contains the target.
-            /// </summary>
-            /// <param name="node">The node to find the parent of.</param>
-            /// <returns>The parent expression, or null if not found.</returns>
-            private Expression? GetParent(Expression node)
-            {
-                var parentFinder = new ParentFinderVisitor(node);
-                return parentFinder.Find();
-            }
-
-            /// <summary>
-            /// Handles string null/empty checks and converts them to OData conditions.
-            /// </summary>
-            private Expression ProcessStringNullCheck(MethodCallExpression node, string op)
-            {
-                _filter.Append("(");
-                Visit(node.Arguments[0]);
-                _filter.Append($" {op} '__null__' or ");
-                Visit(node.Arguments[0]);
-                _filter.Append($" {op} '')");
-                return node;
-            }
-
-            /// <summary>
-            /// Checks if an expression can be compiled and evaluated immediately (e.g., DateTime.Now.AddDays(1)).
-            /// </summary>
-            private bool IsEvaluatable(Expression expr)
-            {
-                try
-                {
-                    Expression.Lambda(expr).Compile().DynamicInvoke();
-                    return true;
-                }
-                catch
-                {
-                    return false;
-                }
-            }
-
-            /// <summary>
-            /// Determines if the expression can be fully handled server-side (i.e., no client-side ops).
-            /// </summary>
-            private bool IsServerSupported(Expression expression) =>
-                AnalyzeBranch(expression).ServerSideOData != null;
-
-            /// <summary>
-            /// Checks if the binary operator is supported in OData/Azure Table Storage.
-            /// </summary>
-            private bool IsSupportedOperator(ExpressionType nodeType) =>
-                nodeType is ExpressionType.Equal or ExpressionType.NotEqual or
-                           ExpressionType.GreaterThan or ExpressionType.GreaterThanOrEqual or
-                           ExpressionType.LessThan or ExpressionType.LessThanOrEqual;
-
-            /// <summary>
-            /// Converts C# binary operator to OData equivalent string.
-            /// </summary>
-            private string ConvertOperator(ExpressionType nodeType) => nodeType switch
-            {
-                ExpressionType.Equal => "eq",
-                ExpressionType.NotEqual => "ne",
-                ExpressionType.GreaterThan => "gt",
-                ExpressionType.GreaterThanOrEqual => "ge",
-                ExpressionType.LessThan => "lt",
-                ExpressionType.LessThanOrEqual => "le",
-                _ => throw new NotSupportedException($"Operator {nodeType} not supported in OData.")
-            };
-
-            /// <summary>
-            /// Checks if a type is numeric (int, double, decimal, etc.) for OData formatting.
-            /// </summary>
-            private bool IsNumericType(Type type)
-            {
-                var t = Nullable.GetUnderlyingType(type) ?? type;
-                return t.IsPrimitive || t == typeof(decimal);
-            }
-
-            /// <summary>
-            /// Escapes single quotes in strings for OData (replace ' with '').
-            /// </summary>
-            /// <param name="value">Input string.</param>
-            /// <returns>Escaped string safe for OData.</returns>
-            private string EscapeODataString(string? value) => value?.Replace("'", "''") ?? "";
-        }
-
-        /// <summary>
-        /// Rewrites expression trees to replace closure-captured values (e.g., value(...).field) with constants.
-        /// This ensures expressions like `d => d.Url == localVar` become `d => d.Url == "https://..."`.
-        /// </summary>
-        private class ClosureExpressionRewriter : ExpressionVisitor
-        {
-            protected override Expression VisitMember(MemberExpression node)
-            {
-                if (node.Expression is ConstantExpression constExpr && constExpr.Value != null)
-                {
-                    var field = node.Member as FieldInfo;
-                    if (field != null)
-                    {
-                        var value = field.GetValue(constExpr.Value);
-                        return Expression.Constant(value, node.Type);
-                    }
-                }
-                return base.VisitMember(node);
-            }
-        }
-
-        /// <summary>
-        /// Helper visitor to find the parent of a given expression node in the tree.
-        /// </summary>
-        private class ParentFinderVisitor : ExpressionVisitor
-        {
-            private readonly Expression _target;
-            private Expression? _parent;
-
-            public ParentFinderVisitor(Expression target) => _target = target;
-
-            public Expression? Find()
-            {
-                Visit(_target);
-                return _parent;
-            }
-
-            protected override Expression VisitBinary(BinaryExpression node)
-            {
-                if (node.Left == _target || node.Right == _target)
-                {
-                    _parent = node;
-                    return node;
-                }
-                return base.VisitBinary(node);
-            }
-
-            protected override Expression VisitUnary(UnaryExpression node)
-            {
-                if (node.Operand == _target)
-                {
-                    _parent = node;
-                    return node;
-                }
-                return base.VisitUnary(node);
-            }
-
-            protected override Expression VisitMethodCall(MethodCallExpression node)
-            {
-                if (node.Object == _target || node.Arguments.Contains(_target))
-                {
-                    _parent = node;
-                    return node;
-                }
-                return base.VisitMethodCall(node);
-            }
-
-            protected override Expression VisitMember(MemberExpression node)
-            {
-                if (node.Expression == _target)
-                {
-                    _parent = node;
-                    return node;
-                }
-                return base.VisitMember(node);
-            }
-
-            protected override Expression VisitConstant(ConstantExpression node)
-            {
-                if (node == _target)
-                {
-                    _parent = null;
-                }
-                return base.VisitConstant(node);
-            }
-
-            protected override Expression VisitParameter(ParameterExpression node)
-            {
-                if (node == _target)
-                {
-                    _parent = null;
-                }
-                return base.VisitParameter(node);
-            }
-
-            protected override Expression VisitConditional(ConditionalExpression node)
-            {
-                if (node.Test == _target || node.IfTrue == _target || node.IfFalse == _target)
-                {
-                    _parent = node;
-                }
-                return base.VisitConditional(node);
-            }
-
-            protected override Expression VisitNew(NewExpression node)
-            {
-                if (node.Arguments.Contains(_target))
-                {
-                    _parent = node;
-                }
-                return base.VisitNew(node);
-            }
-
-            protected override Expression VisitNewArray(NewArrayExpression node)
-            {
-                if (node.Expressions.Contains(_target))
-                {
-                    _parent = node;
-                }
-                return base.VisitNewArray(node);
-            }
-
-            protected override Expression VisitInvocation(InvocationExpression node)
-            {
-                if (node.Expression == _target || node.Arguments.Contains(_target))
-                {
-                    _parent = node;
-                }
-                return base.VisitInvocation(node);
-            }
-
-            protected override Expression VisitIndex(IndexExpression node)
-            {
-                if (node.Object == _target || node.Arguments.Contains(_target))
-                {
-                    _parent = node;
-                }
-                return base.VisitIndex(node);
-            }
-        } // end class ParentFinderVisitor
-
-        /// <summary>
-        /// Result of OData filter analysis.
-        /// </summary>
-        private class FilterAnalysisResult
-        {
-            public string? ServerSideOData { get; set; }
-            public bool HasClientSideOperations { get; set; }
-        }
-
-        private class ParameterFinder : ExpressionVisitor
-        {
-            public bool HasParameter { get; private set; }
-
-            protected override Expression VisitParameter(ParameterExpression node)
-            {
-                HasParameter = true;
-                return node;
-            }
-
-            protected override Expression VisitMethodCall(MethodCallExpression node)
-            {
-                // Visit the object the method is called on
-                if (node.Object != null)
-                {
-                    Visit(node.Object);
-                }
-
-                // Visit all arguments
-                foreach (var arg in node.Arguments)
-                {
-                    Visit(arg);
-                }
-
-                // If we've found a parameter, we can stop
-                if (HasParameter)
-                    return node;
-
-                // Don't call base.VisitMethodCall as it might have issues with certain patterns
-                return node;
-            }
-
-            public override Expression Visit(Expression? node)
-            {
-                if (node == null)
-                    return null!;
-
-                if (HasParameter)
-                    return node; // Short circuit if we already found a parameter
-
-                // Special handling for MethodCallExpression to avoid crashes
-                if (node is MethodCallExpression mce)
-                {
-                    return VisitMethodCall(mce);
-                }
-
-                try
-                {
-                    return base.Visit(node);
-                }
-                catch (Exception ex)
-                {
-                    // If there's an error visiting the expression, assume it might have parameters
-                    System.Diagnostics.Debug.WriteLine($"ParameterFinder error: {ex.Message}");
-                    HasParameter = true;
-                    return node;
-                }
-            }
-        } // end class ParameterFinder
-
-        #endregion Lambda Expression Processing
-
-    } // end class DataAccess<T>
-
-    /// <summary>
-    /// Manages session based data into the database with unified async/sync operations
-    /// Now implements ISession for compatibility with ASP.NET Core
-    /// </summary>
-    public class Session : IDisposable, IAsyncDisposable, ISession
-    {
-        private string? m_sessionID;
-        private List<AppSessionData> m_sessionData = new List<AppSessionData>();
-        private readonly DataAccess<AppSessionData> m_da;
-
-        /// <summary>
-        /// Constructor initializes the configuration and data access setup
-        /// </summary>
-        /// <param name="accountName">The Azure Account name for the Table Store</param>
-        /// <param name="accountKey">The Azure account key for the table store</param>
-        public Session(string accountName, string accountKey)
-        {
-            m_da = new DataAccess<AppSessionData>(accountName, accountKey);
-        }
-
-        /// <summary>
-        /// Constructor to setup the Session object and table
-        /// </summary>
-        /// <param name="accountName">The Azure Account name for the Table Store</param>
-        /// <param name="accountKey">The Azure account key for the table store</param>
-        /// <param name="sessionID">Session Identifier</param>
-        public Session(string accountName, string accountKey, string sessionID) : this(accountName, accountKey)
-        {
-            m_sessionID = sessionID;
-            m_sessionData = LoadSessionDataCore(m_sessionID).GetAwaiter().GetResult();
-        }
-
-        /// <summary>
-        /// Asynchronously creates a Session instance
-        /// </summary>
-        /// <param name="accountName">The Azure Account name for the Table Store</param>
-        /// <param name="accountKey">The Azure account key for the table store</param>
-        /// <param name="sessionID">Session Identifier</param>
-        /// <returns>A new Session instance with data loaded asynchronously</returns>
-        public static async Task<Session> CreateAsync(string accountName, string accountKey, string sessionID)
-        {
-            var session = new Session(accountName, accountKey);
-            session.m_sessionID = sessionID;
-            session.m_sessionData = await session.LoadSessionDataCore(sessionID);
-            return session;
-        }
-
-        #region ISession Implementation
-
-        /// <summary>
-        /// ISession - Indicates whether the session is available
-        /// </summary>
-        public bool IsAvailable => true;
-
-        /// <summary>
-        /// ISession - Gets the session ID
-        /// </summary>
-        public string Id => m_sessionID ?? Guid.NewGuid().ToString();
-
-        /// <summary>
-        /// ISession - Gets all keys in the session
-        /// </summary>
-        public IEnumerable<string> Keys
-        {
-            get
-            {
-                if (m_sessionData != null)
-                {
-                    return m_sessionData.Select(s => s.Key).Where(k => !string.IsNullOrEmpty(k))!;
-                }
-                return Enumerable.Empty<string>();
-            }
-        }
-
-        /// <summary>
-        /// ISession - Clears all session data
-        /// </summary>
-        void ISession.Clear()
-        {
-            RestartSession();
-            m_sessionData?.Clear();
-        }
-
-        /// <summary>
-        /// ISession - Commits session changes asynchronously
-        /// </summary>
-        async Task ISession.CommitAsync(CancellationToken cancellationToken)
-        {
-            await CommitDataAsync();
-        }
-
-        /// <summary>
-        /// ISession - Loads session data asynchronously
-        /// </summary>
-        async Task ISession.LoadAsync(CancellationToken cancellationToken)
-        {
-            await RefreshSessionDataAsync();
-        }
-
-        /// <summary>
-        /// ISession - Removes a key from the session
-        /// </summary>
-        void ISession.Remove(string key)
-        {
-            m_sessionData?.RemoveAll(s => s.Key == key);
-            DataHasBeenCommitted = false;
-        }
-
-        /// <summary>
-        /// ISession - Sets a byte array value in the session
-        /// </summary>
-        public void Set(string key, byte[] value)
-        {
-            if (string.IsNullOrEmpty(key))
-                throw new ArgumentException("Key cannot be null or empty.", nameof(key));
-
-            DataHasBeenCommitted = false;
-            if (value == null)
-            {
-                // If value is null, remove the key (standard session behavior)
-                ((ISession)this).Remove(key);
-                return;
-            }
-
-            this[key]!.Value = value;
-        }
-
-        /// <summary>
-        /// ISession - Tries to get a byte array value from the session.
-        /// </summary>
-        /// <param name="key">The key of the value to retrieve.</param>
-        /// <param name="value">When this method returns, contains the byte array value 
-        /// associated with the specified key, if the key is found; otherwise, null.</param>
-        /// <returns>true if the key is found and the value is a byte array; otherwise, false.</returns>
-        /// <remarks>
-        /// This implementation assumes AppSessionData.Value directly stores the byte[] object.
-        /// </remarks>
-        public bool TryGetValue(string key, out byte[] value)
-        {
-            value = null!;
-            if (string.IsNullOrEmpty(key))
-                return false;
-
-            AppSessionData? data = this[key];
-            if (data != null && data.Value != null && data.Value is byte[] byteArray)
-            {
-                value = byteArray;
-                return true;
-            }
-            return false;
-        }
-
-        /// <summary>
-        /// Stores a strongly typed object in the session state.
-        /// </summary>
-        /// <typeparam name="T">The type of the object to store.</typeparam>
-        /// <param name="key">The key to use for storing the object.</param>
-        /// <param name="value">The object to store.</param>
-        public void SetObject<T>(string key, T value)
-        {
-            if (string.IsNullOrEmpty(key) || value == null) return;
-            this[key]!.Value = value ;
-            DataHasBeenCommitted = false;
-        }
-
-        /// <summary>
-        /// Retrieves a strongly typed object from the session state.
-        /// </summary>
-        /// <typeparam name="T">The type of the object to retrieve.</typeparam>
-        /// <param name="key">The key used to store the object.</param>
-        /// <returns>The deserialized object, or the default value for <typeparamref name="T"/> if the key is not found or the value is null.</returns>
-        public T? GetObject<T>(string key)
-        {
-            if (string.IsNullOrEmpty(key)) return default;
-
-            var data = this[key];
-            if (data != null && data.Value != null)
-                return JsonSerializer.Deserialize<T>(data.Value.ToString()!, Functions.JsonOptions); ;
-                
-            return default;
-        }
-
-        /// <summary>
-        /// Sets an int value in the <see cref="ISession"/>.
-        /// </summary>
-        /// <param name="key">The key to assign.</param>
-        /// <param name="value">The value to assign.</param>
-        public void SetInt32(string key, int value)
-        {
-            Find(key)!.Value = value;
-        }
-
-        /// <summary>
-        /// Gets an int value from <see cref="ISession"/>.
-        /// </summary>
-        /// <param name="key">The key to read.</param>
-        public int? GetInt32(string key)
-        {
-            var data = Find(key);
-            string val = data?.Value?.ToString()!;
-            Int32.TryParse(val, out var val2);
-            return val2;
-        }
-
-        /// <summary>
-        /// Sets a <see cref="string"/> value in the <see cref="ISession"/>.
-        /// </summary>
-        /// <param name="key">The key to assign.</param>
-        /// <param name="value">The value to assign.</param>
-        public void SetString(string key, string value)
-            => Find(key)!.Value = value;        
-
-        /// <summary>
-        /// Gets a string value from <see cref="ISession"/>.
-        /// </summary>
-        /// <param name="key">The key to read.</param>
-        public string? GetString(string key)
-        {
-            var data = Find(key);
-            if (data == null)
-            {
-                return null;
-            }
-            return data.ToString();
-        }
-
-        /// <summary>
-        /// Retrieves a session value by key and attempts to parse it as a local DateTime.
-        /// Returns DateTime.MinValue if parsing fails or the key is missing.
-        /// </summary>
-        /// <param name="key">The key to retrieve.</param>
-        /// <returns>A parsed DateTime or DateTime.MinValue.</returns>
-        public DateTime GetDateTime(string key)
-        {
-            var value = GetString(key);
-            return DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out var result)
-                ? result
-                : DateTime.MinValue;
-        }
-
-        /// <summary>
-        /// Retrieves a session value by key and attempts to parse it as a UTC DateTime.
-        /// Returns DateTime.MinValue if parsing fails or the key is missing.
-        /// </summary>
-        /// <param name="key">The key to retrieve.</param>
-        /// <returns>A parsed UTC DateTime or DateTime.MinValue.</returns>
-        public DateTime GetUtcDateTime(string key)
-        {
-            var value = GetString(key);
-            return DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var result)
-                ? result
-                : DateTime.MinValue;
-        }
-
-        /// <summary>
-        /// Retrieves a session value by key and formats it as a currency string.
-        /// </summary>
-        /// <param name="key">The session key to retrieve.</param>
-        /// <param name="cultureName">
-        /// Optional culture name for formatting (e.g., "en-US", "fr-FR").
-        /// Defaults to "en-US" if not specified.
-        /// </param>
-        /// <returns>
-        /// A formatted currency string based on the parsed value and culture.
-        /// Returns "$0.00" if the value is missing or invalid.
-        /// </returns>
-        /// <example>
-        /// <code>
-        /// var usd = GetCurrency("CartTotal");           // "$123.45"
-        /// var euro = GetCurrency("CartTotal", "fr-FR"); // "123,45 €"
-        /// </code>
-        /// </example>
-        public string GetCurrencyString(string key, string cultureName = "en-US")
-        {
-            var raw = GetString(key);
-            if (string.IsNullOrWhiteSpace(raw) || !double.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var value))
-                return "$0.00"; // fallback
-
-            var culture = new CultureInfo(cultureName);
-            return value.ToString("C", culture);
-        }
-
-        /// <summary>
-        /// Retrieves a session value by key and attempts to parse it as a boolean.
-        /// </summary>
-        /// <param name="key">The session key to retrieve.</param>
-        /// <returns>
-        /// A parsed boolean value. Returns <c>false</c> if the value is missing, empty, or cannot be parsed.
-        /// </returns>
-        /// <remarks>
-        /// Accepts "true", "false", "1", "0", "yes", "no" (case-insensitive).
-        /// </remarks>
-        /// <example>
-        /// <code>
-        /// bool isAdmin = GetBool("IsAdmin"); // true or false
-        /// </code>
-        /// </example>
-        public bool GetBool(string key)
-        {
-            var raw = GetString(key);
-            if (string.IsNullOrWhiteSpace(raw))
-                return false;
-
-            raw = raw.Trim().ToLowerInvariant();
-
-            return raw switch
-            {
-                "true" => true,
-                "1" => true,
-                "yes" => true,
-                "false" => false,
-                "0" => false,
-                "no" => false,
-                _ => bool.TryParse(raw, out var result) && result
-            };
-        }
-
-        /// <summary>
-        /// Gets a byte-array value from <see cref="ISession"/>.
-        /// </summary>
-        /// <param name="key">The key to read.</param>
-        public byte[]? Get(string key)
-        {
-            TryGetValue(key, out var value);
-            return value;
-        }
-
-
-        #endregion ISession Implementation
-
-        #region Core Implementation Methods (Async-First)
-
-        /// <summary>
-        /// Core implementation for loading session data
-        /// </summary>
-        private async Task<List<AppSessionData>> LoadSessionDataCore(string sessionID) => await m_da.GetCollectionAsync(sessionID);
-
-        /// <summary>
-        /// Core implementation for getting stale sessions
-        /// </summary>
-        private async Task<List<string>> GetStaleSessionsCore()
-        {
-            string filter = @"(Key eq 'SessionSubmittedToCRM' and Value eq 'false') or (Key eq 'prospectChannel' and Value eq 'facebook')";
-            TableQuery<AppSessionData> q = new TableQuery<AppSessionData>().Where(filter);
-            List<AppSessionData> coll = await m_da.GetCollectionAsync(q);
-            coll = coll.FindAll(s => s.Timestamp.IsTimeBetween(DateTime.Now, 5, 60));
-            return coll.DistinctBy(s => s.SessionID).Select(s => s.SessionID).ToList()!;
-        }
-
-        /// <summary>
-        /// Core implementation for cleaning session data
-        /// </summary>
-        private async Task CleanSessionDataCore()
-        {
-            string queryString = TableQuery.GenerateFilterConditionForDate("Timestamp", QueryComparisons.LessThan, DateTime.Now.AddHours(-2));
-            TableQuery<AppSessionData> q = new TableQuery<AppSessionData>().Where(queryString);
-            List<AppSessionData> data = await m_da.GetCollectionAsync(q);
-            await m_da.BatchUpdateListAsync(data, TableOperationType.Delete);
-        }
-
-        /// <summary>
-        /// Core implementation for committing data
-        /// </summary>
-        private async Task<bool> CommitDataCore(List<AppSessionData> data, TableOperationType direction)
-        {
-            await m_da.BatchUpdateListAsync(data, direction);
-            DataHasBeenCommitted = direction != TableOperationType.Delete;
-            return DataHasBeenCommitted;
-        }
-
-        /// <summary>
-        /// Core implementation for restarting session
-        /// </summary>
-        private async Task RestartSessionCore()
-        {
-            await m_da.BatchUpdateListAsync(SessionData!, TableOperationType.Delete);
-            m_sessionData = new List<AppSessionData>();
-        }
-
-        #endregion
-
-        #region Public Sync Methods (Wrap Async Core)
-
-        /// <summary>
-        /// Finds the abandoned or stale conversations in session (Synchronous)
-        /// </summary>
-        /// <returns>The collection of stale Prospect object data that needs to be submitted to CRM</returns>
-        public List<string> GetStaleSessions() => GetStaleSessionsCore().GetAwaiter().GetResult();
-
-        /// <summary>
-        /// Removes legacy session data (Synchronous)
-        /// </summary>
-        public void CleanSessionData() => CleanSessionDataCore().GetAwaiter().GetResult();
-
-        /// <summary>
-        /// Uploads all session data to the dB (Synchronous)
-        /// </summary>
-        /// <returns>Confirmation the data is committed</returns>
-        public bool CommitData()
-        {
-            CleanSessionData();
-            return CommitData(m_sessionData, TableOperationType.InsertOrReplace);
-        }
-
-        /// <summary>
-        /// Commits all of the data stored in a collection (Synchronous)
-        /// </summary>
-        /// <param name="data">The data to work on</param>
-        /// <param name="direction">How to put the data into the dB</param>
-        /// <returns>Confirmation the data is committed</returns>
-        public bool CommitData(List<AppSessionData> data, TableOperationType direction) => CommitDataCore(data, direction).GetAwaiter().GetResult();
-
-        /// <summary>
-        /// Restarts the session by removing previous session data (Synchronous)
-        /// </summary>
-        public void RestartSession() => RestartSessionCore().GetAwaiter().GetResult();
-
-        /// <summary>
-        /// Loads session data from the database (Synchronous)
-        /// </summary>
-        /// <param name="sessionID">The session ID to load data for</param>
-        public void LoadSessionData(string sessionID)
-        {
-            m_sessionID = sessionID;
-            m_sessionData = LoadSessionDataCore(m_sessionID).GetAwaiter().GetResult();
-        }
-
-        /// <summary>
-        /// Refreshes the current session data from the database (Synchronous)
-        /// </summary>
-        public void RefreshSessionData()
-        {
-            if (!string.IsNullOrEmpty(m_sessionID))
-                m_sessionData = LoadSessionDataCore(m_sessionID).GetAwaiter().GetResult();
-        }
-
-        #endregion
-
-        #region Public Async Methods (Call Core Directly)
-
-        /// <summary>
-        /// Finds the abandoned or stale conversations in session (Asynchronous)
-        /// </summary>
-        /// <returns>The collection of stale Prospect object data that needs to be submitted to CRM</returns>
-        public Task<List<string>> GetStaleSessionsAsync() => GetStaleSessionsCore();
-
-        /// <summary>
-        /// Removes legacy session data (Asynchronous)
-        /// </summary>
-        public Task CleanSessionDataAsync() => CleanSessionDataCore();
-
-        /// <summary>
-        /// Uploads all session data to the dB (Asynchronous)
-        /// </summary>
-        /// <returns>Confirmation the data is committed</returns>
-        public async Task<bool> CommitDataAsync()
-        {
-            await CleanSessionDataAsync();
-            return await CommitDataAsync(m_sessionData, TableOperationType.InsertOrReplace);
-        }
-
-        /// <summary>
-        /// Commits all of the data stored in a collection (Asynchronous)
-        /// </summary>
-        /// <param name="data">The data to work on</param>
-        /// <param name="direction">How to put the data into the dB</param>
-        /// <returns>Confirmation the data is committed</returns>
-        public Task<bool> CommitDataAsync(List<AppSessionData> data, TableOperationType direction) => CommitDataCore(data, direction);
-
-        /// <summary>
-        /// Restarts the session by removing previous session data (Asynchronous)
-        /// </summary>
-        public Task RestartSessionAsync() => RestartSessionCore();
-
-        /// <summary>
-        /// Loads session data from the database (Asynchronous)
-        /// </summary>
-        /// <param name="sessionID">The session ID to load data for</param>
-        public async Task LoadSessionDataAsync(string sessionID)
-        {
-            m_sessionID = sessionID;
-            m_sessionData = await LoadSessionDataCore(m_sessionID);
-        }
-
-        /// <summary>
-        /// Refreshes the current session data from the database (Asynchronous)
-        /// </summary>
-        public async Task RefreshSessionDataAsync()
-        {
-            if (!string.IsNullOrEmpty(m_sessionID))
-                m_sessionData = await LoadSessionDataCore(m_sessionID);
-        }
-
-        #endregion
-
-        #region Helper Methods and Properties
-
-        /// <summary>
-        /// Checks to see if an object already exists within the collection
-        /// </summary>
-        /// <param name="key">The Key to find</param>
-        /// <returns>The object, new or existing</returns>
-        private AppSessionData? Find(string key)
-        {
-            AppSessionData? b = SessionData!.Find(s => s.Key == key);
-            if (b == null)
-            {
-                b = new AppSessionData() { SessionID = m_sessionID, Key = key };
-                SessionData!.Add(b);
-                DataHasBeenCommitted = false;
-            }
-            return b;
-        }
-
-        /// <summary>
-        /// Locates the object within the collection matching the specified key
-        /// </summary>
-        /// <param name="key">Identifier</param>
-        /// <returns>The requested object if it exists, null if not</returns>
-        /// <remarks>This is called Indexers or default indexers</remarks>
-        public AppSessionData? this[string key]
-        {
-            get { return Find(key); }
-            set { Find(key)!.Value = value; DataHasBeenCommitted = false; }
-        }
-
-        /// <summary>
-        /// Readonly reference to the data stored 
-        /// </summary>
-        public List<AppSessionData>? SessionData
-        {
-            get { return m_sessionData; }
-        }
-
-        /// <summary>
-        /// Gets the current session ID
-        /// </summary>
-        public string? SessionID
-        {
-            get { return m_sessionID; }
-        }
-
-        /// <summary>
-        /// Determines whether the data has successfully been committed to the database
-        /// </summary>
-        public bool DataHasBeenCommitted { get; set; }
-
-        #endregion
-
-        #region Disposal Pattern
-
-        /// <summary>
-        /// Destructor makes sure the data is committed to the DB
-        /// </summary>
-        ~Session()
-        {
-            if (!DataHasBeenCommitted)
-                CommitData();
-        }
-
-        /// <summary>
-        /// Implements IDisposable pattern for proper resource cleanup
-        /// </summary>
-        public void Dispose()
-        {
-            Dispose(true);
-            GC.SuppressFinalize(this);
-        }
-
-        /// <summary>
-        /// Asynchronously implements disposal pattern
-        /// </summary>
-        public async ValueTask DisposeAsync()
-        {
-            await DisposeAsyncCore();
-            GC.SuppressFinalize(this);
-        }
-
-        /// <summary>
-        /// Protected dispose method
-        /// </summary>
-        /// <param name="disposing">True if disposing, false if finalizing</param>
-        protected virtual void Dispose(bool disposing)
-        {
-            if (disposing && !DataHasBeenCommitted)
-                CommitData();
-        }
-
-        /// <summary>
-        /// Protected async dispose core method
-        /// </summary>
-        protected virtual async ValueTask DisposeAsyncCore()
-        {
-            if (!DataHasBeenCommitted)
-                await CommitDataCore(m_sessionData, TableOperationType.InsertOrReplace);
-        }
-
-        #endregion
-
-    } // end class Session
-
-    // <summary>
-    /// Provides asynchronous enumeration with progress tracking functionality for a collection of items.
-    /// </summary>
-    /// <typeparam name="T">The type of elements in the collection.</typeparam>
-    public class AsyncProcessingState<T>
-    {
-        private readonly List<T> m_items;
-        private int m_currentIndex = -1;
-        private readonly object m_lock = new();
-        // <summary>
-        /// Initializes a new instance of the AsyncProcessingState class with the specified collection.
-        /// </summary>
-        /// <param name="items">The collection of items to process.</param>
-        public AsyncProcessingState(List<T> items)
-        {
-            m_items = items;
-        }
-
-        public int TotalCount => m_items.Count;
-        public int ProcessedCount => m_currentIndex + 1;
-        public int RemainingCount => TotalCount - ProcessedCount;
-
-        /// <summary>
-        /// Lazily retrieves and yields one item at a time along with its index.
-        /// This allows efficient asynchronous iteration without loading all items into memory at once.
-        /// </summary>
-        /// <param name="cancellationToken">A token to monitor for cancellation requests.</param>
-        /// <returns>An asynchronous enumerable that yields one (item, index) tuple at a time.</returns>
-        public async IAsyncEnumerable<(T item, int index)> GetItemAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
-        {
-            while (true)
-            {
-                int index;
-                T item;
-
-                // Lock to ensure only one thread modifies m_currentIndex at a time
-                lock (m_lock)
-                {
-                    if (this.ProcessedCount >= m_items.Count) yield break;
-
-                    cancellationToken.ThrowIfCancellationRequested();
-
-                    m_currentIndex++;
-                    item = m_items[m_currentIndex];
-                    index = m_currentIndex;
-                }
-
-                cancellationToken.ThrowIfCancellationRequested();
-                yield return (item, index);
-                if (index % 10 == 0) await Task.Yield(); // Yield every 10 iterations, for efficiency
-            }
-        }
-
-        /// <summary>
-        /// Returns a list of all items that have not yet been processed
-        /// </summary>
-        /// <returns>A new list containing the remaining items</returns>
-        public List<T> GetRemainingItems()
-        {
-            return this.ProcessedCount < m_items.Count
-                ? m_items.GetRange(this.ProcessedCount, this.RemainingCount)
-                : new List<T>();
-        }
-    } // end class AsyncProcessingState
-
-} // end namespace ASCTableStorage.Data
+    }
+}
