@@ -3,10 +3,13 @@ using Azure;
 using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
+using System.Diagnostics;
 using System.Linq.Expressions;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.RegularExpressions;
+using Xabe.FFmpeg;
+using Xabe.FFmpeg.Downloader;
 
 namespace ASCTableStorage.Blobs
 {
@@ -237,6 +240,8 @@ namespace ASCTableStorage.Blobs
             return url;
         }
 
+        private static bool _ffmpegPathInitialized = false;
+
         /// <summary>
         /// Uploads a stream to Azure Blob Storage with size validation and optional index tags
         /// </summary>
@@ -248,49 +253,104 @@ namespace ASCTableStorage.Blobs
         /// <param name="indexTags">Optional dictionary of up to 10 index tags for fast searching</param>
         /// <param name="metadata">Optional metadata dictionary (not searchable but accessible)</param>
         /// <returns>The URI of the uploaded blob</returns>
-        public async Task<Uri> UploadStreamAsync(Stream stream, string fileName, string? contentType = null,
-            bool enforceFileTypeRestriction = true, long? maxFileSizeBytes = null,
-            Dictionary<string, string>? indexTags = null, Dictionary<string, string>? metadata = null)
+        public async Task<Uri> UploadStreamAsync(
+            Stream stream,
+            string fileName,
+            string? contentType = null,
+            bool enforceFileTypeRestriction = true,
+            long? maxFileSizeBytes = null,
+            Dictionary<string, string>? indexTags = null,
+            Dictionary<string, string>? metadata = null)
         {
             if (stream == null)
                 throw new ArgumentNullException(nameof(stream));
 
-            if (string.IsNullOrEmpty(fileName))
+            if (string.IsNullOrWhiteSpace(fileName))
                 throw new ArgumentNullException(nameof(fileName));
 
-            // Check file size
             long maxSize = maxFileSizeBytes ?? m_maxFileSize;
-            if (stream.Length > maxSize)
-                throw new ArgumentException($"Stream size exceeds the maximum allowed size of {maxSize} bytes");
+            string extension = Path.GetExtension(fileName).ToLowerInvariant();
 
-            // Check file type if enforcing restrictions
             if (enforceFileTypeRestriction && !IsFileTypeAllowed(fileName))
-                throw new ArgumentException($"File type {Path.GetExtension(fileName)} is not allowed");
+                throw new ArgumentException($"File type {extension} is not allowed");
 
-            // Validate index tags
             ValidateIndexTags(indexTags);
 
-            // Get a reference to the blob
-            BlobClient bc = m_containerClient.GetBlobClient(fileName);
+            bool isCompressibleVideo = extension is ".mp4" or ".mov" or ".webm" or ".avi";
 
-            // Determine content type
-            if (string.IsNullOrEmpty(contentType))
+            if (stream.Length > maxSize && isCompressibleVideo)
             {
-                contentType = GetContentType(fileName);
+                // Ensure FFmpeg is initialized
+                string ffmpegPath = Path.Combine(Path.GetTempPath(), "ffmpeg");
+                if (!_ffmpegPathInitialized)
+                {
+                    if (!Directory.Exists(ffmpegPath) || !File.Exists(Path.Combine(ffmpegPath, "ffmpeg.exe")))
+                        await FFmpegDownloader.GetLatestVersion(FFmpegVersion.Official, ffmpegPath);
+
+                    FFmpeg.SetExecutablesPath(ffmpegPath);
+                    _ffmpegPathInitialized = true;
+                }
+
+                // Save input stream to temp file
+                string tempInputPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + extension);
+                await using (var inputFile = File.Create(tempInputPath))
+                {
+                    stream.Position = 0;
+                    await stream.CopyToAsync(inputFile);
+                }
+
+                string outputPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".mp4");
+
+                try
+                {
+                    var conversion = await FFmpeg.Conversions.New()
+                        .AddParameter($"-i {tempInputPath} -c:v libx264 -preset veryfast -crf 28 -movflags +faststart -an")
+                        .SetOutput(outputPath)
+                        .SetOverwriteOutput(true)
+                        .Start();
+                }
+                catch (Exception ex)
+                {
+                    File.Delete(tempInputPath);
+                    throw new InvalidOperationException("FFmpeg compression failed", ex);
+                }
+
+                long compressedSize = new FileInfo(outputPath).Length;
+                if (compressedSize > maxSize)
+                {
+                    File.Delete(tempInputPath);
+                    File.Delete(outputPath);
+                    throw new ArgumentException($"Compressed video still exceeds the maximum allowed size of {maxSize} bytes");
+                }
+
+                stream = File.OpenRead(outputPath);
+                fileName = Path.GetFileName(outputPath);
+
+                File.Delete(tempInputPath); // Clean up input
+            }
+            else if (stream.Length > maxSize)
+            {
+                throw new ArgumentException($"Stream size exceeds the maximum allowed size of {maxSize} bytes");
             }
 
-            // Sanitize metadata keys to comply with Azure Blob Storage requirements
-            var sanitizedMetaTags = SanitizeMetadataKeys(indexTags!);
-            var sanitizedMetadata = SanitizeMetadataKeys(metadata!);
+            // Prepare blob client
+            BlobClient blobClient = m_containerClient.GetBlobClient(fileName);
+
+            // Determine content type
+            contentType ??= GetContentType(fileName);
+
+            // Sanitize metadata
+            var sanitizedTags = SanitizeMetadataKeys(indexTags ?? new Dictionary<string, string>());
+            var sanitizedMetadata = SanitizeMetadataKeys(metadata ?? new Dictionary<string, string>());
 
             // Prepare upload options
-            var uploadOptions = CreateUploadOptions(contentType, fileName, stream.Length, sanitizedMetaTags, sanitizedMetadata);
+            var uploadOptions = CreateUploadOptions(contentType, fileName, stream.Length, sanitizedTags, sanitizedMetadata);
 
-            // Upload the stream (overwrite by default)
-            await bc.UploadAsync(stream, uploadOptions);
+            // Upload to Azure Blob Storage
+            await blobClient.UploadAsync(stream, uploadOptions);
 
-            return bc.Uri;
-        }
+            return blobClient.Uri;
+        } // end UploadStreamAsync()
 
         /// <summary>
         /// Ensures clean meta data and tags for going into blob storage
